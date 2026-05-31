@@ -1,0 +1,52 @@
+#cloud-config
+# ---------------------------------------------------------------------------
+# twc-cli Azure demo - provisions an Ubuntu VM as a *remote TeamViewer endpoint*.
+#
+# The twc CLI itself is NOT installed here. It runs on your laptop and observes
+# this VM through the TeamViewer WebAPI (the `auth-policy` specialist) once the
+# host has enrolled into your TeamViewer account via the assignment token.
+#
+# Deploy-TeamViewerDemo.ps1 substitutes __ASSIGNMENT_TOKEN__ before upload.
+# ---------------------------------------------------------------------------
+package_update: true
+package_upgrade: false
+
+packages:
+  - wget
+  - ca-certificates
+
+write_files:
+  - path: /usr/local/bin/twc-demo-setup.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+
+      # 1. Install the TeamViewer Host package (headless, unattended access).
+      wget -q -O /tmp/teamviewer-host.deb \
+        https://download.teamviewer.com/download/linux/teamviewer-host_amd64.deb
+      apt-get update -y
+      apt-get install -y /tmp/teamviewer-host.deb || apt-get install -y -f
+
+      # 2. Make sure the daemon is enabled and running.
+      systemctl enable --now teamviewerd
+      sleep 10
+      teamviewer daemon enable || true
+
+      # 3. Accept the EULA for unattended use, then enroll this device into the
+      #    TeamViewer account/company using the assignment token. After this the
+      #    device shows up in your account's device list and the laptop-side
+      #    `twc` auth-policy probe can see it by name.
+      teamviewer license accept || true
+      teamviewer assignment --id "__ASSIGNMENT_TOKEN__"
+
+      # 4. Give the device a recognizable alias matching the demo --target.
+      teamviewer alias "vm-twc-demo" || true
+
+      teamviewer info || true
+
+runcmd:
+  - ["/usr/local/bin/twc-demo-setup.sh"]
+
+final_message: "twc-cli demo VM ready - TeamViewer Host installed and assignment attempted after $UPTIME s."

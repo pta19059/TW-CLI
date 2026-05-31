@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-cjs/
+
+# Runtime data (jobs, logs, history, config)
+.twc-data/
+
+# Secrets / local env
+.env
+.env.local
+*.env
+
+# .NET launcher build artifacts
+launcher/bin/
+launcher/obj/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log

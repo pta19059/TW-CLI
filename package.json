@@ -1,0 +1,35 @@
+{
+  "name": "twc-cli",
+  "version": "0.1.0",
+  "description": "TeamViewer-only troubleshooting CLI with background Mastra agents",
+  "type": "module",
+  "bin": {
+    "twc": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:exe": "npm run build && dotnet publish .\\launcher\\TwcLauncher.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o .\\bin",
+    "dev": "tsx src/index.ts",
+    "worker": "tsx src/worker.ts",
+    "link:global": "npm link",
+    "start": "node dist/index.js",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@mastra/core": "^1.37.1",
+    "@mastra/loggers": "^1.1.1",
+    "@mastra/memory": "^1.20.0",
+    "commander": "^12.1.0",
+    "nanoid": "^5.0.7",
+    "zod": "^3.25.67"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.9"
+  }
+}

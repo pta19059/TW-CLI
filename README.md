@@ -1,0 +1,553 @@
+# TWC CLI (TeamViewer Command Line)
+
+Copilot-style CLI focused on TeamViewer products, with `debug` and `troubleshoot` tasks executed in the background by a Mastra agent backend.
+
+The UX is modeled on **GitHub Copilot CLI**:
+
+- `twc` with no arguments → interactive REPL with banner, model/endpoint info, slash commands.
+- `twc -p "<issue>"` → one-shot synchronous run with spinner.
+- `twc "<free text>"` → treated as a free-text troubleshoot prompt.
+- All existing subcommands (`products`, `agents`, `debug`, `troubleshoot`, `jobs`, `doctor`, `config`) still work unchanged.
+
+## Goal
+
+- Allow operations only on whitelisted TeamViewer products.
+- Launch non-blocking agent tasks (detached worker per command).
+- Return structured reports: hypotheses, evidence, root-cause scoring, remediation, confidence, escalation.
+
+## Supported TeamViewer Products (Whitelist)
+
+- TeamViewer Remote (`teamviewer-remote`)
+- TeamViewer Tensor (`teamviewer-tensor`)
+- TeamViewer Frontline (`teamviewer-frontline`)
+- TeamViewer Assist AR (`teamviewer-assist-ar`)
+- TeamViewer Remote Management (`teamviewer-remote-management`)
+- TeamViewer DEX (`teamviewer-dex`)
+
+The whitelist is defined in [src/catalog/teamviewerProducts.ts](src/catalog/teamviewerProducts.ts) and should be revalidated against official TeamViewer sources before production release.
+
+## Architecture
+
+Mastra is the **core orchestrator** of this project. Every job flows through a multi-step Mastra workflow that calls real Mastra agents in parallel against a local LLM (Foundry Local).
+
+1. CLI process (`twc`): command parsing, product validation, job enqueue.
+2. Job store (`.twc-data/jobs.json`): atomic writes + retention (last 200 jobs).
+3. Per-job logs (`.twc-data/logs/<jobId>.log`): stdout/stderr of the detached worker.
+4. Detached worker (`dist/worker.js`): background task execution with pid tracking.
+5. Mastra adapter (`src/agents/mastraAdapter.ts`): refuses remote endpoints, delegates entirely to the local runtime.
+6. Mastra runtime (`src/mastra/`): `Mastra` instance with 5 `Agent`s, 4 `createTool` specialists, one multi-step `createWorkflow`.
+7. Foundry Local discovery (`src/mastra/foundryLocal.ts`): endpoint discovery + `/models` probe.
+
+Workflow steps (Mastra-native):
+
+```
+[input] → classify-and-plan (gateway LLM)
+        → parallel:
+            specialist-connectivity     (connectivityAgent + tool)
+            specialist-auth-policy      (authPolicyAgent + tool)
+            specialist-endpoint-health  (endpointHealthAgent + tool)
+            specialist-log-intelligence (logIntelligenceAgent + tool)
+        → aggregate-report (gateway LLM rerank + summary)
+        → [WorkflowReport]
+```
+
+Each specialist step:
+
+- Runs a deterministic baseline tool (resilient to LLM failure).
+- Calls its Mastra Agent with a sanitized prompt and a narrow JSON contract.
+- Merges baseline + LLM enrichment (hypotheses, root causes, actions).
+- Skips itself if its bucket is not triggered.
+
+All LLM I/O goes through `generateStructured()`, a tolerant JSON parser with retries and typed fallback, so a misbehaving local model never crashes the workflow.
+
+## Implemented Agents
+
+Logical agent roles (declared in [src/agents/profiles.ts](src/agents/profiles.ts), used by `twc agents list`, `twc agents plan` and the workflow `execution` log):
+
+- product-gatekeeper
+- session-context
+- diagnosis-planner
+- connectivity
+- auth-policy
+- endpoint-health
+- log-intelligence
+- remediation
+- confidence-escalation
+- report
+
+Real Mastra `Agent` instances (declared in [src/mastra/agents/index.ts](src/mastra/agents/index.ts)):
+
+- `tw-gateway-agent` — classifies issues, reranks root causes, writes the executive summary.
+- `tw-connectivity-agent` — uses `connectivityTool`.
+- `tw-auth-policy-agent` — uses `authPolicyTool`.
+- `tw-endpoint-health-agent` — uses `endpointHealthTool`.
+- `tw-log-intelligence-agent` — uses `logIntelligenceTool`.
+
+Tools are defined in [src/mastra/tools/specialistTools.ts](src/mastra/tools/specialistTools.ts). The four `run*Analysis` functions also act as deterministic baselines used by the specialist workflow steps.
+
+Useful commands:
+
+```bash
+twc agents list
+twc agents plan --task troubleshoot --issue "Policy not applied" --context "SSO enabled"
+```
+
+## Runtime Flow
+
+1. `twc troubleshoot teamviewer-remote ...`
+2. whitelist product validation
+3. job creation (`queued`), pid tracked, log file opened
+4. detached worker spawn (stdio redirected to `.twc-data/logs/<id>.log`)
+5. worker moves job to `running`, sets `startedAt`
+6. Mastra workflow runs: classify → parallel specialists → aggregate
+7. worker saves structured report + text + `completedAt`
+8. job transitions to `completed` / `failed` / `cancelled`
+9. inspect with `twc jobs show <jobId>` (text, `--json`, or `--markdown`)
+
+## Real Diagnostic Probes
+
+Each of the 4 specialists is backed by an actual read-only OS / network probe — no canned data.
+TeamViewer ships on Windows, Linux and macOS, and this CLI may run **wherever the agent is
+installed** — on-prem or on any cloud (Oracle, Google, AWS, Azure). The cloud provider is
+irrelevant; only the host OS matters, and every probe is first-class on all three:
+
+| Specialist        | What it really does                                                                                              | Env vars                  |
+|-------------------|------------------------------------------------------------------------------------------------------------------|---------------------------|
+| connectivity      | DNS resolves `router{1,2,7}.teamviewer.com`, `master1`, `webapi`; TCP probe to port 5938; HTTPS GET to webapi (platform-agnostic, pure Node) | none                      |
+| endpoint-health   | **Windows:** `Get-Service`/`Get-Process TeamViewer*`, `HKLM\SOFTWARE\TeamViewer` (Version, ClientID). **Linux:** `systemctl show teamviewerd`, `pgrep`, `teamviewer --info` (Version, ID). **macOS:** `launchctl list`, `pgrep`, `Info.plist` version | none                      |
+| log-intelligence  | Reads tail (256 KB) of TeamViewer logs — Windows `%APPDATA%`/`%PROGRAMDATA%`, macOS `~/Library/Logs/TeamViewer`, Linux `/var/log/teamviewer` — and clusters repeating error/warning signatures | none                      |
+| auth-policy       | If `TEAMVIEWER_API_TOKEN` is set: calls `webapi.teamviewer.com/api/v1/ping`, `/account`, `/devices` (platform-agnostic) | `TEAMVIEWER_API_TOKEN`    |
+
+All probes have hard timeouts (3–6 s). Remediation steps are emitted in the host OS's native
+form (`Start-Service` on Windows, `systemctl enable --now` on Linux, `launchctl` on macOS).
+The LLM agents then enrich the deterministic baseline with extra hypotheses and re-ranking.
+
+## Azure Demo (laptop ↔ remote VM)
+
+This is a short, **reproducible** demo. The reproduction scripts live in
+[demo/azure](demo/azure) so you can replay it even without the original Azure
+account — just supply your own subscription and TeamViewer tokens.
+
+### Architecture
+
+```
+┌─────────────────────────┐        TeamViewer WebAPI        ┌──────────────────────────┐
+│  Your laptop            │  ───────────────────────────▶  │  Azure VM (Ubuntu 22.04) │
+│  twc CLI (this repo)    │   GET /account, GET /devices    │  TeamViewer Host daemon  │
+│  TEAMVIEWER_API_TOKEN   │  ◀───────────────────────────  │  enrolled via assignment │
+└─────────────────────────┘    sees VM by name + state      └──────────────────────────┘
+```
+
+The CLI is **not** installed on the VM. It runs on your laptop and observes the
+remote VM through the TeamViewer account: the VM enrolls as a managed device,
+and the `auth-policy` specialist lists it by name and online/offline state.
+The `connectivity` specialist independently validates reachability of the
+TeamViewer network endpoints from the laptop.
+
+### Prerequisites
+
+- A TeamViewer account.
+- A **WebAPI script token** (Management Console → *Edit profile → Apps →
+  Create script token*) with the **Account: read** and **Device groups /
+  Computers & Contacts: read** scopes. Use it as `TEAMVIEWER_API_TOKEN`.
+- An **assignment token** (Management Console → *Design & Deploy* or the
+  *Assignment* tool) to enroll the VM into your account.
+- Azure CLI logged in: `az login` (the demo uses resource group `TW` in
+  `swedencentral` by default — change with script parameters).
+
+### 1 — Deploy the remote VM (one command)
+
+```powershell
+cd demo/azure
+./Deploy-TeamViewerDemo.ps1 -AssignmentToken "<assignment-token>"
+```
+
+This creates an Ubuntu `Standard_B2s` VM in RG `TW`, installs TeamViewer Host
+headless via [cloud-init](demo/azure/cloud-init.yaml), enables `teamviewerd`,
+and enrolls the device (alias `vm-twc-demo`). Enrollment completes ~2–3 min
+after boot.
+
+### 2 — Run the demo from your laptop
+
+```powershell
+cd "c:\TW CLI"
+npm install; npm run build
+
+$env:TEAMVIEWER_API_TOKEN = "<webapi-script-token>"
+
+# Connectivity health from the laptop:
+node dist/index.js doctor
+
+# Full diagnosis that "sees" the remote VM by name:
+node dist/index.js troubleshoot "VM unreachable" --product "TeamViewer Remote" --target vm-twc-demo
+```
+
+### Expected output
+
+- **auth-policy**: `Authenticated as <you>`, `Managed devices: vm-twc-demo
+  (online), …`, and `Target 'vm-twc-demo' matches managed device 'vm-twc-demo'
+  — online`. If the VM is powered off, it instead reports it **offline** and
+  raises a root cause + remediation.
+- **connectivity**: resolves and reaches `router*.teamviewer.com` / `webapi`
+  on TCP 5938 / 443.
+- The aggregate report (`twc jobs show <jobId> --markdown`) merges these into a
+  ranked root-cause + action list.
+
+> The Foundry Local LLM layer is optional. Without it the deterministic
+> probe-driven baseline still runs and produces the report.
+
+### Cleanup
+
+```powershell
+az group delete --name TW --yes --no-wait
+```
+
+
+## Setup
+
+```bash
+npm install
+npm run build
+cp .env.example .env   # then edit endpoint/model/token as needed
+```
+
+The CLI auto-loads `.env` from the current directory, `~/.twc/.env`, the install
+directory, or `$TWC_HOME/.env`, so a global install still finds its config.
+
+## Running From PowerShell
+
+Global command (if you want to run it from terminal):
+
+```powershell
+npm run build
+npm run link:global
+twc --help
+twc products list
+```
+
+Windows `.exe` executable:
+
+```powershell
+npm install
+npm run build:exe
+.\bin\twc.exe --help
+.\bin\twc.exe products list
+```
+
+Note: `twc.exe` is a native Windows launcher and requires Node.js to be installed on the machine.
+If you run it outside the project root, set `TWC_HOME` to the project path (for example `C:\TW CLI`).
+
+Icon mode (double-click):
+
+- Double-click `bin\\twc.exe`.
+- If no arguments are passed, a persistent console opens with prompt `twc>` (it does not close immediately).
+- On startup, a stylized TeamViewer name is shown with a startup animation.
+- Type CLI commands (`products list`, `jobs list`, etc.) or `exit` to close.
+
+To create a desktop icon:
+
+```powershell
+.\create-desktop-shortcut.ps1
+```
+
+To run it as a command from any folder, add `C:\TW CLI\bin` to the Windows `PATH`.
+
+## Main Commands
+
+### Interactive REPL (Copilot-style)
+
+```powershell
+twc                          # opens the REPL
+twc chat --product teamviewer-remote   # opens the REPL with a preset product
+```
+
+Inside the REPL:
+
+| Command | Purpose |
+|---|---|
+| `<free text>` | describe an issue, runs the workflow synchronously |
+| `/product <key>` | set the active TeamViewer product |
+| `/target <value>` | set the target (default `local-device`) |
+| `/task <debug\|troubleshoot>` | switch task type |
+| `/context <text>` | attach one-shot extra context |
+| `/products` | list whitelist |
+| `/agents` | list Mastra agent roles |
+| `/jobs [N]` | list recent background jobs |
+| `/show <jobId>` | render a job report |
+| `/explain <jobId>` | explain a job report in plain language |
+| `/logs <jobId> [N]` | tail a job log |
+| `/cancel <jobId>` | kill a running job |
+| `/doctor` | Foundry Local health check |
+| `/model` | show endpoint + model |
+| `/clear`, `/help`, `/exit` | screen / help / leave |
+
+### Natural-language input (Tia-style, but in the terminal)
+
+You don't have to set flags. Just describe the problem and the CLI infers the
+**product** and **target** from your sentence; in the REPL it asks a clarifying
+question only when the product is still ambiguous.
+
+```powershell
+# product (tensor) and target (vm-twc-demo) are auto-detected from the text:
+twc "tensor cannot reach device vm-twc-demo"
+
+# inside the REPL, just type:
+twc › remote management monitoring agent stopped on web-prod-01
+  (detected product: TeamViewer Remote Management)
+  (detected target: web-prod-01)
+```
+
+Detection is deterministic (no LLM required); explicit `--product` / `--target`
+always override it.
+
+### Plain-language explanation
+
+Turn any completed job's structured report into a phone-support-style narrative:
+
+```powershell
+twc explain <jobId>      # or  /explain <jobId>  inside the REPL
+```
+
+### Copy-paste remediation
+
+When a fix maps to an OS-native command (e.g. a stopped service), the report
+includes a ready-to-run **Suggested commands** block tailored to the host OS
+(`Start-Service` on Windows, `systemctl enable --now` on Linux, `launchctl` on
+macOS).
+
+### One-shot mode
+
+```powershell
+twc -p "Session drops after 5 minutes" --product teamviewer-remote --target endpoint-001
+twc -p "Policy not applied" --product teamviewer-tensor --markdown
+```
+
+### Subcommand mode
+
+List products:
+
+```bash
+twc products list
+```
+
+Run debug in background:
+
+```bash
+twc debug teamviewer-remote \
+  --target "endpoint-001" \
+  --issue "Session drops after 5 minutes" \
+  --context "VPN enabled, intermittent packet loss"
+```
+
+Run troubleshoot in background:
+
+```bash
+twc troubleshoot teamviewer-tensor \
+  --target "tenant-acme" \
+  --issue "Policy rollout not applied"
+```
+
+List jobs:
+
+```bash
+twc jobs list
+```
+
+Job details (human view):
+
+```bash
+twc jobs show <jobId>
+```
+
+Job details (raw JSON):
+
+```bash
+twc jobs show <jobId> --json
+```
+
+Job details (Markdown, ready to paste into a ticket):
+
+```bash
+twc jobs show <jobId> --markdown
+```
+
+Per-job worker logs:
+
+```bash
+twc jobs logs <jobId> --tail 200
+```
+
+Cancel a running or queued job:
+
+```bash
+twc jobs cancel <jobId>
+```
+
+Diagnose runtime + env:
+
+```bash
+twc doctor
+```
+
+Inspect current configuration:
+
+```bash
+twc config
+```
+
+### Selecting an LLM model
+
+A curated catalog of Foundry Local models is available — switch at any time, no rebuild needed:
+
+```bash
+twc models list                         # show catalog + currently active
+twc models use phi4-mini-gpu            # accept alias or full Foundry id
+twc models use qwen2.5-7b-instruct-generic-gpu:1
+twc models current                      # print active id
+twc models unset                        # clear persisted choice (falls back to env)
+```
+
+Inside the REPL:
+
+```
+twc › /models           # list catalog
+twc › /model            # show active
+twc › /model phi4-mini-gpu
+```
+
+One-shot override (does not persist if you also call `models unset` after):
+
+```bash
+twc -p "Session drops" --product teamviewer-remote --model phi4-mini-gpu
+```
+
+Priority: persisted choice (`models use` / `/model`) > `FOUNDRY_LOCAL_MODEL` env var. To install a model on the host: `foundry model run <id>`.
+
+Run unit tests:
+
+```bash
+npm test
+```
+
+## Foundry Local-Only LLM Configuration
+
+This project is configured for **local-only LLM execution**.
+
+- Remote endpoints are disabled (`MASTRA_AGENT_ENDPOINT` must NOT be set).
+- Heuristic fallback is disabled.
+- Model config is **resolved lazily**: non-LLM commands (`products list`, `jobs list`, `doctor`, `config`) work even if Foundry Local is offline.
+- Foundry Local endpoint is **auto-discovered** via `foundry service status` when `FOUNDRY_LOCAL_ENDPOINT` is not set.
+- All LLM prompts are sanitized (control chars, role markers, length cap) to mitigate prompt injection.
+
+Recommended environment variables:
+
+```powershell
+$env:FOUNDRY_LOCAL_ENDPOINT = "http://127.0.0.1:58991/v1"
+$env:FOUNDRY_LOCAL_MODEL = "phi-3-mini-4k-instruct-qnn-npu:3"
+$env:FOUNDRY_LOCAL_API_KEY = "local-dev-key"
+```
+
+Use `twc doctor` to verify the runtime is reachable and the model is loaded.
+
+Important constraints:
+
+1. `MASTRA_AGENT_ENDPOINT` must not be set.
+2. Local endpoint must be loopback-only (`localhost`, `127.0.0.1`, or `::1`).
+3. If any of the required local settings are missing, the CLI exits with configuration errors.
+
+## Implementation Based On Official Mastra Examples
+
+This solution follows official patterns in Mastra docs/repo:
+
+- Agents using `new Agent(...)` registered in `new Mastra(...)`
+- Typed tools with `createTool(...)`
+- Typed workflow with `createStep(...)`, `createWorkflow(...)`, `.commit()`
+- Workflow execution with `createRun()` + `run.start()`
+
+References used:
+
+- https://mastra.ai/guides/getting-started/quickstart
+- https://mastra.ai/docs/agents/overview
+- https://mastra.ai/docs/workflows/overview
+- https://github.com/mastra-ai/mastra (examples/templates: agent, agent-builder, weather-agent)
+
+## Project Structure
+
+```text
+src/
+  agents/
+    formatReport.ts        # text + Markdown report renderers
+    mastraAdapter.ts       # entry point used by the worker (local-only)
+    profiles.ts            # logical agent role catalogue
+    routing.ts             # issue bucket inference + agent selection
+  catalog/
+    teamviewerProducts.ts  # whitelist
+  jobs/
+    dispatch.ts            # detached worker spawn + per-job log redirect
+    jobStore.ts            # atomic JSON store + retention + log paths
+  mastra/
+    agents/
+      index.ts             # Mastra Agent definitions + lazy model resolver
+    tools/
+      specialistTools.ts   # createTool + deterministic baseline functions
+    util/
+      llmJson.ts           # tolerant JSON extractor + generateStructured()
+      sanitize.ts           # prompt input sanitization
+    workflows/
+      teamviewerTroubleshootWorkflow.ts  # classify → parallel specialists → aggregate
+    foundryLocal.ts        # endpoint discovery + /models probe + loopback guard
+    index.ts               # Mastra instance (agents + workflow + logger)
+    runtime.ts             # createRun + run.start wrapper
+  cli.ts                   # commander definitions (subcommand mode)
+  index.ts                 # bin entry (REPL / one-shot / commander dispatch / worker)
+  oneShot.ts               # synchronous workflow runner with spinner
+  paths.ts                 # .twc-data + logs paths
+  repl.ts                  # interactive Copilot-style REPL + slash commands
+  types.ts                 # shared types (AgentJob, WorkflowReport, …)
+  ui.ts                    # ANSI colors + spinner + banner helpers
+  worker.ts                # standalone worker entry (dev mode)
+  workerCore.ts            # shared worker job execution
+tests/
+  routing.test.ts
+  sanitizeAndJson.test.ts
+  workflowHelpers.test.ts
+docs/
+  mastra-agent-prompts.md
+launcher/                  # .NET single-file Windows launcher (twc.exe)
+bin/                       # build output: twc.exe (+ twc.cmd / twc.ps1 shims)
+dist/                      # tsc output (ESM, used at runtime)
+dist-cjs/                  # optional CJS output (legacy)
+.twc-data/
+  jobs.json                # job store (last 200 jobs)
+  logs/<jobId>.log         # per-job stdout/stderr
+vitest.config.ts
+tsconfig.json
+package.json
+```
+
+## Recommended Hardening
+
+- Encrypt sensitive data in `.twc-data`.
+- Add retry/backoff + circuit breaker around `gatewayAgent.generate` (today only the JSON parser retries).
+- OpenTelemetry tracing for job execution.
+- RBAC for operator role.
+- CLI package signing and distribution checksums.
+- Migrate `.twc-data/jobs.json` to SQLite or JSONL when the operator volume grows.
+
+## Production Hardening (already shipped)
+
+| Concern | Mitigation |
+|---|---|
+| Background jobs never start when CLI runs outside repo root | Worker entrypoint resolved relative to the module (`import.meta.url`), not `process.cwd()` ([src/jobs/dispatch.ts](src/jobs/dispatch.ts)) |
+| Split-brain data store across working dirs | Deterministic, cwd-independent dir: `TWC_HOME` > `~/.twc` > legacy `./.twc-data` (only if no `~/.twc` yet) ([src/paths.ts](src/paths.ts)) |
+| Hanging LLM call | `Promise.race` workflow timeout (default 120 s, override `TWC_WORKFLOW_TIMEOUT_MS`) |
+| Two CLIs writing jobs.json | Cross-process `mkdir` lock with 5 s timeout + stale-lock recovery |
+| Orphaned worker on cancel (Windows) | `taskkill /PID … /T /F` via [src/jobs/killTree.ts](src/jobs/killTree.ts) |
+| Accidental PII / secrets on disk | Email / IPv4 / JWT / bearer-token / `password=` / `api_key=` redaction in [src/jobs/redact.ts](src/jobs/redact.ts), applied at `addJob()` |
+| Crash silently swallowed | Global `uncaughtException` / `unhandledRejection` handlers with stable exit code 70 |
+| `.env` not found after global install | Autoload from CWD, `~/.twc/.env`, install dir and `TWC_HOME` ([src/runtime/bootstrap.ts](src/runtime/bootstrap.ts)); process env always wins. See [.env.example](.env.example) |
+| `doctor` reports NOT READY despite configured model | `twc doctor` now reads the active model from config (`twc models use`), not just `FOUNDRY_LOCAL_MODEL` |
+| Probe failure crashes a specialist branch | Baseline probe call is wrapped; errors become evidence, the branch still completes |
+| Version drift | `--version` reads `package.json` at runtime |
+| REPL ergonomics | Persisted history across sessions (`~/.twc/history`, last 500 entries) |
+| Wrong-model picked at runtime | Explicit `models use` / `/model` wins over `FOUNDRY_LOCAL_MODEL` env |
