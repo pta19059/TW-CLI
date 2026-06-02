@@ -32,6 +32,8 @@ The `twc` prefix is optional inside the interactive shell. Run `twc --help` or `
 | `twc jobs cancel <jobId>` | Kill a running or queued job |
 | `twc explain <jobId>` | Turn a job report into a plain-language narrative |
 | `twc docs ask "<question>" [--live]` | Answer a TeamViewer question from official docs |
+| `twc docs reindex` | Rebuild the local hybrid RAG index from official sources (via Jina) + local ONNX embeddings |
+| `twc docs index` | Show local index status (chunks, embeddings, model) |
 | `twc docs sources` | List the official documentation sources |
 | `twc docs sync` | Pre-fetch & cache all official docs for offline use |
 | `twc models list\|use <id>\|current\|unset` | Manage the active Foundry Local model |
@@ -179,8 +181,8 @@ right probes always run even if the issue text is vague.
 Mastra is the **core orchestrator** of this project. Every job flows through a multi-step Mastra workflow that calls real Mastra agents in parallel against a local LLM (Foundry Local).
 
 1. CLI process (`twc`): command parsing, product validation, job enqueue.
-2. Job store (`.twc-data/jobs.json`): atomic writes + retention (last 200 jobs).
-3. Per-job logs (`.twc-data/logs/<jobId>.log`): stdout/stderr of the detached worker.
+2. Job store (`~/.twc/jobs.json`): atomic writes + retention (last 200 jobs).
+3. Per-job logs (`~/.twc/logs/<jobId>.log`): stdout/stderr of the detached worker.
 4. Detached worker (`dist/worker.js`): background task execution with pid tracking.
 5. Mastra adapter (`src/agents/mastraAdapter.ts`): refuses remote endpoints, delegates entirely to the local runtime.
 6. Mastra runtime (`src/mastra/`): `Mastra` instance with 5 `Agent`s, 4 `createTool` specialists, one multi-step `createWorkflow`.
@@ -245,7 +247,7 @@ twc agents plan --task troubleshoot --issue "Policy not applied" --context "SSO 
 1. `twc troubleshoot teamviewer-remote ...`
 2. whitelist product validation
 3. job creation (`queued`), pid tracked, log file opened
-4. detached worker spawn (stdio redirected to `.twc-data/logs/<id>.log`)
+4. detached worker spawn (stdio redirected to `~/.twc/logs/<id>.log`)
 5. worker moves job to `running`, sets `startedAt`
 6. Mastra workflow runs: classify → parallel specialists → aggregate
 7. worker saves structured report + text + `completedAt`
@@ -690,6 +692,9 @@ src/
   jobs/
     dispatch.ts            # detached worker spawn + per-job log redirect
     jobStore.ts            # atomic JSON store + retention + log paths
+  knowledge/
+    teamviewerDocs.ts      # local hybrid RAG: Jina ingestion, chunking, retrieval
+    localEmbedder.ts       # in-process ONNX embeddings (Transformers.js)
   mastra/
     agents/
       index.ts             # Mastra Agent definitions + lazy model resolver
@@ -706,15 +711,23 @@ src/
   cli.ts                   # commander definitions (subcommand mode)
   index.ts                 # bin entry (REPL / one-shot / commander dispatch / worker)
   oneShot.ts               # synchronous workflow runner with spinner
-  paths.ts                 # .twc-data + logs paths
+  paths.ts                 # ~/.twc data dir + logs/knowledge paths
   repl.ts                  # interactive REPL + slash commands
   types.ts                 # shared types (AgentJob, WorkflowReport, …)
   ui.ts                    # ANSI colors + spinner + banner helpers
   worker.ts                # standalone worker entry (dev mode)
   workerCore.ts            # shared worker job execution
 tests/
+  intent.test.ts
+  knowledge.test.ts        # RAG knowledge layer + local embedder
+  modelCatalog.test.ts
+  probes.test.ts
+  productProfiles.test.ts
+  rag.test.ts              # chunking + cosine similarity
+  redact.test.ts
   routing.test.ts
   sanitizeAndJson.test.ts
+  userConfig.test.ts
   workflowHelpers.test.ts
 docs/
   mastra-agent-prompts.md
@@ -722,9 +735,10 @@ launcher/                  # .NET single-file Windows launcher (twc.exe)
 bin/                       # build output: twc.exe (+ twc.cmd / twc.ps1 shims)
 dist/                      # tsc output (ESM, used at runtime)
 dist-cjs/                  # optional CJS output (legacy)
-.twc-data/
+~/.twc/                  # per-user data dir (production default; legacy ./.twc-data)
   jobs.json                # job store (last 200 jobs)
   logs/<jobId>.log         # per-job stdout/stderr
+  knowledge/rag-index.json # local hybrid RAG index (chunks + embeddings)
 vitest.config.ts
 tsconfig.json
 package.json
