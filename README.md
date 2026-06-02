@@ -1,5 +1,7 @@
 # TWC CLI (TeamViewer Command Line)
 
+![TWC CLI interactive shell](docs/assets/banner.png)
+
 Copilot-style CLI focused on TeamViewer products, with `debug` and `troubleshoot` tasks executed in the background by a Mastra agent backend.
 
 The UX is modeled on **GitHub Copilot CLI**:
