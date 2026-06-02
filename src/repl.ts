@@ -47,7 +47,7 @@ const HELP_LINES = [
   `${color.bold("/models")}              list curated model catalog`,
   `${color.bold("/clear")}               clear the screen`,
   `${color.bold("/help")}                show this help`,
-  `${color.bold("/exit, /quit")}         leave the session (Ctrl+C also works)`
+  `${color.bold("/exit, /quit")}         leave the session (Ctrl+C clears the line; press it twice to quit)`
 ];
 
 function showHelp(): void {
@@ -240,8 +240,19 @@ async function ensureProduct(state: ReplState, rl: readline.Interface): Promise<
   return product;
 }
 
+// Tracks whether we are currently waiting for a line of input, plus the
+// timestamp of the last Ctrl+C so a quick double press still allows exit.
+let questionActive = false;
+let lastSigintAt = 0;
+
 function ask(rl: readline.Interface, prompt: string): Promise<string> {
-  return new Promise((resolve) => rl.question(prompt, (answer) => resolve(answer)));
+  questionActive = true;
+  return new Promise((resolve) =>
+    rl.question(prompt, (answer) => {
+      questionActive = false;
+      resolve(answer);
+    })
+  );
 }
 
 async function handleSlash(line: string, state: ReplState, rl: readline.Interface): Promise<boolean> {
@@ -344,7 +355,26 @@ export async function runRepl(options: ReplOptions = {}): Promise<void> {
   greet(state);
 
   let alive = true;
-  rl.on("SIGINT", () => { alive = false; rl.close(); });
+  // Ctrl+C should NOT drop the user out of the shell. Instead it discards the
+  // current input line and redraws the prompt (like a typical shell). A second
+  // Ctrl+C within 1.5s is an escape hatch so the user is never trapped; /exit
+  // and /quit remain the explicit ways to leave.
+  rl.on("SIGINT", () => {
+    const now = Date.now();
+    if (now - lastSigintAt < 1500) {
+      alive = false;
+      rl.close();
+      return;
+    }
+    lastSigintAt = now;
+    // Drop whatever was being typed.
+    const editable = rl as unknown as { line: string; cursor: number };
+    editable.line = "";
+    editable.cursor = 0;
+    process.stdout.write("\n");
+    console.log(color.dim("  (^C — input cleared. Press Ctrl+C again or type /exit to quit.)"));
+    if (questionActive) rl.prompt();
+  });
 
   while (alive) {
     const promptLabel = color.magenta("twc") + color.dim(" › ");
