@@ -2,9 +2,9 @@
 
 ![TWC CLI interactive shell](docs/assets/banner.png)
 
-Copilot-style CLI focused on TeamViewer products, with `debug` and `troubleshoot` tasks executed in the background by a Mastra agent backend.
+Interactive CLI focused on TeamViewer products, with `debug` and `troubleshoot` tasks executed in the background by a Mastra agent backend.
 
-The UX is modeled on **GitHub Copilot CLI**:
+The CLI offers several ways to work:
 
 - `twc` with no arguments → interactive REPL with banner, model/endpoint info, slash commands.
 - `twc -p "<issue>"` → one-shot synchronous run with spinner.
@@ -65,7 +65,7 @@ for troubleshooting workflows, TWC CLI offers concrete advantages:
 | Network dependency | Requires TeamViewer **Web API token** + cloud calls | **Works offline** for most probes; inference is **loopback-only** (no cloud, no telemetry) |
 | Privacy | Sends data to TeamViewer cloud API | **100% on-device** LLM (Foundry Local, NPU-accelerated); built-in **secret/PII redaction** ([src/jobs/redact.ts](src/jobs/redact.ts)) |
 | Execution model | Synchronous cmdlets | **Non-blocking job model** — detached worker per command, job store, per-job logs, retention |
-| UX | Cmdlets only | **Copilot-style**: REPL + one-shot + free-text + slash commands |
+| UX | Cmdlets only | **Modern terminal UX**: REPL + one-shot + free-text + slash commands |
 | Guardrails | API permissions | **Product whitelist**, sanitized prompts, strict **no-fallback Foundry Local** policy |
 | Model choice | n/a | **Swappable curated catalog** (`twc models use …`), NPU/CPU builds, reasoning models (DeepSeek-R1, Phi-4) |
 | Runtime | PowerShell 5.1 / 7 | Node ESM + cross-platform **single-file .NET launcher** (`twc`) |
@@ -82,7 +82,7 @@ for troubleshooting workflows, TWC CLI offers concrete advantages:
    and log-intelligence probes are purpose-built for *"why isn't TeamViewer working?"* — a
    scenario TeamViewerPS does not address.
 4. **Operational ergonomics.** Detached background jobs, persisted logs, structured reports,
-   and a Copilot-style REPL make it usable both interactively and in automation.
+   and an interactive REPL make it usable both interactively and in automation.
 5. **Security hardening.** Built-in redaction of emails/IPs/JWTs/tokens/`password=` pairs,
    input sanitization, and a product whitelist.
 
@@ -391,7 +391,7 @@ To run it as a command from any folder, add `C:\TW CLI\bin` to the Windows `PATH
 
 ## Main Commands
 
-### Interactive REPL (Copilot-style)
+### Interactive REPL
 
 ```powershell
 twc                          # opens the REPL
@@ -649,7 +649,7 @@ src/
   index.ts                 # bin entry (REPL / one-shot / commander dispatch / worker)
   oneShot.ts               # synchronous workflow runner with spinner
   paths.ts                 # .twc-data + logs paths
-  repl.ts                  # interactive Copilot-style REPL + slash commands
+  repl.ts                  # interactive REPL + slash commands
   types.ts                 # shared types (AgentJob, WorkflowReport, …)
   ui.ts                    # ANSI colors + spinner + banner helpers
   worker.ts                # standalone worker entry (dev mode)
