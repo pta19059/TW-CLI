@@ -38,6 +38,40 @@ The `twc` prefix is optional inside the interactive shell. Run `twc --help` or `
 | `twc doctor` | Diagnose Foundry Local runtime, env vars and data dirs |
 | `twc config` | Print the resolved configuration |
 
+### Worked examples (real values)
+
+Copy-paste these to see exactly how a command is structured:
+
+```powershell
+# Natural language — product (Tensor) and target (vm-twc-demo) are auto-detected:
+twc "tensor session drops on vm-twc-demo after 5 minutes"
+
+# One-shot troubleshoot, fully explicit, Markdown report for a ticket:
+twc -p "Session drops after 5 minutes" --product teamviewer-remote --target endpoint-001 --context "VPN on, intermittent packet loss" --markdown
+
+# Background troubleshoot job for Tensor policy rollout:
+twc troubleshoot teamviewer-tensor --target tenant-acme --issue "Policy rollout not applied" --context "EU region, 1200 devices"
+
+# Background debug job for the desktop client:
+twc debug teamviewer-remote --target endpoint-001 --issue "Cannot connect to remote device" --context "Behind corporate proxy"
+
+# Inspect the job that the two commands above queued:
+twc jobs list --limit 5
+twc jobs show 8fK2aQ9xLp --markdown
+twc jobs logs 8fK2aQ9xLp --tail 100
+
+# Ask the official docs and explain a finished report in plain language:
+twc docs ask "which ports does teamviewer use"
+twc explain 8fK2aQ9xLp
+
+# Pick a different on-device model, then run with it:
+twc models use deepseek-r1-7b
+twc -p "Web API token rejected" --product teamviewer-tensor
+```
+
+> `8fK2aQ9xLp` is just an example job id — use the id printed by `twc jobs list`
+> or returned when you queue a `debug` / `troubleshoot` job.
+
 ## Goal
 
 - Allow operations only on whitelisted TeamViewer products.
