@@ -401,7 +401,7 @@ A curated catalog of Foundry Local models is available — switch at any time, n
 
 ```bash
 twc models list                         # show catalog + currently active
-twc models use phi4-mini-gpu            # accept alias or full Foundry id
+twc models use deepseek-r1-7b           # accept alias or full Foundry id
 twc models use qwen2.5-7b-instruct-generic-gpu:1
 twc models current                      # print active id
 twc models unset                        # clear persisted choice (falls back to env)
@@ -412,13 +412,13 @@ Inside the REPL:
 ```
 twc › /models           # list catalog
 twc › /model            # show active
-twc › /model phi4-mini-gpu
+twc › /model deepseek-r1-7b
 ```
 
 One-shot override (does not persist if you also call `models unset` after):
 
 ```bash
-twc -p "Session drops" --product teamviewer-remote --model phi4-mini-gpu
+twc -p "Session drops" --product teamviewer-remote --model deepseek-r1-7b
 ```
 
 Priority: persisted choice (`models use` / `/model`) > `FOUNDRY_LOCAL_MODEL` env var. To install a model on the host: `foundry model run <id>`.
@@ -443,7 +443,7 @@ Recommended environment variables:
 
 ```powershell
 $env:FOUNDRY_LOCAL_ENDPOINT = "http://127.0.0.1:58991/v1"
-$env:FOUNDRY_LOCAL_MODEL = "phi-3-mini-4k-instruct-qnn-npu:3"
+$env:FOUNDRY_LOCAL_MODEL = "deepseek-r1-distill-qwen-7b-qnn-npu:2"
 $env:FOUNDRY_LOCAL_API_KEY = "local-dev-key"
 ```
 

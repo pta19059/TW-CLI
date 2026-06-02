@@ -16,61 +16,64 @@ export interface ModelEntry {
 }
 
 export const MODEL_CATALOG: ReadonlyArray<ModelEntry> = [
+  // --- Reasoning-focused (recommended) ---
+  {
+    id: "deepseek-r1-distill-qwen-7b-qnn-npu:2",
+    alias: "deepseek-r1-7b",
+    family: "DeepSeek",
+    accelerator: "npu",
+    description: "DeepSeek-R1 distilled into Qwen 7B, Snapdragon NPU build — strongest reasoning that still runs on the NPU. Default."
+  },
+  {
+    id: "Phi-4-mini-reasoning-generic-cpu:3",
+    alias: "phi4-mini-reasoning",
+    family: "Microsoft Phi",
+    accelerator: "cpu",
+    description: "Phi-4 Mini Reasoning, CPU build — purpose-built for step-by-step reasoning (slower, CPU only)."
+  },
+  {
+    id: "Phi-4-generic-cpu:2",
+    alias: "phi4",
+    family: "Microsoft Phi",
+    accelerator: "cpu",
+    description: "Phi-4 full, CPU build — highest-quality Phi reasoning, heavy (10 GB, CPU only)."
+  },
+  // --- Strong + tool-calling on NPU ---
+  {
+    id: "qwen2.5-7b-instruct-qnn-npu:2",
+    alias: "qwen2.5-7b",
+    family: "Alibaba Qwen",
+    accelerator: "npu",
+    description: "Qwen2.5 7B Instruct, Snapdragon NPU build — strong multilingual reasoning + native tool calling."
+  },
+  {
+    id: "qwen2.5-1.5b-instruct-qnn-npu:2",
+    alias: "qwen2.5-1.5b",
+    family: "Alibaba Qwen",
+    accelerator: "npu",
+    description: "Qwen2.5 1.5B Instruct, NPU build — light + fast, supports tool calling."
+  },
+  // --- Phi small / fast (NPU) ---
   {
     id: "phi-3-mini-4k-instruct-qnn-npu:3",
     alias: "phi3-mini-npu",
     family: "Microsoft Phi",
     accelerator: "npu",
-    description: "Phi-3 Mini 4K, Snapdragon NPU build — default for Copilot+ PCs."
+    description: "Phi-3 Mini 4K, Snapdragon NPU build — fastest, lightweight default for Copilot+ PCs."
   },
   {
-    id: "phi-3.5-mini-instruct-generic-gpu:1",
-    alias: "phi3.5-mini-gpu",
+    id: "phi-3.5-mini-instruct-qnn-npu:2",
+    alias: "phi3.5-mini-npu",
     family: "Microsoft Phi",
-    accelerator: "gpu",
-    description: "Phi-3.5 Mini Instruct, generic GPU build."
+    accelerator: "npu",
+    description: "Phi-3.5 Mini Instruct, NPU build — small + fast, improved over Phi-3 Mini."
   },
   {
-    id: "phi-4-mini-instruct-generic-gpu:1",
-    alias: "phi4-mini-gpu",
+    id: "phi-3-mini-128k-instruct-qnn-npu:3",
+    alias: "phi3-mini-128k-npu",
     family: "Microsoft Phi",
-    accelerator: "gpu",
-    description: "Phi-4 Mini Instruct, generic GPU build — stronger reasoning."
-  },
-  {
-    id: "phi-4-mini-instruct-generic-cpu:1",
-    alias: "phi4-mini-cpu",
-    family: "Microsoft Phi",
-    accelerator: "cpu",
-    description: "Phi-4 Mini Instruct, CPU fallback build."
-  },
-  {
-    id: "qwen2.5-7b-instruct-generic-gpu:1",
-    alias: "qwen2.5-7b-gpu",
-    family: "Alibaba Qwen",
-    accelerator: "gpu",
-    description: "Qwen2.5 7B Instruct, generic GPU build — strong multilingual."
-  },
-  {
-    id: "qwen2.5-0.5b-instruct-generic-cpu:1",
-    alias: "qwen2.5-0.5b-cpu",
-    family: "Alibaba Qwen",
-    accelerator: "cpu",
-    description: "Qwen2.5 0.5B Instruct, ultra-light CPU build."
-  },
-  {
-    id: "mistralai-Mistral-7B-Instruct-v0-2-generic-gpu:1",
-    alias: "mistral-7b-gpu",
-    family: "Mistral AI",
-    accelerator: "gpu",
-    description: "Mistral 7B Instruct v0.2, generic GPU build."
-  },
-  {
-    id: "deepseek-r1-distill-qwen-7b-generic-gpu:1",
-    alias: "deepseek-r1-7b-gpu",
-    family: "DeepSeek",
-    accelerator: "gpu",
-    description: "DeepSeek-R1 distilled into Qwen 7B — reasoning-focused."
+    accelerator: "npu",
+    description: "Phi-3 Mini 128K, NPU build — long-context variant for large log bundles."
   }
 ];
 

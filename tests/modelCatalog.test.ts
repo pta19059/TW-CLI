@@ -9,7 +9,7 @@ describe("modelCatalog", () => {
   });
 
   it("resolveModelId accepts alias", () => {
-    expect(resolveModelId("phi4-mini-gpu")).toBe("phi-4-mini-instruct-generic-gpu:1");
+    expect(resolveModelId("deepseek-r1-7b")).toBe("deepseek-r1-distill-qwen-7b-qnn-npu:2");
   });
 
   it("resolveModelId accepts full id verbatim", () => {
@@ -26,8 +26,8 @@ describe("modelCatalog", () => {
   });
 
   it("findEntry locates by id and alias", () => {
-    expect(findEntry("phi4-mini-gpu")?.id).toBe("phi-4-mini-instruct-generic-gpu:1");
-    expect(findEntry("phi-4-mini-instruct-generic-gpu:1")?.alias).toBe("phi4-mini-gpu");
+    expect(findEntry("deepseek-r1-7b")?.id).toBe("deepseek-r1-distill-qwen-7b-qnn-npu:2");
+    expect(findEntry("deepseek-r1-distill-qwen-7b-qnn-npu:2")?.alias).toBe("deepseek-r1-7b");
     expect(findEntry("nonexistent")).toBeUndefined();
   });
 });
