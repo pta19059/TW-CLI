@@ -15,6 +15,53 @@ The UX is modeled on **GitHub Copilot CLI**:
 - Launch non-blocking agent tasks (detached worker per command).
 - Return structured reports: hypotheses, evidence, root-cause scoring, remediation, confidence, escalation.
 
+## TWC CLI vs TeamViewerPS
+
+[TeamViewerPS](https://github.com/teamviewer/TeamViewerPS) is the official PowerShell
+module from TeamViewer. It is an **administration / automation** wrapper around the
+TeamViewer Web API (user management, user groups, roles, managed groups, policy
+management, SSO, Computers & Contacts) plus a few local utility cmdlets
+(`Get-TeamViewerId`, `Get-TeamViewerVersion`, `Get-TeamViewerInstallationType`).
+
+TWC CLI solves a **different problem**: AI-assisted, local-first **diagnostics and
+root-cause troubleshooting**. The two are complementary rather than competing — but
+for troubleshooting workflows, TWC CLI offers concrete advantages:
+
+| Dimension | TeamViewerPS | **TWC CLI (this project)** |
+| --- | --- | --- |
+| Primary purpose | Administer/provision accounts via Web API | **Diagnose & troubleshoot** TeamViewer issues |
+| Intelligence | None — returns raw API objects | **Local LLM + 5 Mastra agents**: hypotheses, root-cause scoring, remediation, confidence, escalation |
+| Output | PowerShell objects | **Structured Markdown reports** (evidence-anchored) |
+| Real diagnostic probes | No | **Yes** — connectivity (DNS/TCP `5938`/HTTPS), endpoint health (services/registry/processes), auth-policy, log clustering |
+| Network dependency | Requires TeamViewer **Web API token** + cloud calls | **Works offline** for most probes; inference is **loopback-only** (no cloud, no telemetry) |
+| Privacy | Sends data to TeamViewer cloud API | **100% on-device** LLM (Foundry Local, NPU-accelerated); built-in **secret/PII redaction** ([src/jobs/redact.ts](src/jobs/redact.ts)) |
+| Execution model | Synchronous cmdlets | **Non-blocking job model** — detached worker per command, job store, per-job logs, retention |
+| UX | Cmdlets only | **Copilot-style**: REPL + one-shot + free-text + slash commands |
+| Guardrails | API permissions | **Product whitelist**, sanitized prompts, strict **no-fallback Foundry Local** policy |
+| Model choice | n/a | **Swappable curated catalog** (`twc models use …`), NPU/CPU builds, reasoning models (DeepSeek-R1, Phi-4) |
+| Runtime | PowerShell 5.1 / 7 | Node ESM + cross-platform **single-file .NET launcher** (`twc`) |
+
+**Key advantages of TWC CLI**
+
+1. **Root-cause analysis, not raw data.** TeamViewerPS hands you API objects; TWC CLI runs
+   parallel specialist agents over real probe evidence and produces ranked hypotheses,
+   remediation steps, a confidence score, and an escalation decision.
+2. **Local-first & private by design.** All LLM inference is forced to a loopback Foundry
+   Local endpoint (`localhost`/`127.0.0.1`/`::1`) with **no fallback** to remote providers —
+   nothing leaves the machine, and most probes need no API token at all.
+3. **Diagnostics TeamViewerPS simply doesn't have.** Connectivity, endpoint health, auth/policy
+   and log-intelligence probes are purpose-built for *"why isn't TeamViewer working?"* — a
+   scenario TeamViewerPS does not address.
+4. **Operational ergonomics.** Detached background jobs, persisted logs, structured reports,
+   and a Copilot-style REPL make it usable both interactively and in automation.
+5. **Security hardening.** Built-in redaction of emails/IPs/JWTs/tokens/`password=` pairs,
+   input sanitization, and a product whitelist.
+
+**When to use TeamViewerPS instead:** for *managing* a TeamViewer account — creating users,
+assigning policies/roles, configuring SSO, syncing Computers & Contacts. TWC CLI does **not**
+provision or mutate account state. A natural workflow is: **TeamViewerPS to administer**, then
+**TWC CLI to diagnose** when something breaks.
+
 ## Supported TeamViewer Products (Whitelist)
 
 - TeamViewer Remote (`teamviewer-remote`)
