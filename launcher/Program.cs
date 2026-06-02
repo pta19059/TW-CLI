@@ -83,14 +83,33 @@ static void RunClickMode(string root)
     Console.WriteLine("Type 'help' for assistance, 'exit' to close.");
     Console.WriteLine();
 
+    // Ctrl+C must NOT close the window. Intercept it: it cancels the current
+    // input line (or the running child command) and returns to the prompt.
+    // Exit is only via 'exit'/'quit' or real EOF (Ctrl+Z then Enter).
+    var cancelRequested = false;
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;        // keep the launcher (and its window) alive
+        cancelRequested = true;
+    };
+
     while (true)
     {
+        cancelRequested = false;
         Console.Write("twc> ");
         var line = Console.ReadLine();
 
         if (line is null)
         {
-            break;
+            // Ctrl+C interrupts ReadLine and yields null; treat it as "clear
+            // the line" and keep going instead of exiting the shell.
+            if (cancelRequested)
+            {
+                cancelRequested = false;
+                Console.WriteLine();
+                continue;
+            }
+            break; // genuine EOF (Ctrl+Z)
         }
 
         var trimmed = line.Trim();
