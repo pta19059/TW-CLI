@@ -369,69 +369,60 @@ export async function syncOfficialDocs(): Promise<{ id: string; ok: boolean; det
   return results;
 }
 
-/** Resolve a DuckDuckGo redirect link (//duckduckgo.com/l/?uddg=…) to its target URL. */
-function decodeDdgUrl(href: string): string | null {
-  try {
-    const normalized = href.replace(/&amp;/g, "&");
-    const abs = normalized.startsWith("//") ? `https:${normalized}` : normalized;
-    const u = new URL(abs);
-    const uddg = u.searchParams.get("uddg");
-    if (uddg) return decodeURIComponent(uddg);
-    // Direct (non-redirect) result link.
-    return isAllowedHost(abs) ? abs : null;
-  } catch {
-    return null;
-  }
+/** API key for Brave Search (free tier). Read from the environment, never hardcoded. */
+function braveApiKey(): string | undefined {
+  return process.env.BRAVE_API_KEY || process.env.BRAVE_SEARCH_API_KEY || undefined;
+}
+
+/** True when a live web-search provider is configured (Brave API key present). */
+export function isWebSearchConfigured(): boolean {
+  return Boolean(braveApiKey());
 }
 
 /**
- * Live web search restricted to official TeamViewer hosts via the DuckDuckGo
- * HTML endpoint (no API key, no local cache). Returns the result titles, URLs
- * and snippets so the knowledge layer can ground answers and cite official
- * pages even when those pages reject direct fetches (TLS/WAF).
+ * Live web search restricted to official TeamViewer hosts via the Brave Search
+ * API (no local cache). Requires a free Brave API key in BRAVE_API_KEY. Returns
+ * result titles, URLs and snippets so the knowledge layer can ground answers and
+ * cite official pages even when those pages reject direct fetches (TLS/WAF).
+ *
+ * Brave is used instead of DuckDuckGo HTML: DDG is unofficial and serves an
+ * anti-bot CAPTCHA (HTTP 202) on burst/automated traffic, whereas Brave is a
+ * documented API with stable JSON and no CAPTCHA.
  */
 export async function searchTeamViewerWeb(query: string, limit = 5): Promise<WebSearchResult[]> {
-  const ddgQuery = `site:teamviewer.com ${query}`.trim();
-  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(ddgQuery)}`;
+  const key = braveApiKey();
+  if (!key) return []; // No provider configured — caller degrades to verified facts.
+
+  const q = `site:teamviewer.com ${query}`.trim();
+  const url =
+    `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}` +
+    `&count=${Math.min(Math.max(limit, 1), 20)}&safesearch=off`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
     const res = await fetch(url, {
       signal: controller.signal,
       redirect: "follow",
-      headers: { "User-Agent": BROWSER_UA, Accept: "text/html" }
+      headers: { Accept: "application/json", "Accept-Encoding": "gzip", "X-Subscription-Token": key }
     });
-    const html = await res.text();
-    // DuckDuckGo HTML is unofficial and serves an anti-bot challenge (HTTP 202
-    // with a CAPTCHA page) when it suspects automated/burst traffic. Detect it
-    // and degrade cleanly to the offline verified facts instead of parsing junk.
-    if (res.status !== 200 || /complete the following challenge|bots use DuckDuckGo/i.test(html)) {
-      return [];
-    }
-
-    const links: { title: string; url: string }[] = [];
-    const linkRe = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-    let m: RegExpExecArray | null;
-    while ((m = linkRe.exec(html)) && links.length < limit * 2) {
-      const target = decodeDdgUrl(m[1]);
-      if (target && isAllowedHost(target)) {
-        links.push({ title: stripHtml(m[2]), url: target });
-      }
-    }
-
-    const snippets: string[] = [];
-    const snipRe = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
-    while ((m = snipRe.exec(html)) !== null) {
-      snippets.push(stripHtml(m[1]));
-    }
+    if (res.status !== 200) return [];
+    const data = (await res.json()) as {
+      web?: { results?: { title?: string; url?: string; description?: string }[] };
+    };
+    const results = data.web?.results ?? [];
 
     const out: WebSearchResult[] = [];
     const seen = new Set<string>();
-    for (let i = 0; i < links.length && out.length < limit; i++) {
-      const { title, url: u } = links[i];
-      if (seen.has(u)) continue;
+    for (const r of results) {
+      if (out.length >= limit) break;
+      const u = r.url ?? "";
+      if (!u || seen.has(u) || !isAllowedHost(u)) continue;
       seen.add(u);
-      out.push({ title, url: u, snippet: snippets[i] ?? "" });
+      out.push({
+        title: stripHtml(r.title ?? ""),
+        url: u,
+        snippet: stripHtml(r.description ?? "")
+      });
     }
     return out;
   } catch {

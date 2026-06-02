@@ -18,6 +18,7 @@ import { getCliVersion } from "./version.js";
 import {
   OFFICIAL_DOCS,
   answerFromKnowledge,
+  isWebSearchConfigured,
   syncOfficialDocs
 } from "./knowledge/teamviewerDocs.js";
 
@@ -312,6 +313,9 @@ export function buildCli(): Command {
         for (const c of result.citations) console.log(`  - ${c}`);
       }
       console.log(`\nConfident: ${result.confident ? "yes" : "no"}`);
+      if (options.live && !isWebSearchConfigured()) {
+        console.log("\nTip: set BRAVE_API_KEY to enable live web search (free key: https://brave.com/search/api/).");
+      }
     });
 
   docs

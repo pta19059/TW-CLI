@@ -287,10 +287,12 @@ Two layers (`src/knowledge/teamviewerDocs.ts`):
    instant, offline reuse. Fetches are restricted to a `*.teamviewer.com` host allowlist (SSRF
    guard); there is **no archive/Wayback fallback** — docs come straight from the source.
 3. **Live web search (`--live`)** — because teamviewer.com rejects direct fetches behind its
-   WAF (TLS handshake failure), `--live` also runs a live search via the DuckDuckGo HTML
-   endpoint, **restricted to official `*.teamviewer.com` hosts** (no API key, no local cache).
-   The result titles, snippets and URLs ground the answer and are cited as sources — so even
-   pages that can't be fetched directly still yield a grounded, sourced answer.
+   WAF (TLS handshake failure), `--live` also runs a live search via the **Brave Search API**,
+   **restricted to official `*.teamviewer.com` hosts** (no local cache). The result titles,
+   snippets and URLs ground the answer and are cited as sources — so even pages that can't be
+   fetched directly still yield a grounded, sourced answer. Set a free Brave key in the
+   `BRAVE_API_KEY` environment variable (get one at https://brave.com/search/api/); without it
+   `--live` degrades cleanly to the offline verified facts.
 
 Every specialist agent and the gateway agent get a `tw-official-docs` tool. When a model is
 unsure it calls the tool; if the answer isn't grounded the tool returns `confident: false` and
