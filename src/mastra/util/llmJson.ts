@@ -42,12 +42,18 @@ export interface GenerateLike {
 export interface ParseOptions<T> {
   schema: ZodSchema<T>;
   retries?: number;
-  fallback: T;
+  /**
+   * Optional safety net. When provided, it is returned if every LLM attempt
+   * fails. When omitted (the default for agent calls) a persistent failure is
+   * thrown: Foundry Local is mandatory and there is no heuristic fallback.
+   */
+  fallback?: T;
 }
 
 /**
- * Call an agent, parse strict-JSON output against a Zod schema, retry on failure,
- * return fallback if all attempts fail. Designed for small NPU/local models.
+ * Call an agent, parse strict-JSON output against a Zod schema and retry on
+ * failure. If `fallback` is provided it is returned when all attempts fail;
+ * otherwise the last error is thrown. Designed for small NPU/local models.
  */
 export async function generateStructured<T>(
   agent: GenerateLike,
@@ -67,8 +73,12 @@ export async function generateStructured<T>(
       prompt = `${prompt}\n\nIMPORTANT: Reply ONLY with valid JSON matching the schema. No prose, no markdown.`;
     }
   }
-  void lastError;
-  return options.fallback;
+  if (options.fallback !== undefined) {
+    return options.fallback;
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("LLM structured generation failed and no fallback was provided");
 }
 
 export { z };

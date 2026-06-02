@@ -68,3 +68,28 @@ export async function probeFoundryLocal(endpoint: string, timeoutMs = 3000): Pro
     clearTimeout(timer);
   }
 }
+
+/**
+ * Hard gate used before every agent/workflow run. Foundry Local is mandatory:
+ * if no loopback endpoint is configured or the service is unreachable, this
+ * throws an actionable error instead of allowing any heuristic fallback.
+ */
+export async function ensureFoundryLocalReady(timeoutMs = 4000): Promise<void> {
+  const endpoint = discoverFoundryEndpoint();
+  if (!endpoint) {
+    throw new Error(
+      "Foundry Local is required but no endpoint is configured. Start it with 'foundry service start' or set FOUNDRY_LOCAL_ENDPOINT. No fallback is available."
+    );
+  }
+  if (!isLoopbackEndpoint(endpoint)) {
+    throw new Error(
+      `Foundry Local endpoint '${endpoint}' is not a loopback address. Only localhost/127.0.0.1/::1 are allowed.`
+    );
+  }
+  const status = await probeFoundryLocal(endpoint, timeoutMs);
+  if (!status.reachable) {
+    throw new Error(
+      `Foundry Local is not reachable at ${endpoint} (${status.error ?? "unknown error"}). Start it with 'foundry service start' and load a model — agents run only on Foundry Local, with no fallback.`
+    );
+  }
+}

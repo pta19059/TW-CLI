@@ -9,7 +9,6 @@ import {
   RootCauseCandidate,
   WorkflowReport
 } from "../../types.js";
-import { productName } from "../../catalog/teamviewerProducts.js";
 import { inferIssueBuckets, selectAgents } from "../../agents/routing.js";
 import type { Agent } from "@mastra/core/agent";
 import {
@@ -101,38 +100,32 @@ const classifyStep = createStep({
       context: inputData.context
     });
 
-    let buckets = deterministicBuckets;
-    let hypotheses: string[] = [];
+    // Foundry Local is mandatory. The LLM classification runs with no fallback;
+    // a persistent failure throws and fails the job. The deterministic buckets
+    // are only a seed that is merged with the model's output, never a substitute.
+    const planPrompt =
+      "You are a TeamViewer triage planner. Classify the issue into one or more buckets " +
+      "from this exact set: connectivity, auth-policy, endpoint-health, log-intelligence, generic. " +
+      "Also produce 3-6 short triage hypotheses ordered most-likely-first.\n" +
+      `Task: ${inputData.task}\n` +
+      `Product: ${inputData.product}\n` +
+      `Target: ${sanitizePromptInput(inputData.target, 200)}\n` +
+      `Issue: ${issue}\n` +
+      `Context: ${context || "none"}\n\n` +
+      'Reply ONLY with JSON: {"buckets":["..."],"hypotheses":["..."]}';
 
-    try {
-      const planPrompt =
-        "You are a TeamViewer triage planner. Classify the issue into one or more buckets " +
-        "from this exact set: connectivity, auth-policy, endpoint-health, log-intelligence, generic. " +
-        "Also produce 3-6 short triage hypotheses ordered most-likely-first.\n" +
-        `Task: ${inputData.task}\n` +
-        `Product: ${inputData.product}\n` +
-        `Target: ${sanitizePromptInput(inputData.target, 200)}\n` +
-        `Issue: ${issue}\n` +
-        `Context: ${context || "none"}\n\n` +
-        'Reply ONLY with JSON: {"buckets":["..."],"hypotheses":["..."]}';
+    const parsed = await generateStructured(gatewayAgent, planPrompt, {
+      schema: z.object({
+        buckets: z.array(z.string()).min(1),
+        hypotheses: z.array(z.string()).default([])
+      }),
+      retries: 1
+    });
 
-      const fallback = { buckets: deterministicBuckets, hypotheses: [] as string[] };
-      const parsed = await generateStructured(gatewayAgent, planPrompt, {
-        schema: z.object({
-          buckets: z.array(z.string()).min(1),
-          hypotheses: z.array(z.string()).default([])
-        }),
-        retries: 1,
-        fallback
-      });
-
-      const allowed = new Set(["connectivity", "auth-policy", "endpoint-health", "log-intelligence", "generic"]);
-      const cleaned = parsed.buckets.map((b) => b.toLowerCase().trim()).filter((b) => allowed.has(b));
-      buckets = cleaned.length > 0 ? Array.from(new Set([...deterministicBuckets, ...cleaned])) : deterministicBuckets;
-      hypotheses = (parsed.hypotheses ?? []).map((h) => h.trim()).filter(Boolean).slice(0, 6);
-    } catch {
-      // keep deterministic fallback
-    }
+    const allowed = new Set(["connectivity", "auth-policy", "endpoint-health", "log-intelligence", "generic"]);
+    const cleaned = parsed.buckets.map((b) => b.toLowerCase().trim()).filter((b) => allowed.has(b));
+    const buckets = Array.from(new Set([...deterministicBuckets, ...cleaned]));
+    let hypotheses = (parsed.hypotheses ?? []).map((h) => h.trim()).filter(Boolean).slice(0, 6);
 
     if (hypotheses.length === 0) {
       hypotheses = [`Issue statement baseline: ${inputData.issue}`];
@@ -247,26 +240,20 @@ function buildSpecialistStep(def: SpecialistDef) {
         'Reply ONLY with JSON: {"hypotheses":["..."],"rootCauses":[{"title":"...","score":0.7,"rationale":"..."}],"actions":[{"step":"...","risk":"low","rollback":"..."}]}';
 
       type Enrichment = z.infer<typeof enrichmentSchema>;
-      const fallback: Enrichment = { hypotheses: [], rootCauses: [], actions: [] };
-      let status: SpecialistResult["status"] = "completed";
-      let note = `Mastra agent ${def.key} executed`;
-      let enrichment: Enrichment = fallback;
 
-      try {
-        const result = await generateStructured(def.agent, prompt, {
-          schema: enrichmentSchema,
-          retries: 1,
-          fallback
-        });
-        enrichment = {
-          hypotheses: result.hypotheses ?? [],
-          rootCauses: result.rootCauses ?? [],
-          actions: result.actions ?? []
-        };
-      } catch (err) {
-        status = "failed";
-        note = `Agent ${def.key} failed: ${err instanceof Error ? err.message : "unknown"}`;
-      }
+      // Foundry Local is mandatory: no fallback. A persistent LLM failure throws
+      // and fails the whole job rather than degrading to baseline-only output.
+      const result = await generateStructured(def.agent, prompt, {
+        schema: enrichmentSchema,
+        retries: 1
+      });
+      const enrichment: Enrichment = {
+        hypotheses: result.hypotheses ?? [],
+        rootCauses: result.rootCauses ?? [],
+        actions: result.actions ?? []
+      };
+      const status: SpecialistResult["status"] = "completed";
+      const note = `Mastra agent ${def.key} executed via Foundry Local`;
 
       const enrichmentRoots = enrichment.rootCauses ?? [];
       const enrichmentActions = enrichment.actions ?? [];
@@ -354,8 +341,7 @@ const aggregateStep = createStep({
         'Reply ONLY with JSON: {"rootCauses":[{"title":"...","score":0.0,"rationale":"..."}]}';
       const reranked = await generateStructured(gatewayAgent, rerankPrompt, {
         schema: z.object({ rootCauses: z.array(rootCauseSchema) }),
-        retries: 1,
-        fallback: { rootCauses: allRoots }
+        retries: 1
       });
       const knownTitles = new Map(allRoots.map((r) => [r.title, r]));
       rerankedRoots = reranked.rootCauses
@@ -370,23 +356,19 @@ const aggregateStep = createStep({
     const confidence = calculateConfidence(topRoots, evidence.length, meta.task as JobType);
     const escalationRequired = confidence < 0.6 || (topRoots[0]?.score ?? 0) < 0.65;
 
-    // LLM-generated executive summary (plain text, single line)
-    let summary = `${capitalize(meta.task)} analysis for ${productName(meta.product as ProductKey)} identified ${(topRoots[0]?.title ?? "an unclassified issue").toLowerCase()} as primary candidate`;
-    try {
-      const summaryPrompt =
-        "Write ONE short sentence (max 35 words) summarizing the troubleshooting outcome. No prose around it, no JSON, no markdown.\n" +
-        `Task: ${meta.task}\n` +
-        `Product: ${meta.product}\n` +
-        `Top root cause: ${topRoots[0]?.title ?? "unclassified"}\n` +
-        `Confidence: ${confidence.toFixed(2)}\n` +
-        `Issue: ${sanitizePromptInput(meta.issue, 400)}`;
-      const out = await gatewayAgent.generate(summaryPrompt);
-      const text = (out.text ?? "").trim().split(/\r?\n/)[0].trim();
-      if (text && text.length <= 300) {
-        summary = text;
-      }
-    } catch {
-      // keep deterministic summary
+    // LLM-generated executive summary (plain text, single line). Mandatory —
+    // Foundry Local must produce it; an empty/failed generation throws.
+    const summaryPrompt =
+      "Write ONE short sentence (max 35 words) summarizing the troubleshooting outcome. No prose around it, no JSON, no markdown.\n" +
+      `Task: ${meta.task}\n` +
+      `Product: ${meta.product}\n` +
+      `Top root cause: ${topRoots[0]?.title ?? "unclassified"}\n` +
+      `Confidence: ${confidence.toFixed(2)}\n` +
+      `Issue: ${sanitizePromptInput(meta.issue, 400)}`;
+    const summaryOut = await gatewayAgent.generate(summaryPrompt);
+    const summary = (summaryOut.text ?? "").trim().split(/\r?\n/)[0].trim();
+    if (!summary) {
+      throw new Error("Foundry Local returned an empty summary; aborting (no fallback).");
     }
 
     const selected = selectAgents(meta.task as JobType, meta.buckets);
@@ -444,8 +426,4 @@ export function deduplicateActions(actions: ActionItem[]): ActionItem[] {
     unique.set(action.step, action);
   }
   return Array.from(unique.values());
-}
-
-function capitalize(input: string): string {
-  return input ? input[0].toUpperCase() + input.slice(1) : input;
 }
