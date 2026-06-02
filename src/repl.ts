@@ -15,6 +15,7 @@ import { MODEL_CATALOG, findEntry, resolveModelId } from "./mastra/modelCatalog.
 import { getActiveModelId, setActiveModelId } from "./userConfig.js";
 import { invalidateModelCache } from "./mastra/agents/index.js";
 import { runOneShot } from "./oneShot.js";
+import { answerFromKnowledge } from "./knowledge/teamviewerDocs.js";
 import { JobType, ProductKey } from "./types.js";
 import { banner, color } from "./ui.js";
 import { killProcessTree } from "./jobs/killTree.js";
@@ -41,6 +42,7 @@ const HELP_LINES = [
   `${color.bold("/logs <jobId> [N]")}    print last N lines of a job log`,
   `${color.bold("/cancel <jobId>")}      cancel a running job`,
   `${color.bold("/doctor")}              check Foundry Local runtime`,
+  `${color.bold("/docs <question>")}     ask the official-docs knowledge layer`,
   `${color.bold("/model [id]")}          show active model, or switch (alias or full id)`,
   `${color.bold("/models")}              list curated model catalog`,
   `${color.bold("/clear")}               clear the screen`,
@@ -263,6 +265,15 @@ async function handleSlash(line: string, state: ReplState, rl: readline.Interfac
     }
     case "cancel": if (!arg) console.log(color.red("  usage: /cancel <jobId>")); else cancelCmd(arg); return true;
     case "doctor": await doctorCmd(); return true;
+    case "docs": {
+      if (!arg) { console.log(color.red("  usage: /docs <question>")); return true; }
+      const result = await answerFromKnowledge(arg, { live: false });
+      console.log(result.answer);
+      if (result.citations.length > 0) {
+        console.log(color.dim(`  sources: ${result.citations.join(", ")}`));
+      }
+      return true;
+    }
     case "model":
       if (arg) useModelCmd(arg);
       else showModelCmd();

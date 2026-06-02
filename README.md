@@ -9,7 +9,34 @@ The UX is modeled on **GitHub Copilot CLI**:
 - `twc` with no arguments → interactive REPL with banner, model/endpoint info, slash commands.
 - `twc -p "<issue>"` → one-shot synchronous run with spinner.
 - `twc "<free text>"` → treated as a free-text troubleshoot prompt.
-- All existing subcommands (`products`, `agents`, `debug`, `troubleshoot`, `jobs`, `doctor`, `config`) still work unchanged.
+- All existing subcommands (`products`, `agents`, `debug`, `troubleshoot`, `jobs`, `doctor`, `config`, `docs`) still work unchanged.
+
+## Command cheat sheet
+
+The `twc` prefix is optional inside the interactive shell. Run `twc --help` or `twc <command> --help` for full option details.
+
+| Command | What it does |
+|---|---|
+| `twc` | Open the interactive REPL (banner + slash commands) |
+| `twc chat [--product <key>]` | Open the REPL with a preset product |
+| `twc "<free text>"` | Troubleshoot from a natural-language sentence (auto-detects product/target) |
+| `twc -p "<issue>" [--product <key>] [--target <v>] [--task <t>] [--context <c>] [--model <id>] [--markdown]` | One-shot synchronous run |
+| `twc products list` | List the whitelisted TeamViewer products |
+| `twc agents list` | List the Mastra agent roles |
+| `twc agents plan --task <t> --issue "<text>"` | Show which agents would be selected (dry run) |
+| `twc debug <product> --target <v> --issue "<text>" [--context <c>]` | Run a background **debug** job |
+| `twc troubleshoot <product> --target <v> --issue "<text>" [--context <c>]` | Run a background **troubleshoot** job |
+| `twc jobs list [--limit N]` | List recent background jobs |
+| `twc jobs show <jobId> [--json\|--markdown]` | Show a job report (text / JSON / Markdown) |
+| `twc jobs logs <jobId> [--tail N]` | Tail a job's worker log |
+| `twc jobs cancel <jobId>` | Kill a running or queued job |
+| `twc explain <jobId>` | Turn a job report into a plain-language narrative |
+| `twc docs ask "<question>" [--live]` | Answer a TeamViewer question from official docs |
+| `twc docs sources` | List the official documentation sources |
+| `twc docs sync` | Pre-fetch & cache all official docs for offline use |
+| `twc models list\|use <id>\|current\|unset` | Manage the active Foundry Local model |
+| `twc doctor` | Diagnose Foundry Local runtime, env vars and data dirs |
+| `twc config` | Print the resolved configuration |
 
 ## Goal
 
@@ -388,6 +415,7 @@ Inside the REPL:
 | `/logs <jobId> [N]` | tail a job log |
 | `/cancel <jobId>` | kill a running job |
 | `/doctor` | Foundry Local health check |
+| `/docs <question>` | ask the official-docs knowledge layer |
 | `/model` | show endpoint + model |
 | `/clear`, `/help`, `/exit` | screen / help / leave |
 
@@ -503,6 +531,15 @@ Inspect current configuration:
 
 ```bash
 twc config
+```
+
+Query the official-docs knowledge layer:
+
+```bash
+twc docs ask "which ports does teamviewer use"     # verified facts + cached docs
+twc docs ask "how does Tensor SSO work" --live      # read the official page first
+twc docs sources                                     # list official doc URLs
+twc docs sync                                        # pre-fetch & cache for offline use
 ```
 
 ### Selecting an LLM model
