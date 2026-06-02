@@ -5,6 +5,10 @@ import {
   endpointHealthTool,
   logIntelligenceTool
 } from "../tools/specialistTools.js";
+import { teamviewerDocsTool } from "../tools/knowledgeTool.js";
+
+const DOCS_INSTRUCTION =
+  " When unsure about TeamViewer specifics (ports, Web API endpoints, services, product capabilities), call the tw-official-docs tool to read the official documentation. If it returns confident=false, do not invent an answer — tell the user the verified facts you have and point them to the cited official URL.";
 import { isLoopbackEndpoint, normalizeModelId, discoverFoundryEndpoint } from "../foundryLocal.js";
 import { getActiveModelId } from "../../userConfig.js";
 
@@ -76,44 +80,50 @@ export const gatewayAgent = new Agent({
   id: "tw-gateway-agent",
   name: "TeamViewer Gateway Agent",
   instructions:
-    "You coordinate TeamViewer troubleshooting. Classify issues, route to specialists, and synthesize final analysis. Reply concisely and follow output format requested by the caller.",
-  model: modelGetter
+    "You coordinate TeamViewer troubleshooting. Classify issues, route to specialists, and synthesize final analysis. Reply concisely and follow output format requested by the caller." +
+    DOCS_INSTRUCTION,
+  model: modelGetter,
+  tools: { teamviewerDocsTool }
 });
 
 export const connectivityAgent = new Agent({
   id: "tw-connectivity-agent",
   name: "TeamViewer Connectivity Agent",
   instructions:
-    "You diagnose TeamViewer connectivity problems: VPN, DNS, firewall, routing, packet loss. Use the connectivity tool to gather baseline evidence, then prioritize hypotheses for the user's specific issue.",
+    "You diagnose TeamViewer connectivity problems: VPN, DNS, firewall, routing, packet loss. Use the connectivity tool to gather baseline evidence, then prioritize hypotheses for the user's specific issue." +
+    DOCS_INSTRUCTION,
   model: modelGetter,
-  tools: { connectivityTool }
+  tools: { connectivityTool, teamviewerDocsTool }
 });
 
 export const authPolicyAgent = new Agent({
   id: "tw-auth-policy-agent",
   name: "TeamViewer Auth Policy Agent",
   instructions:
-    "You diagnose TeamViewer auth/SSO/token/policy issues. Use the auth-policy tool for baseline, then prioritize hypotheses.",
+    "You diagnose TeamViewer auth/SSO/token/policy issues. Use the auth-policy tool for baseline, then prioritize hypotheses." +
+    DOCS_INSTRUCTION,
   model: modelGetter,
-  tools: { authPolicyTool }
+  tools: { authPolicyTool, teamviewerDocsTool }
 });
 
 export const endpointHealthAgent = new Agent({
   id: "tw-endpoint-health-agent",
   name: "TeamViewer Endpoint Health Agent",
   instructions:
-    "You diagnose endpoint runtime health, service state, version compatibility and host resources. Use the endpoint-health tool first, then enrich.",
+    "You diagnose endpoint runtime health, service state, version compatibility and host resources. Use the endpoint-health tool first, then enrich." +
+    DOCS_INSTRUCTION,
   model: modelGetter,
-  tools: { endpointHealthTool }
+  tools: { endpointHealthTool, teamviewerDocsTool }
 });
 
 export const logIntelligenceAgent = new Agent({
   id: "tw-log-intelligence-agent",
   name: "TeamViewer Log Intelligence Agent",
   instructions:
-    "You analyze incident logs and identify repeating failure signatures. Use the log-intelligence tool to seed analysis, then surface deterministic clusters.",
+    "You analyze incident logs and identify repeating failure signatures. Use the log-intelligence tool to seed analysis, then surface deterministic clusters." +
+    DOCS_INSTRUCTION,
   model: modelGetter,
-  tools: { logIntelligenceTool }
+  tools: { logIntelligenceTool, teamviewerDocsTool }
 });
 
 export const specialistAgents = {

@@ -15,6 +15,11 @@ import { getActiveModelId, setActiveModelId } from "./userConfig.js";
 import { invalidateModelCache } from "./mastra/agents/index.js";
 import { killProcessTree } from "./jobs/killTree.js";
 import { getCliVersion } from "./version.js";
+import {
+  OFFICIAL_DOCS,
+  answerFromKnowledge,
+  syncOfficialDocs
+} from "./knowledge/teamviewerDocs.js";
 
 function resolveProduct(raw: string): ProductKey {
   const product = normalizeProduct(raw);
@@ -237,6 +242,47 @@ export function buildCli(): Command {
         completedAt: new Date().toISOString()
       });
       console.log(`Job ${jobId} marked as cancelled.`);
+    });
+
+  const docs = program.command("docs").description("Query the official TeamViewer documentation knowledge layer");
+
+  docs
+    .command("ask <question>")
+    .description("Answer a TeamViewer question from verified facts and official docs")
+    .option("--live", "Read the most relevant official doc page directly before answering", false)
+    .action(async (question: string, options: { live?: boolean }) => {
+      const result = await answerFromKnowledge(question, { live: Boolean(options.live) });
+      console.log(result.answer);
+      if (result.citations.length > 0) {
+        console.log("\nSources:");
+        for (const c of result.citations) console.log(`  - ${c}`);
+      }
+      console.log(`\nConfident: ${result.confident ? "yes" : "no"}`);
+    });
+
+  docs
+    .command("sources")
+    .description("List the official TeamViewer documentation sources the agents can read")
+    .action(() => {
+      for (const doc of OFFICIAL_DOCS) {
+        console.log(`${doc.id.padEnd(24)} ${doc.title}`);
+        console.log(`${" ".repeat(24)} ${doc.url}`);
+      }
+    });
+
+  docs
+    .command("sync")
+    .description("Pre-fetch and cache every official documentation source for offline use")
+    .action(async () => {
+      console.log("Syncing official TeamViewer documentation...");
+      const results = await syncOfficialDocs();
+      for (const r of results) {
+        console.log(`  ${r.ok ? "OK " : "ERR"} ${r.id.padEnd(24)} ${r.detail}`);
+      }
+      const failed = results.filter((r) => !r.ok).length;
+      if (failed > 0) {
+        console.log(`\n${failed} source(s) could not be fetched (network/host restrictions). Verified facts remain available offline.`);
+      }
     });
 
   program

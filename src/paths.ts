@@ -28,12 +28,14 @@ function resolveAppDir(): string {
 export const APP_DIR = resolveAppDir();
 export const JOBS_FILE = path.join(APP_DIR, "jobs.json");
 export const LOGS_DIR = path.join(APP_DIR, "logs");
+export const KNOWLEDGE_DIR = path.join(APP_DIR, "knowledge");
 export const HISTORY_FILE = path.join(APP_DIR, "history");
 export const CONFIG_FILE = path.join(APP_DIR, "config.json");
 
 export function ensureDataDir(): void {
   mkdirSync(APP_DIR, { recursive: true });
   mkdirSync(LOGS_DIR, { recursive: true });
+  mkdirSync(KNOWLEDGE_DIR, { recursive: true });
 }
 
 export function jobLogPath(jobId: string): string {

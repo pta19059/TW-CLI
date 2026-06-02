@@ -48,6 +48,7 @@ const KNOWN_COMMANDS = new Set([
   "doctor",
   "config",
   "models",
+  "docs",
   "explain",
   "help",
   "--help",

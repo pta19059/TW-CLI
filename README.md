@@ -202,6 +202,34 @@ All probes have hard timeouts (3–6 s). Remediation steps are emitted in the ho
 form (`Start-Service` on Windows, `systemctl enable --now` on Linux, `launchctl` on macOS).
 The LLM agents then enrich the deterministic baseline with extra hypotheses and re-ranking.
 
+## Knowledge & official docs
+
+The agents are grounded against TeamViewer's **official documentation** so they answer
+accurately instead of hallucinating, and stay honest when they don't know.
+
+Two layers (`src/knowledge/teamviewerDocs.ts`):
+
+1. **Verified facts** — a curated, offline set of facts confirmed against the official KB and
+   the Web API v1 spec (primary port 5938 → fallback 443 → 80; Web API base
+   `https://webapi.teamviewer.com/api/v1` and its documented endpoints; the fact that
+   TeamViewer publishes no fixed server IP/hostname list; DEX = 1E Client; per-product delivery
+   models). These ground every specialist prompt and are always available with no network.
+2. **Official docs (read on demand)** — the agents can fetch real TeamViewer doc pages directly
+   (`twc docs ... --live`), strip them to text and cache them under `~/.twc/knowledge` for
+   instant, offline reuse. Fetches are restricted to a `*.teamviewer.com` host allowlist (SSRF
+   guard); there is **no archive/Wayback fallback** — docs come straight from the source.
+
+Every specialist agent and the gateway agent get a `tw-official-docs` tool. When a model is
+unsure it calls the tool; if the answer isn't grounded the tool returns `confident: false` and
+the agent points the user to the cited official URL rather than guessing.
+
+```powershell
+twc docs ask "which ports does teamviewer use"      # answer from verified facts + docs
+twc docs ask "how does Tensor SSO work" --live        # read the official page first
+twc docs sources                                       # list the official doc URLs
+twc docs sync                                          # pre-fetch & cache all docs for offline use
+```
+
 ## Azure Demo (laptop ↔ remote VM)
 
 This is a short, **reproducible** demo. The reproduction scripts live in

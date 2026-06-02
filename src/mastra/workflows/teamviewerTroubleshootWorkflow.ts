@@ -25,6 +25,7 @@ import {
   runLogIntelligenceAnalysis
 } from "../tools/specialistTools.js";
 import { sanitizePromptInput } from "../util/sanitize.js";
+import { groundingFacts, type DocTopic } from "../../knowledge/teamviewerDocs.js";
 import { generateStructured } from "../util/llmJson.js";
 
 const inputSchema = z.object({
@@ -231,10 +232,17 @@ function buildSpecialistStep(def: SpecialistDef) {
       const issue = sanitizePromptInput(inputData.issue);
       const context = sanitizePromptInput(inputData.context, 2000);
 
+      const docTopic: DocTopic =
+        def.key === "log-intelligence" ? "logs" : (def.key as DocTopic);
+      const facts = groundingFacts([docTopic], inputData.product);
+      const referenceLine =
+        facts.length > 0 ? `Official references (verified): ${facts.join(" | ")}\n` : "";
+
       const prompt =
         `You are the TeamViewer ${def.key} specialist. Focus exclusively on ${def.topic}.\n` +
         `Issue: ${issue}\n` +
         `Context: ${context || "none"}\n` +
+        referenceLine +
         `Baseline evidence: ${baseline.evidence.join(" | ")}\n` +
         `Baseline root cause: ${baseline.rootCauses.map((r) => r.title).join(" | ")}\n\n` +
         "Add up to 3 prioritized hypotheses, up to 2 additional root causes (score 0.0-1.0), " +
