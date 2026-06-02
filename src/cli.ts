@@ -348,7 +348,7 @@ export function buildCli(): Command {
 
   docs
     .command("reindex")
-    .description("Rebuild the local documentation index from official sources (via Jina); embeddings via Foundry Local are required")
+    .description("Rebuild the local documentation index from official sources (via Jina); local ONNX embeddings are required")
     .action(async () => {
       console.log("Rebuilding local documentation index (fetching via Jina Reader)...");
       try {
@@ -359,7 +359,7 @@ export function buildCli(): Command {
         const info = localIndexInfo();
         const failed = results.filter((r) => !r.ok).length;
         console.log(`\nIndex: ${info.chunks} chunks, ${info.embeddings} embedded (model: ${info.model})`);
-        console.log("Retrieval: hybrid (keyword + Foundry Local embeddings).");
+        console.log("Retrieval: hybrid (keyword + local ONNX embeddings).");
         if (failed > 0) {
           console.log(`${failed} source(s) failed to fetch.`);
         }
@@ -381,7 +381,7 @@ export function buildCli(): Command {
       console.log(`Built:      ${info.builtAt}`);
       console.log(`Chunks:     ${info.chunks}`);
       console.log(`Embedded:   ${info.embeddings}${info.model ? ` (model: ${info.model})` : ""}`);
-      console.log("Retrieval:  hybrid (keyword + Foundry Local embeddings)");
+      console.log("Retrieval:  hybrid (keyword + local ONNX embeddings)");
     });
 
   program

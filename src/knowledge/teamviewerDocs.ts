@@ -18,7 +18,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { KNOWLEDGE_DIR } from "../paths.js";
 import { ProductKey } from "../types.js";
-import { discoverFoundryEndpoint, isLoopbackEndpoint } from "../mastra/foundryLocal.js";
+import { embedLocal, embedModelId } from "./localEmbedder.js";
 
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 // Jina AI Reader fetches pages server-side and returns clean Markdown, which
@@ -440,71 +440,23 @@ export function cosineSimilarity(a: number[], b: number[]): number {
 }
 
 /**
- * Embed texts with Foundry Local (OpenAI-compatible /embeddings). Foundry Local
- * is MANDATORY — there is no keyword-only fallback. If no loopback endpoint is
- * configured, no embedding-capable model is loaded, or any request fails, this
- * throws an actionable error. The model is taken from TWC_EMBED_MODEL, else the
- * first loaded model whose id contains "embed".
+ * Embed texts for the hybrid RAG index. Embeddings are MANDATORY — there is no
+ * keyword-only fallback. They run on a small local ONNX model in-process (see
+ * localEmbedder), which is fully local, free and offline once cached. Foundry
+ * Local cannot serve embeddings (its catalog ships only chat-completion models),
+ * so embeddings run here. The model id comes from TWC_EMBED_MODEL (default
+ * Xenova/all-MiniLM-L6-v2). Throws if the model cannot be loaded.
  */
 async function embedTexts(texts: string[]): Promise<{ vectors: number[][]; model: string }> {
   if (texts.length === 0) throw new Error("embedTexts called with no input.");
-  const endpoint = discoverFoundryEndpoint();
-  if (!endpoint) {
+  try {
+    return await embedLocal(texts);
+  } catch (err) {
     throw new Error(
-      "Foundry Local is required for hybrid retrieval but no endpoint is configured. Start it with 'foundry service start' or set FOUNDRY_LOCAL_ENDPOINT. There is no fallback."
+      `Local embedding model '${embedModelId()}' could not be used (${err instanceof Error ? err.message : String(err)}). ` +
+        "The first run downloads the model from the Hugging Face hub; ensure network access, or set TWC_EMBED_MODEL to a cached model. There is no fallback."
     );
   }
-  if (!isLoopbackEndpoint(endpoint)) {
-    throw new Error(
-      `Foundry Local endpoint '${endpoint}' is not a loopback address. Only localhost/127.0.0.1/::1 are allowed.`
-    );
-  }
-  const base = endpoint.replace(/\/+$/, "");
-
-  let model = process.env.TWC_EMBED_MODEL;
-  if (!model) {
-    let data: { data?: Array<{ id?: string }> } | null = null;
-    try {
-      const res = await fetch(`${base}/models`);
-      data = (await res.json().catch(() => null)) as { data?: Array<{ id?: string }> } | null;
-    } catch (err) {
-      throw new Error(
-        `Foundry Local is not reachable at ${base} (${err instanceof Error ? err.message : "unknown error"}). Start it with 'foundry service start'. There is no fallback.`
-      );
-    }
-    model = data?.data?.find((m) => /embed/i.test(m.id ?? ""))?.id;
-  }
-  if (!model) {
-    throw new Error(
-      "No embedding model is loaded in Foundry Local. Load one (e.g. 'foundry model run text-embedding-3-small') or set TWC_EMBED_MODEL to a loaded embedding model. Hybrid retrieval requires embeddings — there is no fallback."
-    );
-  }
-
-  const vectors: number[][] = [];
-  const BATCH = 32;
-  for (let i = 0; i < texts.length; i += BATCH) {
-    const batch = texts.slice(i, i + BATCH);
-    const res = await fetch(`${base}/embeddings`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model, input: batch })
-    });
-    if (!res.ok) {
-      throw new Error(
-        `Foundry Local /embeddings returned HTTP ${res.status} for model '${model}'. Verify the model supports embeddings. There is no fallback.`
-      );
-    }
-    const data = (await res.json()) as { data?: Array<{ embedding?: number[] }> };
-    const rows = data.data ?? [];
-    for (let j = 0; j < batch.length; j++) {
-      const v = rows[j]?.embedding;
-      if (!v || v.length === 0) {
-        throw new Error(`Foundry Local returned an empty embedding for model '${model}'. There is no fallback.`);
-      }
-      vectors.push(v);
-    }
-  }
-  return { vectors, model };
 }
 
 function loadLocalIndex(): LocalIndex | null {

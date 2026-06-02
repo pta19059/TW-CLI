@@ -10,6 +10,7 @@ import {
   stripHtml,
   tokenize
 } from "../src/knowledge/teamviewerDocs.js";
+import { embedLocal, embedModelId } from "../src/knowledge/localEmbedder.js";
 
 describe("knowledge layer", () => {
   it("tokenizes and drops stopwords", () => {
@@ -40,13 +41,14 @@ describe("knowledge layer", () => {
     expect(hits.some((h) => h.text.includes("webapi.teamviewer.com"))).toBe(true);
   });
 
-  it("requires Foundry Local hybrid retrieval (no offline fallback)", async () => {
-    // answerFromKnowledge now mandates Foundry Local embeddings: with no
-    // embedded index (or Foundry Local down) it must throw rather than silently
-    // degrading to keyword/verified-facts-only.
-    await expect(answerFromKnowledge("what ports does teamviewer use 5938")).rejects.toThrow(
-      /Foundry Local|index|embedding/i
-    );
+  it("uses an in-process local ONNX embedder (no Foundry Local for embeddings)", async () => {
+    // Embeddings run locally via Transformers.js. The default model is the small
+    // MiniLM ONNX model, overridable with TWC_EMBED_MODEL. The empty-input path
+    // is deterministic and needs no model download.
+    expect(embedModelId()).toBe("Xenova/all-MiniLM-L6-v2");
+    const empty = await embedLocal([]);
+    expect(empty.vectors).toEqual([]);
+    expect(empty.model).toBe("Xenova/all-MiniLM-L6-v2");
   });
 
   it("rejects non-allowlisted hosts (SSRF guard)", async () => {

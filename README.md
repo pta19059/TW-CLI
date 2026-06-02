@@ -282,7 +282,7 @@ Two layers (`src/knowledge/teamviewerDocs.ts`):
    `https://webapi.teamviewer.com/api/v1` and its documented endpoints; the fact that
    TeamViewer publishes no fixed server IP/hostname list; DEX = 1E Client; per-product delivery
    models). These ground every specialist prompt and are always available with no network.
-2. **Local documentation index (hybrid RAG, Foundry Local required)** — `twc docs reindex`
+2. **Local documentation index (hybrid RAG, local ONNX embeddings)** — `twc docs reindex`
    builds a local index from the official doc pages and then answers run **fully offline against
    that index** — there is **no web search at query time**. Because teamviewer.com rejects direct
    fetches behind its WAF (TLS handshake failure), the index is populated through
@@ -292,12 +292,14 @@ Two layers (`src/knowledge/teamviewerDocs.ts`):
    `~/.twc/knowledge/rag-index.json`.
    Retrieval is **always hybrid** — there is **no keyword-only fallback**:
    - **Keyword** overlap scoring — deterministic, the backbone of confidence.
-   - **Semantic** cosine similarity — embeddings via **Foundry Local** (`/embeddings`).
-   Foundry Local is **mandatory**: both `docs reindex` and `docs ask` embed text through it. If
-   Foundry Local is not running or **no embedding model is loaded**, the commands fail with an
-   actionable error instead of degrading. Load an embedding model (e.g.
-   `foundry model run text-embedding-3-small`) or point `TWC_EMBED_MODEL` at a loaded embedding
-   model before indexing/querying.
+   - **Semantic** cosine similarity — embeddings computed **in-process by a local ONNX model**
+     via [Transformers.js](https://github.com/huggingface/transformers.js)
+     ([src/knowledge/localEmbedder.ts](src/knowledge/localEmbedder.ts)).
+   Embeddings are **mandatory** and run **100% on-device, free and offline once cached**. The
+   default model `Xenova/all-MiniLM-L6-v2` (~90 MB, 384-dim) is downloaded once from the Hugging
+   Face hub on first `docs reindex`, then reused offline; override it with `TWC_EMBED_MODEL`.
+   Foundry Local cannot serve embeddings (its catalog ships only chat-completion models), so the
+   embedder is independent — it remains the hard gate only for the **chat agents**.
 3. **`--live` refresh** — `twc docs ask "..." --live` re-fetches the single most relevant
    official page via Jina before answering, so the freshest content is searchable. No key
    required. "Always up to date" simply means: re-run `twc docs reindex` whenever you want.
