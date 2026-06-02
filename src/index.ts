@@ -12,6 +12,7 @@ import { JobType } from "./types.js";
 import { resolveModelId } from "./mastra/modelCatalog.js";
 import { setActiveModelId } from "./userConfig.js";
 import { invalidateModelCache } from "./mastra/agents/index.js";
+import { maybeFilterNativeStderr } from "./runtime/stderrFilter.js";
 
 function applyModelFlag(argv: string[]): void {
   const raw = parseFlagValue(argv, ["--model"]);
@@ -67,6 +68,10 @@ async function main(): Promise<void> {
     await runWorkerJob(jobId);
     return;
   }
+
+  // Embedder commands emit harmless native onnxruntime warnings on stderr; run
+  // them in a child with a filtered stderr stream so the output stays clean.
+  if (await maybeFilterNativeStderr(argv)) return;
 
   // One-shot mode: `twc -p "issue text" [--product X] [--target Y] [--task T] [--context C] [--markdown]`
   if (hasFlag(argv, ["-p", "--prompt"])) {
