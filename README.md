@@ -34,6 +34,7 @@ The `twc` prefix is optional inside the interactive shell. Run `twc --help` or `
 | `twc docs ask "<question>"` | Answer a TeamViewer question from official docs |
 | `twc docs reindex` | Rebuild the local hybrid RAG index from official sources (via Jina) + local ONNX embeddings |
 | `twc docs index` | Show local index status (chunks, embeddings, model) |
+| `twc docs map [--rebuild]` | Build/show the lightweight KB URL map used for just-in-time live lookups |
 | `twc docs sources` | List the official documentation sources |
 | `twc docs sync` | Pre-fetch & cache all official docs for offline use |
 | `twc models list\|use <id>\|current\|unset` | Manage the active Foundry Local model |
@@ -304,6 +305,17 @@ Two layers (`src/knowledge/teamviewerDocs.ts`):
    embedder is independent — it remains the hard gate only for the **chat agents**.
 3. **Staying current** — the index is a snapshot; re-run `twc docs reindex` whenever you want
    to refresh the local knowledge from the official sources (fetched via Jina).
+4. **Just-in-time KB retrieval (live fallback)** — the curated index covers a small, high-value
+   core; the wider TeamViewer Knowledge Base is far larger. When the core **cannot answer a
+   question confidently** (no real keyword anchor among the top hits), a just-in-time pass kicks
+   in: it consults a **lightweight URL map** of the KB (titles + URLs only, a few KB on disk at
+   `~/.twc/knowledge/url-map.json`, harvested from the KB landing page and refreshed weekly),
+   ranks the best-matching pages, **fetches the top few live via Jina**, embeds them **on the
+   fly**, and answers from that fresh context. The newly embedded chunks are **folded back into
+   the local index** ([enrichLocalIndex](src/knowledge/teamviewerDocs.ts)), so the second time a
+   topic is asked it is already cached. The result is **always-fresh, effectively unlimited
+   coverage without keeping a giant index in RAM**. Build/inspect the map with `twc docs map`;
+   set `TWC_NO_JIT=1` to disable the live pass (core-only).
 
 Every specialist agent and the gateway agent get a `tw-official-docs` tool. When a model is
 unsure it calls the tool; if the answer isn't grounded the tool returns `confident: false` and
@@ -312,6 +324,7 @@ the agent points the user to the cited official URL rather than guessing.
 ```powershell
 twc docs reindex                                       # build the local index (fetch via Jina)
 twc docs index                                         # show index status (chunks / embeddings)
+twc docs map                                            # show the KB URL map (just-in-time lookups)
 twc docs ask "which ports does teamviewer use"      # answer from verified facts + local index
 twc docs ask "how does Tensor SSO work"               # answer from verified facts + local index
 twc docs sources                                       # list the official doc URLs

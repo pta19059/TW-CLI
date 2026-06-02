@@ -112,6 +112,76 @@ export interface LocalIndex {
   chunks: IndexChunk[];
 }
 
+// ── Just-in-time retrieval (lightweight URL map of the whole KB) ─────────────
+//
+// The curated OFFICIAL_DOCS cover common questions. For long-tail questions we
+// keep a *lightweight* map of KB article URLs/titles (metadata only, no
+// embeddings — a few KB on disk for the whole knowledge base). When the curated
+// core can't answer confidently, we pick the best-matching URLs from this map,
+// fetch them live via Jina, embed them on the fly, and answer from that fresh
+// context. Newly fetched chunks are folded back into the local index so the
+// next identical question is answered instantly from the core.
+
+/** One discoverable KB page: just enough metadata to rank and fetch it. */
+export interface KbLink {
+  url: string;
+  title: string;
+}
+
+export interface UrlMap {
+  version: 1;
+  builtAt: string;
+  links: KbLink[];
+}
+
+const URL_MAP_FILE = path.join(KNOWLEDGE_DIR, "url-map.json");
+const URL_MAP_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+/** KB landing page whose Jina markdown lists the whole knowledge-base tree. */
+const KB_ROOT_URL = "https://www.teamviewer.com/en/global/support/knowledge-base/";
+/** How many candidate pages just-in-time retrieval may fetch per question. */
+const JIT_MAX_PAGES = 3;
+
+/** Drop obvious navigation/chrome links that are not documentation pages. */
+const NAV_LINK_RE = /sign\s?in|skip to|cookie|privacy|imprint|legal|contact|careers/i;
+
+/**
+ * Extract TeamViewer knowledge-base links from a Jina markdown document. Pure
+ * (no I/O) so it is unit-testable. Keeps only allowlisted hosts and real KB
+ * paths, strips link titles/fragments, and de-duplicates by normalized URL.
+ */
+export function harvestKbLinks(markdown: string): KbLink[] {
+  const re = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)(?:\s+"[^"]*")?\)/g;
+  const seen = new Set<string>();
+  const out: KbLink[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(markdown)) !== null) {
+    const title = m[1].replace(/\s+/g, " ").trim();
+    const rawUrl = m[2].trim();
+    let url: URL;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      continue;
+    }
+    const host = url.hostname.toLowerCase();
+    if (!DOC_HOST_ALLOWLIST.includes(host)) continue;
+    const isKb =
+      /\/support\/knowledge-base\//i.test(url.pathname) || /\/kb\/articles\//i.test(url.pathname);
+    if (!isKb) continue;
+    // Normalize: drop fragment/query, collapse trailing slash.
+    const normalized = `${url.origin}${url.pathname.replace(/\/+$/, "")}`.toLowerCase();
+    if (normalized === `${new URL(KB_ROOT_URL).origin}${new URL(KB_ROOT_URL).pathname.replace(/\/+$/, "")}`.toLowerCase()) {
+      continue; // skip the root itself
+    }
+    if (seen.has(normalized)) continue;
+    if (!title || /^image\b/i.test(title) || NAV_LINK_RE.test(title)) continue;
+    seen.add(normalized);
+    out.push({ url: `${url.origin}${url.pathname.replace(/\/+$/, "")}`, title });
+  }
+  return out;
+}
+
+
 // ── Curated official documentation sources ──────────────────────────────────
 
 /**
@@ -386,6 +456,141 @@ export async function syncOfficialDocs(): Promise<{ id: string; ok: boolean; det
   return results;
 }
 
+// ── URL map (just-in-time discovery) ────────────────────────────────────────
+
+function loadUrlMap(): UrlMap | null {
+  try {
+    if (!existsSync(URL_MAP_FILE)) return null;
+    return JSON.parse(readFileSync(URL_MAP_FILE, "utf8")) as UrlMap;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * (Re)build the lightweight URL map by harvesting the KB landing page via Jina.
+ * Stores only URLs + titles (no embeddings), so the whole knowledge base costs
+ * just a few KB on disk. Returns the number of links discovered.
+ */
+export async function buildUrlMap(): Promise<{ links: number; ok: boolean; detail: string }> {
+  const r = await fetchOfficialDoc(KB_ROOT_URL, true);
+  if (!r.ok || !r.text) {
+    return { links: 0, ok: false, detail: r.error ?? "failed to fetch the knowledge-base index" };
+  }
+  const links = harvestKbLinks(r.text);
+  const map: UrlMap = { version: 1, builtAt: new Date().toISOString(), links };
+  mkdirSync(KNOWLEDGE_DIR, { recursive: true });
+  writeFileSync(URL_MAP_FILE, JSON.stringify(map), "utf8");
+  return { links: links.length, ok: links.length > 0, detail: `${links.length} KB links` };
+}
+
+/** Load the URL map, rebuilding it lazily when missing or stale. */
+async function ensureUrlMap(): Promise<UrlMap | null> {
+  const existing = loadUrlMap();
+  if (existing && Date.now() - new Date(existing.builtAt).getTime() < URL_MAP_TTL_MS) {
+    return existing;
+  }
+  const built = await buildUrlMap().catch(() => ({ ok: false }) as { ok: boolean });
+  return built.ok ? loadUrlMap() : existing;
+}
+
+/** Summary of the URL map for `docs map`. */
+export function urlMapInfo(): { built: boolean; builtAt?: string; links: number } {
+  const map = loadUrlMap();
+  if (!map) return { built: false, links: 0 };
+  return { built: true, builtAt: map.builtAt, links: map.links.length };
+}
+
+/** Decode a KB URL path into search-friendly words for lexical ranking. */
+function urlSlugWords(url: string): string {
+  try {
+    return decodeURIComponent(new URL(url).pathname)
+      .replace(/\/(en|english|global|support|knowledge-base|kb|articles)\//gi, " ")
+      .replace(/[-/_]+/g, " ");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Just-in-time retrieval: pick the best-matching KB pages from the URL map,
+ * fetch them live via Jina, embed them on the fly, and return the strongest
+ * chunks. Newly embedded chunks are folded into the local index so the next
+ * identical question is answered instantly from the core. Network/embedding
+ * failures resolve to an empty list (the caller falls back to "I don't know").
+ */
+export async function retrieveJustInTime(query: string, limit = 5): Promise<KnowledgeHit[]> {
+  const tokens = tokenize(query);
+  if (tokens.length === 0) return [];
+
+  const map = await ensureUrlMap();
+  if (!map || map.links.length === 0) return [];
+
+  // Rank candidate pages lexically (title + URL slug) and fetch the top few.
+  const candidates = map.links
+    .map((l) => ({ l, score: scoreText(tokens, `${l.title} ${urlSlugWords(l.url)}`) }))
+    .filter((c) => c.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, JIT_MAX_PAGES);
+  if (candidates.length === 0) return [];
+
+  const freshChunks: IndexChunk[] = [];
+  for (const { l } of candidates) {
+    const r = await fetchOfficialDoc(l.url).catch(() => null);
+    if (!r || !r.ok || !r.text) continue;
+    const docId = createHash("sha1").update(l.url).digest("hex").slice(0, 12);
+    chunkMarkdown(r.text).forEach((text, i) =>
+      freshChunks.push({ id: `jit-${docId}#${i}`, docId: `jit-${docId}`, url: l.url, title: l.title, text })
+    );
+  }
+  if (freshChunks.length === 0) return [];
+
+  // Embed the query and the fresh chunks together (one local batch).
+  const { vectors, model } = await embedTexts([query, ...freshChunks.map((c) => c.text)]);
+  const queryVec = vectors[0];
+  freshChunks.forEach((c, i) => {
+    c.embedding = vectors[i + 1];
+  });
+
+  const scored = freshChunks
+    .map((c) => {
+      const kw = scoreText(tokens, `${c.title} ${c.text}`);
+      const sem = cosineSimilarity(queryVec, c.embedding!);
+      return { c, score: kw + sem * 3 };
+    })
+    .filter((s) => s.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  // Fold the fetched chunks into the local index for next time (best-effort).
+  enrichLocalIndex(freshChunks, model);
+
+  return scored.slice(0, limit).map((s) => ({
+    kind: "doc" as const,
+    text: bestSnippet(s.c.text, tokens),
+    score: s.score,
+    source: s.c.url,
+    title: s.c.title
+  }));
+}
+
+/** Append freshly embedded chunks to the on-disk index (deduped by id). */
+function enrichLocalIndex(chunks: IndexChunk[], model: string): void {
+  try {
+    const idx = loadLocalIndex();
+    if (!idx) return; // no core index yet; nothing to enrich
+    const have = new Set(idx.chunks.map((c) => c.id));
+    const additions = chunks.filter((c) => c.embedding && c.embedding.length > 0 && !have.has(c.id));
+    if (additions.length === 0) return;
+    idx.chunks.push(...additions);
+    idx.builtAt = new Date().toISOString();
+    if (!idx.embeddingModel) idx.embeddingModel = model;
+    writeFileSync(INDEX_FILE, JSON.stringify(idx), "utf8");
+  } catch {
+    /* enrichment is best-effort */
+  }
+}
+
+
 // ── Local hybrid RAG index ──────────────────────────────────────────────────
 //
 // `docs reindex` fetches every official source via Jina, splits it into chunks,
@@ -395,8 +600,53 @@ export async function syncOfficialDocs(): Promise<{ id: string; ok: boolean; det
 // embeddings exist). No web search happens at query time.
 
 /** Split Markdown into ~maxChars chunks, preferring paragraph boundaries. */
+/**
+ * Strip navigation/footer "link soup" from Jina markdown before chunking. KB
+ * pages fetched via Jina carry huge menus and footers rendered as bullet lists
+ * of links; if indexed, those lists match almost any keyword and drown out the
+ * real prose. We drop image-only lines and list items whose visible text — once
+ * the [label](url) markup is removed — is essentially just a link, plus obvious
+ * navigation boilerplate. Prose paragraphs (real sentences) are preserved.
+ */
+export function denoiseMarkdown(text: string): string {
+  const lines = text.replace(/\r/g, "").split("\n");
+  const kept: string[] = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) {
+      kept.push("");
+      continue;
+    }
+    // Drop pure image lines.
+    if (/^!\[[^\]]*\]\([^)]*\)\s*$/.test(t)) continue;
+    const isListItem = /^([*+-]|\d+\.)\s/.test(t);
+    // A list item whose entire content is just link(s) (no prose around them)
+    // is a menu/footer entry, however descriptive the link label — drop it.
+    if (isListItem) {
+      const body = t.replace(/^([*+-]|\d+\.)\s+/, "");
+      const residual = body
+        .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+        .replace(/\[[^\]]*\]\([^)]*\)/g, " ")
+        .replace(/[^a-z0-9]/gi, "");
+      if (/\]\(https?:\/\//.test(body) && residual.length === 0) continue;
+    }
+    // Visible text once links/images are unwrapped to their label only.
+    const unwrapped = t
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
+    const hasLink = /\]\(https?:\/\//.test(t);
+    const letters = unwrapped.replace(/[^a-z0-9]/gi, "").length;
+    // A list item that is just a link (little residual text) is navigation.
+    if (isListItem && hasLink && letters < 25) continue;
+    // Obvious nav/boilerplate lines.
+    if (NAV_LINK_RE.test(t) && letters < 40) continue;
+    kept.push(line);
+  }
+  return kept.join("\n");
+}
+
 export function chunkMarkdown(text: string, maxChars = 1200, overlap = 150): string[] {
-  const clean = text.replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim();
+  const clean = denoiseMarkdown(text).replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim();
   const paras = clean.split(/\n\n+/);
   const chunks: string[] = [];
   let cur = "";
@@ -660,20 +910,44 @@ export function groundingFacts(topics: DocTopic[], product?: string, limit = 4):
 
 /**
  * Answer a question from the knowledge layer: verified facts + the local RAG
- * index (built by `docs reindex`). With `live`, refresh the single most
- * relevant official page via Jina first (key-free) so its fresh content is
- * searchable. No web search is performed. When nothing is confidently
+ * index (built by `docs reindex`). When the curated core can't answer
+ * confidently, a just-in-time pass discovers the best-matching KB pages from the
+ * lightweight URL map, fetches them live via Jina, embeds them on the fly and
+ * answers from that fresh context (folding the new chunks back into the index).
+ * Set TWC_NO_JIT=1 to disable the live pass. When nothing is confidently
  * grounded, return an honest "I don't know" pointing to the official source.
  */
 export async function answerFromKnowledge(
   query: string
 ): Promise<KnowledgeAnswer> {
+  const tokens = tokenize(query);
+  // A hit is trustworthy only when it is both highly ranked AND lexically
+  // anchored to the question. Purely-semantic neighbours (high cosine, zero
+  // keyword overlap) score ~2 on noise alone, so we require a real token match
+  // before declaring confidence — otherwise we fall through to the live KB.
+  const isConfident = (h: KnowledgeHit[]): boolean =>
+    h.length > 0 &&
+    h[0].score >= 2 &&
+    scoreText(tokens, `${h[0].title ?? ""} ${h[0].text}`) >= 1;
+
   const localHits = await retrieveLocal(query, 5);
-  const hits = [...localHits, ...searchKnowledge(query, 5)]
+  let hits = [...localHits, ...searchKnowledge(query, 5)]
     .sort((a, b) => b.score - a.score)
     .slice(0, 5);
-  const confident = hits.length > 0 && hits[0].score >= 2;
+  let confident = isConfident(hits);
+
+  // Just-in-time fallback: the curated core didn't answer confidently, so reach
+  // into the wider KB (URL map → live fetch → on-the-fly embeddings).
+  if (!confident && process.env.TWC_NO_JIT !== "1") {
+    const jit = await retrieveJustInTime(query, 5).catch(() => [] as KnowledgeHit[]);
+    if (jit.length > 0) {
+      hits = [...hits, ...jit].sort((a, b) => b.score - a.score).slice(0, 5);
+      confident = isConfident(hits);
+    }
+  }
+
   const citations = Array.from(new Set(hits.map((h) => h.source))).slice(0, 3);
+
 
   if (!confident) {
     const src = bestSourceFor(query);

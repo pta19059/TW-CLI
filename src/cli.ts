@@ -18,9 +18,11 @@ import { getCliVersion } from "./version.js";
 import {
   OFFICIAL_DOCS,
   answerFromKnowledge,
+  buildUrlMap,
   localIndexInfo,
   reindexOfficialDocs,
-  syncOfficialDocs
+  syncOfficialDocs,
+  urlMapInfo
 } from "./knowledge/teamviewerDocs.js";
 
 function resolveProduct(raw: string): ProductKey {
@@ -304,7 +306,7 @@ export function buildCli(): Command {
 
   docs
     .command("ask <question>")
-    .description("Answer a TeamViewer question from verified facts and the local doc index")
+    .description("Answer a TeamViewer question from verified facts and the local doc index (falls back to live KB lookup)")
     .action(async (question: string) => {
       try {
         const result = await answerFromKnowledge(question);
@@ -381,6 +383,27 @@ export function buildCli(): Command {
       console.log(`Chunks:     ${info.chunks}`);
       console.log(`Embedded:   ${info.embeddings}${info.model ? ` (model: ${info.model})` : ""}`);
       console.log("Retrieval:  hybrid (keyword + local ONNX embeddings)");
+    });
+
+  docs
+    .command("map")
+    .description("Build/refresh the lightweight KB URL map used for just-in-time lookups, or show its status")
+    .option("--rebuild", "Re-fetch the knowledge-base index and rebuild the URL map", false)
+    .action(async (options: { rebuild?: boolean }) => {
+      if (options.rebuild) {
+        console.log("Building KB URL map (fetching the knowledge-base index via Jina)...");
+        const r = await buildUrlMap();
+        console.log(`  ${r.ok ? "OK " : "ERR"} ${r.detail}`);
+        if (!r.ok) process.exitCode = 1;
+        return;
+      }
+      const info = urlMapInfo();
+      if (!info.built) {
+        console.log("No URL map yet. It is built automatically on the first live lookup, or run 'twc docs map --rebuild'.");
+        return;
+      }
+      console.log(`Built: ${info.builtAt}`);
+      console.log(`Links: ${info.links} KB pages discoverable for just-in-time lookups`);
     });
 
   program

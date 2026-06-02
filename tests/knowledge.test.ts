@@ -6,6 +6,7 @@ import {
   bestSourceFor,
   fetchOfficialDoc,
   groundingFacts,
+  harvestKbLinks,
   searchKnowledge,
   stripHtml,
   tokenize
@@ -84,5 +85,36 @@ describe("knowledge layer", () => {
     for (const fact of VERIFIED_FACTS) {
       expect(urls.has(fact.source)).toBe(true);
     }
+  });
+
+  it("harvests only allowlisted KB links from Jina markdown", () => {
+    const md = [
+      "[Sign In](https://community.teamviewer.com/English/entry/signin?target=x)",
+      "[TeamViewer Tensor](https://www.teamviewer.com/en/global/support/knowledge-base/teamviewer-tensor/)",
+      '[Which ports](https://www.teamviewer.com/en/global/support/knowledge-base/teamviewer-remote/get-started/which-ports-are-used/ "tooltip")',
+      "[Article 4139](https://community.teamviewer.com/English/kb/articles/4139-ports)",
+      "[Knowledge Base](https://www.teamviewer.com/en/global/support/knowledge-base/)",
+      "[Pricing](https://www.teamviewer.com/en/pricing/)",
+      "[Evil](https://example.com/kb/articles/1-evil)"
+    ].join("\n");
+    const links = harvestKbLinks(md);
+    const urls = links.map((l) => l.url);
+    // Keeps real KB pages (allowlisted host + KB path), strips link titles.
+    expect(urls).toContain("https://www.teamviewer.com/en/global/support/knowledge-base/teamviewer-tensor");
+    expect(urls).toContain("https://community.teamviewer.com/English/kb/articles/4139-ports");
+    expect(urls.some((u) => u.includes("which-ports-are-used"))).toBe(true);
+    // Drops nav (Sign In), the KB root itself, non-KB pages, and other hosts.
+    expect(urls.some((u) => u.includes("signin"))).toBe(false);
+    expect(urls).not.toContain("https://www.teamviewer.com/en/global/support/knowledge-base");
+    expect(urls.some((u) => u.includes("/pricing"))).toBe(false);
+    expect(urls.some((u) => u.includes("example.com"))).toBe(false);
+  });
+
+  it("de-duplicates KB links by normalized URL", () => {
+    const md = [
+      "[Tensor](https://www.teamviewer.com/en/global/support/knowledge-base/teamviewer-tensor/)",
+      "[Tensor again](https://www.teamviewer.com/en/global/support/knowledge-base/teamviewer-tensor)"
+    ].join("\n");
+    expect(harvestKbLinks(md)).toHaveLength(1);
   });
 });
