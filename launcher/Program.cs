@@ -86,28 +86,32 @@ static void RunClickMode(string root)
     // Ctrl+C must NOT close the window. Intercept it: it cancels the current
     // input line (or the running child command) and returns to the prompt.
     // Exit is only via 'exit'/'quit' or real EOF (Ctrl+Z then Enter).
-    var cancelRequested = false;
+    //
+    // The CancelKeyPress handler runs on a separate thread, so we use a
+    // volatile flag and give it a brief moment to flip before deciding whether
+    // a null ReadLine was a Ctrl+C (stay) or a genuine Ctrl+Z EOF (exit).
+    var cancelFlag = new bool[1];
     Console.CancelKeyPress += (_, e) =>
     {
         e.Cancel = true;        // keep the launcher (and its window) alive
-        cancelRequested = true;
+        Volatile.Write(ref cancelFlag[0], true);
     };
 
     while (true)
     {
-        cancelRequested = false;
+        Volatile.Write(ref cancelFlag[0], false);
         Console.Write("twc> ");
         var line = Console.ReadLine();
 
         if (line is null)
         {
-            // Ctrl+C interrupts ReadLine and yields null; treat it as "clear
-            // the line" and keep going instead of exiting the shell.
-            if (cancelRequested)
+            // Could be Ctrl+C (cancel) or Ctrl+Z (real EOF). Let the cancel
+            // handler win the race, then decide.
+            Thread.Sleep(80);
+            if (Volatile.Read(ref cancelFlag[0]))
             {
-                cancelRequested = false;
                 Console.WriteLine();
-                continue;
+                continue; // Ctrl+C → clear the line, stay in the shell
             }
             break; // genuine EOF (Ctrl+Z)
         }
