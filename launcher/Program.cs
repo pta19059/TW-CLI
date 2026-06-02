@@ -128,6 +128,13 @@ static void RunClickMode(string root)
             break;
         }
 
+        if (trimmed.Equals("cls", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Equals("clear", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.Clear();
+            continue;
+        }
+
         var args = trimmed.Equals("help", StringComparison.OrdinalIgnoreCase)
             ? new List<string> { "--help" }
             : SplitArgs(trimmed);
