@@ -282,27 +282,33 @@ Two layers (`src/knowledge/teamviewerDocs.ts`):
    `https://webapi.teamviewer.com/api/v1` and its documented endpoints; the fact that
    TeamViewer publishes no fixed server IP/hostname list; DEX = 1E Client; per-product delivery
    models). These ground every specialist prompt and are always available with no network.
-2. **Official docs (read on demand)** — the agents can fetch real TeamViewer doc pages directly
-   (`twc docs ... --live`), strip them to text and cache them under `~/.twc/knowledge` for
-   instant, offline reuse. Fetches are restricted to a `*.teamviewer.com` host allowlist (SSRF
-   guard); there is **no archive/Wayback fallback** — docs come straight from the source.
-3. **Live web search (`--live`)** — because teamviewer.com rejects direct fetches behind its
-   WAF (TLS handshake failure), `--live` also runs a live search via the **Brave Search API**,
-   **restricted to official `*.teamviewer.com` hosts** (no local cache). The result titles,
-   snippets and URLs ground the answer and are cited as sources — so even pages that can't be
-   fetched directly still yield a grounded, sourced answer. Set a free Brave key in the
-   `BRAVE_API_KEY` environment variable (get one at https://brave.com/search/api/); without it
-   `--live` degrades cleanly to the offline verified facts.
+2. **Local documentation index (hybrid RAG)** — `twc docs reindex` builds a local index from
+   the official doc pages and then answers run **fully offline against that index** — there is
+   **no web search at query time**. Because teamviewer.com rejects direct fetches behind its WAF
+   (TLS handshake failure), the index is populated through **[Jina Reader](https://jina.ai/reader/)**
+   (`https://r.jina.ai/...`), which fetches the pages server-side and returns clean Markdown.
+   Jina is **free and needs no API key** (set `JINA_API_KEY` only to raise rate limits). The
+   Markdown is split into chunks and stored under `~/.twc/knowledge/rag-index.json`.
+   Retrieval is **hybrid**:
+   - **Keyword** overlap scoring — always available, deterministic, the backbone of confidence.
+   - **Semantic** cosine similarity — best-effort embeddings via **Foundry Local**
+     (`/embeddings`). If no embedding model is loaded, retrieval degrades cleanly to keyword-only
+     (no error). Override the model with `TWC_EMBED_MODEL`.
+3. **`--live` refresh** — `twc docs ask "..." --live` re-fetches the single most relevant
+   official page via Jina before answering, so the freshest content is searchable. No key
+   required. "Always up to date" simply means: re-run `twc docs reindex` whenever you want.
 
 Every specialist agent and the gateway agent get a `tw-official-docs` tool. When a model is
 unsure it calls the tool; if the answer isn't grounded the tool returns `confident: false` and
 the agent points the user to the cited official URL rather than guessing.
 
 ```powershell
-twc docs ask "which ports does teamviewer use"      # answer from verified facts + docs
-twc docs ask "how does Tensor SSO work" --live        # read the official page first
+twc docs reindex                                       # build the local index (fetch via Jina)
+twc docs index                                         # show index status (chunks / embeddings)
+twc docs ask "which ports does teamviewer use"      # answer from verified facts + local index
+twc docs ask "how does Tensor SSO work" --live        # refresh the most relevant page first
 twc docs sources                                       # list the official doc URLs
-twc docs sync                                          # pre-fetch & cache all docs for offline use
+twc docs sync                                          # pre-fetch & cache raw doc text (offline)
 ```
 
 ## Azure Demo (laptop ↔ remote VM)

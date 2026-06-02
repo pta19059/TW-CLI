@@ -18,11 +18,17 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { KNOWLEDGE_DIR } from "../paths.js";
 import { ProductKey } from "../types.js";
+import { discoverFoundryEndpoint, isLoopbackEndpoint } from "../mastra/foundryLocal.js";
 
-const FETCH_TIMEOUT_MS = 8000;
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-const BROWSER_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+// Jina AI Reader fetches pages server-side and returns clean Markdown, which
+// bypasses the Cloudflare/WAF TLS block that rejects every direct client
+// (Node, browser, curl) for teamviewer.com from restricted networks. Free, no
+// API key required (an optional JINA_API_KEY raises rate limits).
+const JINA_READER_BASE = "https://r.jina.ai/";
+const JINA_TIMEOUT_MS = 25_000;
+// Local hybrid RAG index built from the official docs (see reindexOfficialDocs).
+const INDEX_FILE = path.join(KNOWLEDGE_DIR, "rag-index.json");
 
 /** Only these hosts may be fetched by the knowledge layer. */
 const DOC_HOST_ALLOWLIST = [
@@ -88,10 +94,22 @@ export interface DocFetchResult {
   fromCache?: boolean;
 }
 
-export interface WebSearchResult {
-  title: string;
+/** A retrievable unit of an official doc (one section of one page). */
+export interface IndexChunk {
+  id: string;
+  docId: string;
   url: string;
-  snippet: string;
+  title: string;
+  text: string;
+  /** Optional embedding (present only when Foundry Local produced one). */
+  embedding?: number[];
+}
+
+export interface LocalIndex {
+  version: 1;
+  builtAt: string;
+  embeddingModel?: string;
+  chunks: IndexChunk[];
 }
 
 // ── Curated official documentation sources ──────────────────────────────────
@@ -322,8 +340,11 @@ function loadCachedDocs(): CacheEntry[] {
 }
 
 /**
- * Fetch an official documentation page (direct, no archive fallback), strip it
- * to text and cache it. Only allowlisted hosts are permitted.
+ * Fetch an official documentation page via the Jina AI Reader (server-side,
+ * returns clean Markdown), strip nothing, and cache it. Jina is used because
+ * teamviewer.com sits behind a Cloudflare/WAF TLS block that rejects every
+ * direct client; Jina fetches from its own servers and so reaches the page.
+ * Only allowlisted hosts are permitted (the target URL, not Jina, is checked).
  */
 export async function fetchOfficialDoc(url: string, force = false): Promise<DocFetchResult> {
   if (!isAllowedHost(url)) {
@@ -335,22 +356,18 @@ export async function fetchOfficialDoc(url: string, force = false): Promise<DocF
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), JINA_TIMEOUT_MS);
   try {
-    const res = await fetch(url, {
-      signal: controller.signal,
-      redirect: "follow",
-      headers: { "User-Agent": BROWSER_UA, Accept: "text/html,application/xhtml+xml,application/json" }
-    });
-    const raw = await res.text();
-    const text = raw.trimStart().startsWith("{") || raw.trimStart().startsWith("[")
-      ? raw // looks like JSON (e.g. an OpenAPI spec) — keep as-is
-      : stripHtml(raw);
+    const headers: Record<string, string> = { Accept: "text/plain", "X-Return-Format": "markdown" };
+    const key = process.env.JINA_API_KEY;
+    if (key) headers.Authorization = `Bearer ${key}`;
+    const res = await fetch(`${JINA_READER_BASE}${url}`, { signal: controller.signal, headers });
+    const text = await res.text();
     if (!res.ok) {
       return { ok: false, url, status: res.status, error: `HTTP ${res.status}` };
     }
     const title = OFFICIAL_DOCS.find((d) => d.url === url)?.title;
-    writeCacheEntry({ url, title, text: text.slice(0, 200_000), fetchedAt: new Date().toISOString() });
+    writeCacheEntry({ url, title, text: text.slice(0, 300_000), fetchedAt: new Date().toISOString() });
     return { ok: true, url, status: res.status, text };
   } catch (err) {
     return { ok: false, url, error: err instanceof Error ? err.message : String(err) };
@@ -369,67 +386,213 @@ export async function syncOfficialDocs(): Promise<{ id: string; ok: boolean; det
   return results;
 }
 
-/** API key for Brave Search (free tier). Read from the environment, never hardcoded. */
-function braveApiKey(): string | undefined {
-  return process.env.BRAVE_API_KEY || process.env.BRAVE_SEARCH_API_KEY || undefined;
+// ── Local hybrid RAG index ──────────────────────────────────────────────────
+//
+// `docs reindex` fetches every official source via Jina, splits it into chunks,
+// optionally embeds them with Foundry Local, and writes a single index file.
+// At query time `retrieveLocal` scores chunks with a hybrid of keyword overlap
+// (always available, deterministic) and semantic cosine similarity (when
+// embeddings exist). No web search happens at query time.
+
+/** Split Markdown into ~maxChars chunks, preferring paragraph boundaries. */
+export function chunkMarkdown(text: string, maxChars = 1200, overlap = 150): string[] {
+  const clean = text.replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim();
+  const paras = clean.split(/\n\n+/);
+  const chunks: string[] = [];
+  let cur = "";
+  const flush = () => {
+    const c = cur.trim();
+    if (c.length >= 40) chunks.push(c);
+    cur = "";
+  };
+  for (const raw of paras) {
+    const para = raw.trim();
+    if (!para) continue;
+    if (cur.length + para.length + 2 <= maxChars) {
+      cur = cur ? `${cur}\n\n${para}` : para;
+    } else if (para.length <= maxChars) {
+      flush();
+      cur = para;
+    } else {
+      flush();
+      for (let i = 0; i < para.length; i += maxChars - overlap) {
+        chunks.push(para.slice(i, i + maxChars).trim());
+      }
+    }
+  }
+  flush();
+  return chunks.filter((c) => c.length >= 40);
 }
 
-/** True when a live web-search provider is configured (Brave API key present). */
-export function isWebSearchConfigured(): boolean {
-  return Boolean(braveApiKey());
+/** Cosine similarity of two equal-length vectors (0 when missing/degenerate). */
+export function cosineSimilarity(a: number[], b: number[]): number {
+  if (!a || !b || a.length !== b.length || a.length === 0) return 0;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (na === 0 || nb === 0) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
 /**
- * Live web search restricted to official TeamViewer hosts via the Brave Search
- * API (no local cache). Requires a free Brave API key in BRAVE_API_KEY. Returns
- * result titles, URLs and snippets so the knowledge layer can ground answers and
- * cite official pages even when those pages reject direct fetches (TLS/WAF).
- *
- * Brave is used instead of DuckDuckGo HTML: DDG is unofficial and serves an
- * anti-bot CAPTCHA (HTTP 202) on burst/automated traffic, whereas Brave is a
- * documented API with stable JSON and no CAPTCHA.
+ * Embed texts with Foundry Local (OpenAI-compatible /embeddings). Best-effort:
+ * if no loopback endpoint, no embedding-capable model, or any error, returns
+ * nulls so the caller degrades cleanly to keyword-only retrieval. The model is
+ * taken from TWC_EMBED_MODEL, else any loaded model whose id contains "embed".
  */
-export async function searchTeamViewerWeb(query: string, limit = 5): Promise<WebSearchResult[]> {
-  const key = braveApiKey();
-  if (!key) return []; // No provider configured — caller degrades to verified facts.
+async function embedTexts(texts: string[]): Promise<{ vectors: (number[] | null)[]; model?: string }> {
+  const nulls = () => ({ vectors: texts.map(() => null) as (number[] | null)[] });
+  if (texts.length === 0) return { vectors: [] };
+  const endpoint = discoverFoundryEndpoint();
+  if (!endpoint || !isLoopbackEndpoint(endpoint)) return nulls();
+  const base = endpoint.replace(/\/+$/, "");
 
-  const q = `site:teamviewer.com ${query}`.trim();
-  const url =
-    `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}` +
-    `&count=${Math.min(Math.max(limit, 1), 20)}&safesearch=off`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, {
-      signal: controller.signal,
-      redirect: "follow",
-      headers: { Accept: "application/json", "Accept-Encoding": "gzip", "X-Subscription-Token": key }
-    });
-    if (res.status !== 200) return [];
-    const data = (await res.json()) as {
-      web?: { results?: { title?: string; url?: string; description?: string }[] };
-    };
-    const results = data.web?.results ?? [];
-
-    const out: WebSearchResult[] = [];
-    const seen = new Set<string>();
-    for (const r of results) {
-      if (out.length >= limit) break;
-      const u = r.url ?? "";
-      if (!u || seen.has(u) || !isAllowedHost(u)) continue;
-      seen.add(u);
-      out.push({
-        title: stripHtml(r.title ?? ""),
-        url: u,
-        snippet: stripHtml(r.description ?? "")
-      });
+  let model = process.env.TWC_EMBED_MODEL;
+  if (!model) {
+    try {
+      const res = await fetch(`${base}/models`);
+      const data = (await res.json().catch(() => null)) as { data?: Array<{ id?: string }> } | null;
+      model = data?.data?.find((m) => /embed/i.test(m.id ?? ""))?.id;
+    } catch {
+      return nulls();
     }
-    return out;
-  } catch {
-    return [];
-  } finally {
-    clearTimeout(timer);
   }
+  if (!model) return nulls(); // No embedding model available — keyword-only.
+
+  const vectors: (number[] | null)[] = [];
+  const BATCH = 32;
+  for (let i = 0; i < texts.length; i += BATCH) {
+    const batch = texts.slice(i, i + BATCH);
+    try {
+      const res = await fetch(`${base}/embeddings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model, input: batch })
+      });
+      if (!res.ok) {
+        for (const _ of batch) vectors.push(null);
+        continue;
+      }
+      const data = (await res.json()) as { data?: Array<{ embedding?: number[] }> };
+      const rows = data.data ?? [];
+      for (let j = 0; j < batch.length; j++) vectors.push(rows[j]?.embedding ?? null);
+    } catch {
+      for (const _ of batch) vectors.push(null);
+    }
+  }
+  return { vectors, model };
+}
+
+function loadLocalIndex(): LocalIndex | null {
+  try {
+    if (!existsSync(INDEX_FILE)) return null;
+    return JSON.parse(readFileSync(INDEX_FILE, "utf8")) as LocalIndex;
+  } catch {
+    return null;
+  }
+}
+
+/** Summary of the on-disk index for `docs index`. */
+export function localIndexInfo(): {
+  built: boolean;
+  builtAt?: string;
+  chunks: number;
+  embeddings: number;
+  model?: string;
+} {
+  const idx = loadLocalIndex();
+  if (!idx) return { built: false, chunks: 0, embeddings: 0 };
+  return {
+    built: true,
+    builtAt: idx.builtAt,
+    chunks: idx.chunks.length,
+    embeddings: idx.chunks.filter((c) => c.embedding && c.embedding.length > 0).length,
+    model: idx.embeddingModel
+  };
+}
+
+/**
+ * Rebuild the local RAG index from the official sources via Jina, then embed
+ * the chunks with Foundry Local (best-effort). Returns a per-source result.
+ */
+export async function reindexOfficialDocs(): Promise<
+  { id: string; ok: boolean; detail: string; chunks: number }[]
+> {
+  const results: { id: string; ok: boolean; detail: string; chunks: number }[] = [];
+  const allChunks: IndexChunk[] = [];
+  for (const doc of OFFICIAL_DOCS) {
+    const r = await fetchOfficialDoc(doc.url, true);
+    if (!r.ok || !r.text) {
+      results.push({ id: doc.id, ok: false, detail: r.error ?? "failed", chunks: 0 });
+      continue;
+    }
+    const pieces = chunkMarkdown(r.text);
+    pieces.forEach((text, i) =>
+      allChunks.push({ id: `${doc.id}#${i}`, docId: doc.id, url: doc.url, title: doc.title, text })
+    );
+    results.push({ id: doc.id, ok: true, detail: `${pieces.length} chunks`, chunks: pieces.length });
+  }
+
+  const { vectors, model } = await embedTexts(allChunks.map((c) => c.text));
+  vectors.forEach((v, i) => {
+    if (v && v.length > 0) allChunks[i].embedding = v;
+  });
+
+  const index: LocalIndex = {
+    version: 1,
+    builtAt: new Date().toISOString(),
+    embeddingModel: model,
+    chunks: allChunks
+  };
+  try {
+    mkdirSync(KNOWLEDGE_DIR, { recursive: true });
+    writeFileSync(INDEX_FILE, JSON.stringify(index), "utf8");
+  } catch {
+    /* index write is best-effort */
+  }
+  return results;
+}
+
+/**
+ * Retrieve from the local RAG index with hybrid scoring: keyword overlap
+ * (always) plus semantic cosine similarity (when embeddings are present and a
+ * query embedding can be produced). Pure-local: no web search.
+ */
+export async function retrieveLocal(query: string, limit = 5): Promise<KnowledgeHit[]> {
+  const idx = loadLocalIndex();
+  if (!idx || idx.chunks.length === 0) return [];
+  const tokens = tokenize(query);
+  if (tokens.length === 0) return [];
+
+  let queryVec: number[] | null = null;
+  if (idx.chunks.some((c) => c.embedding && c.embedding.length > 0)) {
+    queryVec = (await embedTexts([query]).catch(() => ({ vectors: [null] }))).vectors[0];
+  }
+
+  const scored = idx.chunks
+    .map((c) => {
+      const kw = scoreText(tokens, `${c.title} ${c.text}`);
+      const sem = queryVec && c.embedding ? cosineSimilarity(queryVec, c.embedding) : 0;
+      // Keyword stays the backbone (clears the confidence bar); semantic boosts
+      // and reranks. A strong semantic-only match can still surface.
+      return { c, score: kw + sem * 3 };
+    })
+    .filter((s) => s.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+
+  return scored.map((s) => ({
+    kind: "doc" as const,
+    text: bestSnippet(s.c.text, tokens),
+    score: s.score,
+    source: s.c.url,
+    title: s.c.title
+  }));
 }
 
 /** Light singular/plural normalization so "ports" matches "port". */
@@ -514,34 +677,26 @@ export function groundingFacts(topics: DocTopic[], product?: string, limit = 4):
 }
 
 /**
- * Answer a question from the knowledge layer. With `live`, fetch the most
- * relevant official doc first (so cached text is available to the search).
- * When nothing is confidently grounded, return an honest "I don't know"
- * answer that points to the official source instead of guessing.
+ * Answer a question from the knowledge layer: verified facts + the local RAG
+ * index (built by `docs reindex`). With `live`, refresh the single most
+ * relevant official page via Jina first (key-free) so its fresh content is
+ * searchable. No web search is performed. When nothing is confidently
+ * grounded, return an honest "I don't know" pointing to the official source.
  */
 export async function answerFromKnowledge(
   query: string,
   opts: { live?: boolean } = {}
 ): Promise<KnowledgeAnswer> {
-  const webHits: KnowledgeHit[] = [];
   if (opts.live) {
-    const src = bestSourceFor(query);
-    await fetchOfficialDoc(src.url).catch(() => undefined);
-
-    // Live web search restricted to official TeamViewer hosts (no cache).
-    const tokens = tokenize(query);
-    const results = await searchTeamViewerWeb(query).catch(() => [] as WebSearchResult[]);
-    for (const r of results) {
-      const raw = scoreText(tokens, `${r.title} ${r.snippet}`);
-      if (raw <= 0) continue;
-      const text = r.snippet || r.title;
-      // Official, site-restricted results are trustworthy: boost so a relevant
-      // hit clears the confidence bar even for short queries.
-      webHits.push({ kind: "doc", text, score: raw + 1.5, source: r.url, title: r.title });
-    }
+    // Key-free refresh of the most relevant page (server-side via Jina), so the
+    // legacy full-text cache below reflects the latest content.
+    await fetchOfficialDoc(bestSourceFor(query).url, true).catch(() => undefined);
   }
 
-  const hits = [...webHits, ...searchKnowledge(query, 5)].sort((a, b) => b.score - a.score).slice(0, 5);
+  const localHits = await retrieveLocal(query, 5).catch(() => [] as KnowledgeHit[]);
+  const hits = [...localHits, ...searchKnowledge(query, 5)]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
   const confident = hits.length > 0 && hits[0].score >= 2;
   const citations = Array.from(new Set(hits.map((h) => h.source))).slice(0, 3);
 
@@ -553,7 +708,7 @@ export async function answerFromKnowledge(
     return {
       answer:
         `${lead}\nFor an authoritative answer, consult the official TeamViewer documentation: ${src.title} — ${src.url}` +
-        (opts.live ? "" : " (re-run with --live to read it directly)."),
+        (localIndexInfo().built ? "" : " (run 'twc docs reindex' to build the local index)."),
       confident: false,
       citations: citations.length > 0 ? citations : [src.url],
       hits

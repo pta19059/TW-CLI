@@ -18,7 +18,8 @@ import { getCliVersion } from "./version.js";
 import {
   OFFICIAL_DOCS,
   answerFromKnowledge,
-  isWebSearchConfigured,
+  localIndexInfo,
+  reindexOfficialDocs,
   syncOfficialDocs
 } from "./knowledge/teamviewerDocs.js";
 
@@ -303,8 +304,8 @@ export function buildCli(): Command {
 
   docs
     .command("ask <question>")
-    .description("Answer a TeamViewer question from verified facts and official docs")
-    .option("--live", "Read the most relevant official doc page directly before answering", false)
+    .description("Answer a TeamViewer question from verified facts and the local doc index")
+    .option("--live", "Refresh the most relevant official page (via Jina) before answering", false)
     .action(async (question: string, options: { live?: boolean }) => {
       const result = await answerFromKnowledge(question, { live: Boolean(options.live) });
       console.log(result.answer);
@@ -313,8 +314,8 @@ export function buildCli(): Command {
         for (const c of result.citations) console.log(`  - ${c}`);
       }
       console.log(`\nConfident: ${result.confident ? "yes" : "no"}`);
-      if (options.live && !isWebSearchConfigured()) {
-        console.log("\nTip: set BRAVE_API_KEY to enable live web search (free key: https://brave.com/search/api/).");
+      if (!localIndexInfo().built) {
+        console.log("\nTip: run 'twc docs reindex' to build the local documentation index.");
       }
     });
 
@@ -341,6 +342,41 @@ export function buildCli(): Command {
       if (failed > 0) {
         console.log(`\n${failed} source(s) could not be fetched (network/host restrictions). Verified facts remain available offline.`);
       }
+    });
+
+  docs
+    .command("reindex")
+    .description("Rebuild the local documentation index from official sources (via Jina), with embeddings when Foundry Local is available")
+    .action(async () => {
+      console.log("Rebuilding local documentation index (fetching via Jina Reader)...");
+      const results = await reindexOfficialDocs();
+      for (const r of results) {
+        console.log(`  ${r.ok ? "OK " : "ERR"} ${r.id.padEnd(24)} ${r.detail}`);
+      }
+      const info = localIndexInfo();
+      const failed = results.filter((r) => !r.ok).length;
+      console.log(
+        `\nIndex: ${info.chunks} chunks, ${info.embeddings} embedded` +
+          (info.model ? ` (model: ${info.model})` : " (keyword-only — Foundry Local embedding model not found)")
+      );
+      if (failed > 0) {
+        console.log(`${failed} source(s) failed. Verified facts remain available offline.`);
+      }
+    });
+
+  docs
+    .command("index")
+    .description("Show the status of the local documentation index")
+    .action(() => {
+      const info = localIndexInfo();
+      if (!info.built) {
+        console.log("No local index yet. Run 'twc docs reindex' to build it.");
+        return;
+      }
+      console.log(`Built:      ${info.builtAt}`);
+      console.log(`Chunks:     ${info.chunks}`);
+      console.log(`Embedded:   ${info.embeddings}${info.model ? ` (model: ${info.model})` : ""}`);
+      console.log(`Retrieval:  ${info.embeddings > 0 ? "hybrid (keyword + semantic)" : "keyword-only"}`);
     });
 
   program
