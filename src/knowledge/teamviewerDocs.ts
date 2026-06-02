@@ -401,8 +401,13 @@ export async function searchTeamViewerWeb(query: string, limit = 5): Promise<Web
       redirect: "follow",
       headers: { "User-Agent": BROWSER_UA, Accept: "text/html" }
     });
-    if (!res.ok) return [];
     const html = await res.text();
+    // DuckDuckGo HTML is unofficial and serves an anti-bot challenge (HTTP 202
+    // with a CAPTCHA page) when it suspects automated/burst traffic. Detect it
+    // and degrade cleanly to the offline verified facts instead of parsing junk.
+    if (res.status !== 200 || /complete the following challenge|bots use DuckDuckGo/i.test(html)) {
+      return [];
+    }
 
     const links: { title: string; url: string }[] = [];
     const linkRe = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
