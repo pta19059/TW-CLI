@@ -1,4 +1,20 @@
-import { AgentName, JobInput, JobType } from "../types.js";
+import { AgentName, JobInput, JobType, ProductKey } from "../types.js";
+import { getProductProfile } from "../catalog/productProfiles.js";
+
+/**
+ * Buckets that should always run for a product regardless of the issue text, so
+ * every product gets a real baseline: connectivity for all, plus the local-agent
+ * health check for products that install one, or the Web API/auth surface for
+ * cloud-/mobile-delivered products.
+ */
+export function productBaselineBuckets(product?: string): string[] {
+  if (!product) return [];
+  const profile = getProductProfile(product as ProductKey);
+  const buckets = ["connectivity"];
+  if (profile.deliveryModel === "local-agent") buckets.push("endpoint-health");
+  else buckets.push("auth-policy");
+  return buckets;
+}
 
 export function inferIssueBuckets(input: JobInput): string[] {
   const text = `${input.issue} ${input.context ?? ""}`.toLowerCase();

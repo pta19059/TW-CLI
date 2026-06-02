@@ -1,20 +1,13 @@
 // Real connectivity probes against TeamViewer endpoints. All read-only and
-// timeout-bounded. Used by the `connectivity` specialist to produce evidence
-// based on the actual state of the host running the CLI.
+// timeout-bounded. Driven by a per-product profile so each TeamViewer product
+// is checked against the endpoints IT actually depends on (the shared router
+// backbone plus product-specific SaaS hosts).
 
 import dns from "node:dns/promises";
 import net from "node:net";
-
-const TV_HOSTS = [
-  "router1.teamviewer.com",
-  "router2.teamviewer.com",
-  "router7.teamviewer.com",
-  "master1.teamviewer.com",
-  "webapi.teamviewer.com"
-];
+import { getProductProfile, type ProbeEndpoint, type ProductDiagnosticProfile } from "../catalog/productProfiles.js";
 
 const TV_PORT_PRIMARY = 5938;
-const TV_PORT_HTTPS = 443;
 const PROBE_TIMEOUT_MS = 3000;
 
 export interface DnsResult {
@@ -31,6 +24,8 @@ export interface TcpResult {
   ok: boolean;
   error?: string;
   ms?: number;
+  /** Tenant/region-dependent endpoint: a failure is informational, not a fault. */
+  bestEffort?: boolean;
 }
 
 export interface HttpResult {
@@ -39,12 +34,20 @@ export interface HttpResult {
   status?: number;
   ms?: number;
   error?: string;
+  bestEffort?: boolean;
 }
 
 export interface ConnectivityReport {
   dns: DnsResult[];
   tcp5938: TcpResult[];
   https: HttpResult;
+  // ── product-aware additions (optional, backward compatible) ──
+  /** Product the probe targeted (display name). */
+  product?: string;
+  /** TCP reachability for non-5938 product ports (e.g. 443 to SaaS hosts). */
+  tcpExtra?: TcpResult[];
+  /** Application-layer HTTPS checks for product-specific endpoints. */
+  httpsExtra?: HttpResult[];
 }
 
 async function resolveHost(host: string): Promise<DnsResult> {
@@ -94,13 +97,61 @@ async function httpsProbe(url: string, timeoutMs = PROBE_TIMEOUT_MS): Promise<Ht
   }
 }
 
-export async function runConnectivityProbe(): Promise<ConnectivityReport> {
-  const dnsResults = await Promise.all(TV_HOSTS.map(resolveHost));
-  // Only TCP-probe the routers that resolved (avoid amplifying DNS failures).
-  const routerHosts = dnsResults
-    .filter((r) => r.ok && r.host.startsWith("router"))
-    .map((r) => r.host);
-  const tcp5938 = await Promise.all(routerHosts.map((h) => tcpProbe(h, TV_PORT_PRIMARY)));
-  const https = await httpsProbe("https://webapi.teamviewer.com/api/v1/ping", 6000);
-  return { dns: dnsResults, tcp5938, https };
+/**
+ * Run connectivity probes for a product. When no profile is given the legacy
+ * core-client backbone is used, preserving prior behaviour.
+ */
+export async function runConnectivityProbe(
+  profile: ProductDiagnosticProfile = getProductProfile("teamviewer-remote")
+): Promise<ConnectivityReport> {
+  const endpoints: ProbeEndpoint[] = profile.endpoints;
+  const uniqueHosts = [...new Set(endpoints.map((e) => e.host))];
+
+  // 1) DNS for every host this product touches.
+  const dnsResults = await Promise.all(uniqueHosts.map(resolveHost));
+  const resolved = new Set(dnsResults.filter((r) => r.ok).map((r) => r.host));
+
+  // 2) TCP for each endpoint/port that resolved (avoid amplifying DNS failures).
+  const tcp5938: TcpResult[] = [];
+  const tcpExtra: TcpResult[] = [];
+  const tcpJobs: Promise<void>[] = [];
+  for (const ep of endpoints) {
+    if (!resolved.has(ep.host)) continue;
+    for (const port of ep.ports) {
+      tcpJobs.push(
+        tcpProbe(ep.host, port).then((r) => {
+          const tagged = { ...r, bestEffort: ep.bestEffort };
+          if (port === TV_PORT_PRIMARY) tcp5938.push(tagged);
+          else tcpExtra.push(tagged);
+        })
+      );
+    }
+  }
+  await Promise.all(tcpJobs);
+
+  // 3) Application-layer HTTPS checks for endpoints that expose one.
+  const httpsTargets = endpoints.filter((e) => e.https);
+  const httpsResults = await Promise.all(
+    httpsTargets.map((e) =>
+      httpsProbe(e.https as string, 6000).then((r) => ({ ...r, bestEffort: e.bestEffort }))
+    )
+  );
+
+  // Keep `https` pointing at the Web API ping for backward-compatible evidence.
+  const primary =
+    httpsResults.find((r) => r.url.includes("webapi.teamviewer.com")) ??
+    httpsResults[0] ?? {
+      url: "https://webapi.teamviewer.com/api/v1/ping",
+      ok: false,
+      error: "no HTTPS endpoint resolved"
+    };
+
+  return {
+    dns: dnsResults,
+    tcp5938,
+    https: primary,
+    product: profile.name,
+    tcpExtra,
+    httpsExtra: httpsResults
+  };
 }

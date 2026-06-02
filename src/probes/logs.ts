@@ -1,10 +1,11 @@
 // Real TeamViewer log harvester + signature clustering.
 // Reads up to MAX_BYTES of each known log file and groups error/warning
 // lines by a normalized signature (timestamps and numeric IDs stripped).
+// Log directories and file-name pattern are driven by the per-product profile.
 
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { getProductProfile, productLogDirs, type ProductDiagnosticProfile } from "../catalog/productProfiles.js";
 
 const MAX_BYTES_PER_FILE = 256 * 1024; // 256 KB tail per file
 const MAX_FILES = 8;
@@ -23,33 +24,20 @@ export interface LogProbeReport {
   warningCount: number;
   topSignatures: SignatureCluster[];
   diagnostics: string[];
+  /** Product the probe targeted (display name). */
+  product?: string;
 }
 
-function candidateDirs(): string[] {
-  const dirs: string[] = [];
-  if (process.platform === "win32") {
-    const appData = process.env.APPDATA ?? path.join(os.homedir(), "AppData", "Roaming");
-    const programData = process.env.PROGRAMDATA ?? "C:\\ProgramData";
-    dirs.push(
-      path.join(appData, "TeamViewer"),
-      path.join(programData, "TeamViewer", "Logs"),
-      "C:\\Program Files\\TeamViewer",
-      "C:\\Program Files (x86)\\TeamViewer"
-    );
-  } else if (process.platform === "darwin") {
-    dirs.push(path.join(os.homedir(), "Library", "Logs", "TeamViewer"));
-  } else {
-    dirs.push("/var/log/teamviewer", path.join(os.homedir(), ".local", "share", "teamviewer"));
-  }
-  return dirs.filter(existsSync);
+function candidateDirs(profile: ProductDiagnosticProfile): string[] {
+  return productLogDirs(profile.key, process.platform).filter(existsSync);
 }
 
-function findLogFiles(): string[] {
+function findLogFiles(profile: ProductDiagnosticProfile): string[] {
   const out: string[] = [];
-  for (const dir of candidateDirs()) {
+  for (const dir of candidateDirs(profile)) {
     try {
       for (const name of readdirSync(dir)) {
-        if (/teamviewer.*\.log$/i.test(name)) {
+        if (profile.logFilePattern.test(name)) {
           out.push(path.join(dir, name));
           if (out.length >= MAX_FILES) return out;
         }
@@ -98,12 +86,14 @@ export function normalize(line: string): string {
     .trim();
 }
 
-export function runLogProbe(): LogProbeReport {
-  const files = findLogFiles();
+export function runLogProbe(
+  profile: ProductDiagnosticProfile = getProductProfile("teamviewer-remote")
+): LogProbeReport {
+  const files = findLogFiles(profile);
   const diagnostics: string[] = [];
   if (files.length === 0) {
-    diagnostics.push("No TeamViewer log files found in standard locations.");
-    return { filesInspected: [], totalLines: 0, errorCount: 0, warningCount: 0, topSignatures: [], diagnostics };
+    diagnostics.push(`No ${profile.name} log files found in standard locations.`);
+    return { filesInspected: [], totalLines: 0, errorCount: 0, warningCount: 0, topSignatures: [], diagnostics, product: profile.name };
   }
 
   const counts = new Map<string, { count: number; example: string }>();
@@ -141,5 +131,5 @@ export function runLogProbe(): LogProbeReport {
     diagnostics.push(`Scanned ${totalLines} lines; ${errorCount} error(s), ${warningCount} warning(s).`);
   }
 
-  return { filesInspected: files, totalLines, errorCount, warningCount, topSignatures, diagnostics };
+  return { filesInspected: files, totalLines, errorCount, warningCount, topSignatures, diagnostics, product: profile.name };
 }

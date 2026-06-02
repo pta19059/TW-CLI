@@ -1,12 +1,18 @@
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
-import { ActionItem, RootCauseCandidate } from "../../types.js";
+import { ActionItem, ProductKey, RootCauseCandidate } from "../../types.js";
+import { getProductProfile } from "../../catalog/productProfiles.js";
 import { runConnectivityProbe, type ConnectivityReport } from "../../probes/connectivity.js";
 import { runEndpointHealthProbe, type EndpointHealthReport } from "../../probes/endpointHealth.js";
 import { runLogProbe, type LogProbeReport } from "../../probes/logs.js";
 import { runAuthPolicyProbe, type AuthProbeReport } from "../../probes/authPolicy.js";
 
+function resolveProfile(product?: string) {
+  return getProductProfile((product as ProductKey) ?? "teamviewer-remote");
+}
+
 const specialistInputSchema = z.object({
+  product: z.string().optional(),
   target: z.string(),
   issue: z.string(),
   context: z.string().optional()
@@ -93,6 +99,47 @@ export function fromConnectivity(report: ConnectivityReport, target: string): Sp
     });
   }
 
+  // ── Product-specific endpoint reachability (e.g. 443 to SaaS consoles) ──
+  if (report.tcpExtra && report.tcpExtra.length > 0) {
+    const extraFail = report.tcpExtra.filter((t) => !t.ok);
+    const okCount = report.tcpExtra.length - extraFail.length;
+    evidence.push(`${report.product ?? "Product"} endpoint TCP reachability: ${okCount}/${report.tcpExtra.length} OK`);
+    const hardFail = extraFail.filter((t) => !t.bestEffort);
+    const softFail = extraFail.filter((t) => t.bestEffort);
+    if (hardFail.length > 0) {
+      evidence.push(`Blocked product endpoints: ${hardFail.map((t) => `${t.host}:${t.port} (${t.error})`).join("; ")}`);
+      rootCauses.push({
+        title: `${report.product ?? "Product"} endpoint unreachable`,
+        score: 0.8,
+        rationale: `Cannot reach ${hardFail.map((t) => `${t.host}:${t.port}`).join(", ")}`
+      });
+      actions.push({
+        step: `Allow egress to the product endpoints (${hardFail.map((t) => `${t.host}:${t.port}`).join(", ")}) in firewall/proxy`,
+        risk: "medium",
+        rollback: "Restore previous firewall/proxy rules"
+      });
+    }
+    if (softFail.length > 0) {
+      evidence.push(
+        `Note: tenant/region-dependent endpoints unreachable (verify exact hostnames for your tenant): ${softFail.map((t) => `${t.host}:${t.port}`).join("; ")}`
+      );
+    }
+  }
+  if (report.httpsExtra && report.httpsExtra.length > 0) {
+    const okHttps = report.httpsExtra.filter((h) => h.ok).length;
+    evidence.push(`${report.product ?? "Product"} HTTPS checks: ${okHttps}/${report.httpsExtra.length} OK`);
+    const httpsFail = report.httpsExtra.filter(
+      (h) => !h.ok && !h.bestEffort && !h.url.includes("webapi.teamviewer.com")
+    );
+    for (const h of httpsFail) {
+      rootCauses.push({
+        title: `Product HTTPS endpoint unreachable: ${h.url}`,
+        score: 0.66,
+        rationale: h.error ?? `HTTP ${h.status}`
+      });
+    }
+  }
+
   if (rootCauses.length === 0) {
     evidence.push("All baseline connectivity probes succeeded.");
   }
@@ -102,7 +149,7 @@ export function fromConnectivity(report: ConnectivityReport, target: string): Sp
 export async function runConnectivityAnalysis(
   input: z.infer<typeof specialistInputSchema>
 ): Promise<SpecialistOutput> {
-  const report = await runConnectivityProbe();
+  const report = await runConnectivityProbe(resolveProfile(input.product));
   return fromConnectivity(report, input.target);
 }
 
@@ -154,23 +201,30 @@ export function fromEndpointHealth(report: EndpointHealthReport, target: string)
         (report.clientId ? `${report.installedVersion ? "," : ":"} ClientID ${report.clientId}` : "")
     );
   } else if (report.services.length === 0 && report.processes.length === 0) {
-    // No version, no service, no process anywhere → strong "not installed" signal.
-    evidence.push(`TeamViewer install not detected on ${report.platform}.`);
-    rootCauses.push({
-      title: "TeamViewer not installed / not detectable on target",
-      score: report.platform === "win32" ? 0.9 : 0.75,
-      rationale: installHint
-    });
-    actions.push({
-      step:
-        report.platform === "linux"
-          ? "Install the TeamViewer Host/Full package and ensure the `teamviewer` CLI is on PATH, then re-run"
-          : report.platform === "darwin"
-            ? "Install TeamViewer to /Applications (or verify the install path), then re-run"
-            : "Install TeamViewer or verify install path; re-run after install",
-      risk: "low",
-      rollback: "Uninstall via the platform's standard package/app manager"
-    });
+    if (report.deliveryModel === "cloud-or-mobile") {
+      // Cloud/mobile-first product: no host agent is expected here.
+      evidence.push(
+        `${report.product ?? "This product"} has no host agent on ${report.platform} (expected for a cloud/mobile product); diagnose via connectivity + Web API instead.`
+      );
+    } else {
+      // No version, no service, no process anywhere → strong "not installed" signal.
+      evidence.push(`TeamViewer install not detected on ${report.platform}.`);
+      rootCauses.push({
+        title: "TeamViewer not installed / not detectable on target",
+        score: report.platform === "win32" ? 0.9 : 0.75,
+        rationale: installHint
+      });
+      actions.push({
+        step:
+          report.platform === "linux"
+            ? "Install the TeamViewer Host/Full package and ensure the `teamviewer` CLI is on PATH, then re-run"
+            : report.platform === "darwin"
+              ? "Install TeamViewer to /Applications (or verify the install path), then re-run"
+              : "Install TeamViewer or verify install path; re-run after install",
+        risk: "low",
+        rollback: "Uninstall via the platform's standard package/app manager"
+      });
+    }
   }
 
   const svcName = report.services[0]?.name ?? (report.platform === "linux" ? "teamviewerd" : "TeamViewer");
@@ -241,7 +295,7 @@ export function fromEndpointHealth(report: EndpointHealthReport, target: string)
 export async function runEndpointHealthAnalysis(
   input: z.infer<typeof specialistInputSchema>
 ): Promise<SpecialistOutput> {
-  const report = await runEndpointHealthProbe();
+  const report = await runEndpointHealthProbe(resolveProfile(input.product));
   return fromEndpointHealth(report, input.target);
 }
 
@@ -288,9 +342,9 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
 }
 
 export async function runLogIntelligenceAnalysis(
-  _input: z.infer<typeof specialistInputSchema>
+  input: z.infer<typeof specialistInputSchema>
 ): Promise<SpecialistOutput> {
-  const report = runLogProbe();
+  const report = runLogProbe(resolveProfile(input.product));
   return fromLogs(report);
 }
 
@@ -375,6 +429,21 @@ export function fromAuth(report: AuthProbeReport, target?: string): SpecialistOu
     }
   }
 
+  // Product-specific Web API surface (e.g. Tensor policy/SSO: /users, /managedgroups).
+  if (report.policyChecks && report.policyChecks.length > 0) {
+    const okChecks = report.policyChecks.filter((c) => c.ok).length;
+    evidence.push(
+      `${report.product ?? "Product"} policy/API surface: ${okChecks}/${report.policyChecks.length} endpoint(s) accessible`
+    );
+    for (const c of report.policyChecks.filter((c) => !c.ok)) {
+      rootCauses.push({
+        title: `Web API ${c.path} not accessible`,
+        score: 0.6,
+        rationale: `${c.path} returned HTTP ${c.status} — token scope or policy access likely missing`
+      });
+    }
+  }
+
   for (const d of report.diagnostics) evidence.push(d);
   return { evidence, rootCauses, actions };
 }
@@ -382,7 +451,7 @@ export function fromAuth(report: AuthProbeReport, target?: string): SpecialistOu
 export async function runAuthPolicyAnalysis(
   input: z.infer<typeof specialistInputSchema>
 ): Promise<SpecialistOutput> {
-  const report = await runAuthPolicyProbe();
+  const report = await runAuthPolicyProbe(resolveProfile(input.product));
   return fromAuth(report, input.target);
 }
 

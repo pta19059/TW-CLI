@@ -1,6 +1,10 @@
 // Real TeamViewer Management Console API probe. Requires a personal/script
 // access token in the TEAMVIEWER_API_TOKEN env var. Read-only calls only.
+// The set of API paths checked is driven by the per-product profile (e.g.
+// Tensor also checks /users + /managedgroups for policy/SSO propagation).
 // Doc: https://webapi.teamviewer.com/api/v1
+
+import { getProductProfile, type ProductDiagnosticProfile } from "../catalog/productProfiles.js";
 
 const API_BASE = "https://webapi.teamviewer.com/api/v1";
 const TIMEOUT_MS = 6000;
@@ -9,6 +13,12 @@ export interface DeviceSummary {
   name: string;
   online: boolean;
   id?: string;
+}
+
+export interface PolicyCheck {
+  path: string;
+  status: number;
+  ok: boolean;
 }
 
 export interface AuthProbeReport {
@@ -23,6 +33,10 @@ export interface AuthProbeReport {
   devicesCount?: number;
   /** Up to MAX_DEVICES managed devices visible to the token (name + online state). */
   devices?: DeviceSummary[];
+  /** Product-specific Web API path checks (Tensor: users/managed groups, etc.). */
+  policyChecks?: PolicyCheck[];
+  /** Product the probe targeted (display name). */
+  product?: string;
   diagnostics: string[];
 }
 
@@ -48,7 +62,9 @@ async function getJson(url: string, token?: string): Promise<{ status: number; b
   }
 }
 
-export async function runAuthPolicyProbe(): Promise<AuthProbeReport> {
+export async function runAuthPolicyProbe(
+  profile: ProductDiagnosticProfile = getProductProfile("teamviewer-remote")
+): Promise<AuthProbeReport> {
   const token = process.env.TEAMVIEWER_API_TOKEN;
   const diagnostics: string[] = [];
 
@@ -56,7 +72,7 @@ export async function runAuthPolicyProbe(): Promise<AuthProbeReport> {
     diagnostics.push(
       "TEAMVIEWER_API_TOKEN not set. Set it (Bearer/script token from Management Console) to enable live auth/policy probes."
     );
-    return { tokenPresent: false, diagnostics };
+    return { tokenPresent: false, diagnostics, product: profile.name };
   }
 
   // 1) unauthenticated ping — confirms WebAPI reachability
@@ -106,6 +122,24 @@ export async function runAuthPolicyProbe(): Promise<AuthProbeReport> {
     }
   }
 
+  // 4) product-specific path checks (e.g. Tensor policy/SSO surface: /users,
+  //    /managedgroups). /account and /devices are already covered above, so we
+  //    only probe the additional paths declared by the profile.
+  let policyChecks: PolicyCheck[] | undefined;
+  if (accountOk) {
+    const extraPaths = profile.webApiPaths.filter((p) => p !== "/account" && p !== "/devices");
+    if (extraPaths.length > 0) {
+      policyChecks = [];
+      for (const p of extraPaths) {
+        const res = await getJson(`${API_BASE}${p}`, token);
+        policyChecks.push({ path: p, status: res.status, ok: res.status === 200 });
+        if (res.status !== 200 && res.status !== 0) {
+          diagnostics.push(`${profile.name}: ${p} returned HTTP ${res.status} (token may lack the required scope).`);
+        }
+      }
+    }
+  }
+
   return {
     tokenPresent: true,
     pingOk,
@@ -117,6 +151,8 @@ export async function runAuthPolicyProbe(): Promise<AuthProbeReport> {
     companyName,
     devicesCount,
     devices,
+    policyChecks,
+    product: profile.name,
     diagnostics
   };
 }

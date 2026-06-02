@@ -9,7 +9,7 @@ import {
   RootCauseCandidate,
   WorkflowReport
 } from "../../types.js";
-import { inferIssueBuckets, selectAgents } from "../../agents/routing.js";
+import { inferIssueBuckets, productBaselineBuckets, selectAgents } from "../../agents/routing.js";
 import type { Agent } from "@mastra/core/agent";
 import {
   authPolicyAgent,
@@ -124,7 +124,8 @@ const classifyStep = createStep({
 
     const allowed = new Set(["connectivity", "auth-policy", "endpoint-health", "log-intelligence", "generic"]);
     const cleaned = parsed.buckets.map((b) => b.toLowerCase().trim()).filter((b) => allowed.has(b));
-    const buckets = Array.from(new Set([...deterministicBuckets, ...cleaned]));
+    const productBuckets = productBaselineBuckets(inputData.product);
+    const buckets = Array.from(new Set([...deterministicBuckets, ...productBuckets, ...cleaned]));
     let hypotheses = (parsed.hypotheses ?? []).map((h) => h.trim()).filter(Boolean).slice(0, 6);
 
     if (hypotheses.length === 0) {
@@ -146,7 +147,7 @@ interface SpecialistDef {
   stepId: string;
   // Each specialist has a different generic Agent type; we only need .generate(), so widen.
   agent: Agent<string, any, undefined, unknown>;
-  baseline: (input: { target: string; issue: string; context?: string }) => Promise<{
+  baseline: (input: { product?: string; target: string; issue: string; context?: string }) => Promise<{
     evidence: string[];
     rootCauses: RootCauseCandidate[];
     actions: ActionItem[];
@@ -217,6 +218,7 @@ function buildSpecialistStep(def: SpecialistDef) {
       }
 
       const baseline = await def.baseline({
+        product: inputData.product,
         target: inputData.target,
         issue: inputData.issue,
         context: inputData.context
