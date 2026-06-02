@@ -31,7 +31,7 @@ The `twc` prefix is optional inside the interactive shell. Run `twc --help` or `
 | `twc jobs logs [jobId] [--tail N]` | Tail a job's worker log (no id = last queued job) |
 | `twc jobs cancel <jobId>` | Kill a running or queued job |
 | `twc explain <jobId>` | Turn a job report into a plain-language narrative |
-| `twc docs ask "<question>" [--live]` | Answer a TeamViewer question from official docs |
+| `twc docs ask "<question>"` | Answer a TeamViewer question from official docs |
 | `twc docs reindex` | Rebuild the local hybrid RAG index from official sources (via Jina) + local ONNX embeddings |
 | `twc docs index` | Show local index status (chunks, embeddings, model) |
 | `twc docs sources` | List the official documentation sources |
@@ -302,9 +302,8 @@ Two layers (`src/knowledge/teamviewerDocs.ts`):
    Face hub on first `docs reindex`, then reused offline; override it with `TWC_EMBED_MODEL`.
    Foundry Local cannot serve embeddings (its catalog ships only chat-completion models), so the
    embedder is independent — it remains the hard gate only for the **chat agents**.
-3. **`--live` refresh** — `twc docs ask "..." --live` re-fetches the single most relevant
-   official page via Jina before answering, so the freshest content is searchable. No key
-   required. "Always up to date" simply means: re-run `twc docs reindex` whenever you want.
+3. **Staying current** — the index is a snapshot; re-run `twc docs reindex` whenever you want
+   to refresh the local knowledge from the official sources (fetched via Jina).
 
 Every specialist agent and the gateway agent get a `tw-official-docs` tool. When a model is
 unsure it calls the tool; if the answer isn't grounded the tool returns `confident: false` and
@@ -314,7 +313,7 @@ the agent points the user to the cited official URL rather than guessing.
 twc docs reindex                                       # build the local index (fetch via Jina)
 twc docs index                                         # show index status (chunks / embeddings)
 twc docs ask "which ports does teamviewer use"      # answer from verified facts + local index
-twc docs ask "how does Tensor SSO work" --live        # refresh the most relevant page first
+twc docs ask "how does Tensor SSO work"               # answer from verified facts + local index
 twc docs sources                                       # list the official doc URLs
 twc docs sync                                          # pre-fetch & cache raw doc text (offline)
 ```
@@ -597,7 +596,7 @@ Query the official-docs knowledge layer:
 
 ```bash
 twc docs ask "which ports does teamviewer use"     # verified facts + cached docs
-twc docs ask "how does Tensor SSO work" --live      # read the official page first
+twc docs ask "how does Tensor SSO work"             # verified facts + local index
 twc docs sources                                     # list official doc URLs
 twc docs sync                                        # pre-fetch & cache for offline use
 ```

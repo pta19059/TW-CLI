@@ -666,15 +666,8 @@ export function groundingFacts(topics: DocTopic[], product?: string, limit = 4):
  * grounded, return an honest "I don't know" pointing to the official source.
  */
 export async function answerFromKnowledge(
-  query: string,
-  opts: { live?: boolean } = {}
+  query: string
 ): Promise<KnowledgeAnswer> {
-  if (opts.live) {
-    // Key-free refresh of the most relevant page (server-side via Jina), so the
-    // legacy full-text cache below reflects the latest content.
-    await fetchOfficialDoc(bestSourceFor(query).url, true).catch(() => undefined);
-  }
-
   const localHits = await retrieveLocal(query, 5);
   const hits = [...localHits, ...searchKnowledge(query, 5)]
     .sort((a, b) => b.score - a.score)

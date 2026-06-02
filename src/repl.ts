@@ -278,7 +278,7 @@ async function handleSlash(line: string, state: ReplState, rl: readline.Interfac
     case "doctor": await doctorCmd(); return true;
     case "docs": {
       if (!arg) { console.log(color.red("  usage: /docs <question>")); return true; }
-      const result = await answerFromKnowledge(arg, { live: false });
+      const result = await answerFromKnowledge(arg);
       console.log(result.answer);
       if (result.citations.length > 0) {
         console.log(color.dim(`  sources: ${result.citations.join(", ")}`));

@@ -305,10 +305,9 @@ export function buildCli(): Command {
   docs
     .command("ask <question>")
     .description("Answer a TeamViewer question from verified facts and the local doc index")
-    .option("--live", "Refresh the most relevant official page (via Jina) before answering", false)
-    .action(async (question: string, options: { live?: boolean }) => {
+    .action(async (question: string) => {
       try {
-        const result = await answerFromKnowledge(question, { live: Boolean(options.live) });
+        const result = await answerFromKnowledge(question);
         console.log(result.answer);
         if (result.citations.length > 0) {
           console.log("\nSources:");
