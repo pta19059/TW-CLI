@@ -11,7 +11,7 @@ import { renderReportMarkdown } from "./agents/formatReport.js";
 import { explainReport } from "./agents/explain.js";
 import { discoverFoundryEndpoint, probeFoundryLocal } from "./mastra/foundryLocal.js";
 import { MODEL_CATALOG, findEntry, resolveModelId } from "./mastra/modelCatalog.js";
-import { getActiveModelId, setActiveModelId } from "./userConfig.js";
+import { getActiveModelId, setActiveModelId, setLastJobId, getLastJobId } from "./userConfig.js";
 import { invalidateModelCache } from "./mastra/agents/index.js";
 import { killProcessTree } from "./jobs/killTree.js";
 import { getCliVersion } from "./version.js";
@@ -30,7 +30,63 @@ function resolveProduct(raw: string): ProductKey {
   return product;
 }
 
-function enqueue(type: JobType, rawProduct: string, options: { target: string; issue: string; context?: string }): void {
+function printJobDetails(job: AgentJob): void {
+  console.log(`Job: ${job.id}`);
+  console.log(`Type: ${job.type}`);
+  console.log(`Product: ${productName(job.product)}`);
+  console.log(`Status: ${job.status}`);
+  console.log(`Updated: ${job.updatedAt}`);
+
+  if (job.report) {
+    console.log("");
+    console.log(`Summary: ${job.report.summary}`);
+    console.log(`Confidence: ${job.report.confidence.toFixed(2)}`);
+    console.log(`Escalation: ${job.report.escalation.required ? "yes" : "no"} (${job.report.escalation.reason})`);
+
+    console.log("");
+    console.log("Top root causes:");
+    for (const cause of job.report.rootCauses.slice(0, 3)) {
+      console.log(`- ${cause.title} (${cause.score.toFixed(2)}): ${cause.rationale}`);
+    }
+
+    console.log("");
+    console.log("Actions:");
+    for (const action of job.report.actions) {
+      console.log(`- ${action.step} | risk=${action.risk} | rollback=${action.rollback}`);
+    }
+  } else if (job.output) {
+    console.log("");
+    console.log(job.output);
+  }
+
+  if (job.error) {
+    console.log("");
+    console.log(`Error: ${job.error}`);
+  }
+}
+
+/** Poll the job store until the job reaches a terminal status (or timeout). */
+async function waitForJob(jobId: string, timeoutMs = 180_000): Promise<AgentJob | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const job = getJob(jobId);
+    if (job && (job.status === "completed" || job.status === "failed" || job.status === "cancelled")) {
+      return job;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return getJob(jobId);
+}
+
+function resolveJobId(jobId?: string): string | undefined {
+  return jobId ?? getLastJobId();
+}
+
+function enqueue(
+  type: JobType,
+  rawProduct: string,
+  options: { target: string; issue: string; context?: string; wait?: boolean }
+): void {
   const product = resolveProduct(rawProduct);
   const now = new Date().toISOString();
 
@@ -49,11 +105,26 @@ function enqueue(type: JobType, rawProduct: string, options: { target: string; i
   };
 
   addJob(job);
+  setLastJobId(job.id);
   startDetachedWorker(job.id);
 
+  if (options.wait) {
+    console.log(`Queued ${type} job ${job.id} for ${productName(product)}. Waiting for it to finish...`);
+    void waitForJob(job.id).then((finished) => {
+      console.log("");
+      if (finished) {
+        printJobDetails(finished);
+      } else {
+        console.log(`Still running. Inspect later with 'twc jobs show ${job.id}'.`);
+      }
+    });
+    return;
+  }
+
   console.log(`Queued ${type} job ${job.id} for ${productName(product)}.`);
-  console.log("Use 'twc jobs show <jobId>' to inspect status and output.");
+  console.log(`Saved as last job. Run 'twc jobs show' (no id) to view the output once ready.`);
 }
+
 
 export function buildCli(): Command {
   const program = new Command();
@@ -103,8 +174,9 @@ export function buildCli(): Command {
     .requiredOption("--target <target>", "Target device/session/endpoint")
     .requiredOption("--issue <issue>", "Debug issue summary")
     .option("--context <context>", "Extra context for the agent")
+    .option("--wait", "Wait for the job to finish and print the output directly")
     .description("Start a background debugging task with Mastra agents")
-    .action((product, options: { target: string; issue: string; context?: string }) => {
+    .action((product, options: { target: string; issue: string; context?: string; wait?: boolean }) => {
       enqueue("debug", product, options);
     });
 
@@ -113,8 +185,9 @@ export function buildCli(): Command {
     .requiredOption("--target <target>", "Target device/session/endpoint")
     .requiredOption("--issue <issue>", "Troubleshooting issue summary")
     .option("--context <context>", "Extra context for the agent")
+    .option("--wait", "Wait for the job to finish and print the output directly")
     .description("Start a background troubleshooting task with Mastra agents")
-    .action((product, options: { target: string; issue: string; context?: string }) => {
+    .action((product, options: { target: string; issue: string; context?: string; wait?: boolean }) => {
       enqueue("troubleshoot", product, options);
     });
 
@@ -132,11 +205,17 @@ export function buildCli(): Command {
     });
 
   jobs
-    .command("show <jobId>")
+    .command("show [jobId]")
     .option("--json", "Print full raw job JSON")
     .option("--markdown", "Print report as Markdown")
-    .description("Show one job with output/error")
-    .action((jobId: string, options: { json?: boolean; markdown?: boolean }) => {
+    .description("Show one job with output/error (defaults to the last queued job)")
+    .action((jobIdArg: string | undefined, options: { json?: boolean; markdown?: boolean }) => {
+      const jobId = resolveJobId(jobIdArg);
+      if (!jobId) {
+        console.error("No job id given and no last job saved yet. Run a debug/troubleshoot job first.");
+        process.exitCode = 1;
+        return;
+      }
       const job = getJob(jobId);
       if (!job) {
         console.error(`Job not found: ${jobId}`);
@@ -159,45 +238,20 @@ export function buildCli(): Command {
         return;
       }
 
-      console.log(`Job: ${job.id}`);
-      console.log(`Type: ${job.type}`);
-      console.log(`Product: ${productName(job.product)}`);
-      console.log(`Status: ${job.status}`);
-      console.log(`Updated: ${job.updatedAt}`);
-
-      if (job.report) {
-        console.log("");
-        console.log(`Summary: ${job.report.summary}`);
-        console.log(`Confidence: ${job.report.confidence.toFixed(2)}`);
-        console.log(`Escalation: ${job.report.escalation.required ? "yes" : "no"} (${job.report.escalation.reason})`);
-
-        console.log("");
-        console.log("Top root causes:");
-        for (const cause of job.report.rootCauses.slice(0, 3)) {
-          console.log(`- ${cause.title} (${cause.score.toFixed(2)}): ${cause.rationale}`);
-        }
-
-        console.log("");
-        console.log("Actions:");
-        for (const action of job.report.actions) {
-          console.log(`- ${action.step} | risk=${action.risk} | rollback=${action.rollback}`);
-        }
-      } else if (job.output) {
-        console.log("");
-        console.log(job.output);
-      }
-
-      if (job.error) {
-        console.log("");
-        console.log(`Error: ${job.error}`);
-      }
+      printJobDetails(job);
     });
 
   jobs
-    .command("logs <jobId>")
+    .command("logs [jobId]")
     .option("--tail <lines>", "Print only the last N lines", "200")
-    .description("Print stdout/stderr captured for a job")
-    .action((jobId: string, options: { tail: string }) => {
+    .description("Print stdout/stderr captured for a job (defaults to the last queued job)")
+    .action((jobIdArg: string | undefined, options: { tail: string }) => {
+      const jobId = resolveJobId(jobIdArg);
+      if (!jobId) {
+        console.error("No job id given and no last job saved yet. Run a debug/troubleshoot job first.");
+        process.exitCode = 1;
+        return;
+      }
       const job = getJob(jobId);
       if (!job) {
         console.error(`Job not found: ${jobId}`);

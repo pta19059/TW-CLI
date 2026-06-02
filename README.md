@@ -24,11 +24,11 @@ The `twc` prefix is optional inside the interactive shell. Run `twc --help` or `
 | `twc products list` | List the whitelisted TeamViewer products |
 | `twc agents list` | List the Mastra agent roles |
 | `twc agents plan --task <t> --issue "<text>"` | Show which agents would be selected (dry run) |
-| `twc debug <product> --target <v> --issue "<text>" [--context <c>]` | Run a background **debug** job |
-| `twc troubleshoot <product> --target <v> --issue "<text>" [--context <c>]` | Run a background **troubleshoot** job |
+| `twc debug <product> --target <v> --issue "<text>" [--context <c>] [--wait]` | Run a background **debug** job (`--wait` prints the output directly) |
+| `twc troubleshoot <product> --target <v> --issue "<text>" [--context <c>] [--wait]` | Run a background **troubleshoot** job (`--wait` prints the output directly) |
 | `twc jobs list [--limit N]` | List recent background jobs |
-| `twc jobs show <jobId> [--json\|--markdown]` | Show a job report (text / JSON / Markdown) |
-| `twc jobs logs <jobId> [--tail N]` | Tail a job's worker log |
+| `twc jobs show [jobId] [--json\|--markdown]` | Show a job report (no id = last queued job) |
+| `twc jobs logs [jobId] [--tail N]` | Tail a job's worker log (no id = last queued job) |
 | `twc jobs cancel <jobId>` | Kill a running or queued job |
 | `twc explain <jobId>` | Turn a job report into a plain-language narrative |
 | `twc docs ask "<question>" [--live]` | Answer a TeamViewer question from official docs |
@@ -52,10 +52,15 @@ twc -p "Session drops after 5 minutes" --product teamviewer-remote --target endp
 # Background troubleshoot job for Tensor policy rollout:
 twc troubleshoot teamviewer-tensor --target tenant-acme --issue "Policy rollout not applied" --context "EU region, 1200 devices"
 
-# Background debug job for the desktop client:
-twc debug teamviewer-remote --target endpoint-001 --issue "Cannot connect to remote device" --context "Behind corporate proxy"
+# Same, but wait and print the output directly (no need to copy the job id):
+twc debug teamviewer-remote --target endpoint-001 --issue "Cannot connect to remote device" --context "Behind corporate proxy" --wait
 
-# Inspect the job that the two commands above queued:
+# The last queued job is remembered, so you can inspect it later WITHOUT the id:
+twc jobs show            # shows the last job
+twc jobs show --markdown # last job as a Markdown report
+twc jobs logs --tail 100 # tail the last job's worker log
+
+# ...or target a specific job by id from the list:
 twc jobs list --limit 5
 twc jobs show 8fK2aQ9xLp --markdown
 twc jobs logs 8fK2aQ9xLp --tail 100

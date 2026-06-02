@@ -9,6 +9,7 @@ const CONFIG_PATH = join(APP_DIR, "config.json");
 
 export interface UserConfig {
   activeModelId?: string;
+  lastJobId?: string;
 }
 
 export function loadUserConfig(): UserConfig {
@@ -42,4 +43,16 @@ export function setActiveModelId(id: string | undefined): void {
  */
 export function getActiveModelId(): string | undefined {
   return loadUserConfig().activeModelId ?? process.env.FOUNDRY_LOCAL_MODEL ?? process.env.MASTRA_MODEL;
+}
+
+/** Remember the most recently queued job so `jobs show`/`jobs logs` can default to it. */
+export function setLastJobId(id: string | undefined): void {
+  const current = loadUserConfig();
+  if (id) current.lastJobId = id;
+  else delete current.lastJobId;
+  saveUserConfig(current);
+}
+
+export function getLastJobId(): string | undefined {
+  return loadUserConfig().lastJobId;
 }
