@@ -88,6 +88,12 @@ export interface DocFetchResult {
   fromCache?: boolean;
 }
 
+export interface WebSearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
 // ── Curated official documentation sources ──────────────────────────────────
 
 /**
@@ -363,6 +369,73 @@ export async function syncOfficialDocs(): Promise<{ id: string; ok: boolean; det
   return results;
 }
 
+/** Resolve a DuckDuckGo redirect link (//duckduckgo.com/l/?uddg=…) to its target URL. */
+function decodeDdgUrl(href: string): string | null {
+  try {
+    const normalized = href.replace(/&amp;/g, "&");
+    const abs = normalized.startsWith("//") ? `https:${normalized}` : normalized;
+    const u = new URL(abs);
+    const uddg = u.searchParams.get("uddg");
+    if (uddg) return decodeURIComponent(uddg);
+    // Direct (non-redirect) result link.
+    return isAllowedHost(abs) ? abs : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Live web search restricted to official TeamViewer hosts via the DuckDuckGo
+ * HTML endpoint (no API key, no local cache). Returns the result titles, URLs
+ * and snippets so the knowledge layer can ground answers and cite official
+ * pages even when those pages reject direct fetches (TLS/WAF).
+ */
+export async function searchTeamViewerWeb(query: string, limit = 5): Promise<WebSearchResult[]> {
+  const ddgQuery = `site:teamviewer.com ${query}`.trim();
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(ddgQuery)}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: { "User-Agent": BROWSER_UA, Accept: "text/html" }
+    });
+    if (!res.ok) return [];
+    const html = await res.text();
+
+    const links: { title: string; url: string }[] = [];
+    const linkRe = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    let m: RegExpExecArray | null;
+    while ((m = linkRe.exec(html)) && links.length < limit * 2) {
+      const target = decodeDdgUrl(m[1]);
+      if (target && isAllowedHost(target)) {
+        links.push({ title: stripHtml(m[2]), url: target });
+      }
+    }
+
+    const snippets: string[] = [];
+    const snipRe = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+    while ((m = snipRe.exec(html)) !== null) {
+      snippets.push(stripHtml(m[1]));
+    }
+
+    const out: WebSearchResult[] = [];
+    const seen = new Set<string>();
+    for (let i = 0; i < links.length && out.length < limit; i++) {
+      const { title, url: u } = links[i];
+      if (seen.has(u)) continue;
+      seen.add(u);
+      out.push({ title, url: u, snippet: snippets[i] ?? "" });
+    }
+    return out;
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Light singular/plural normalization so "ports" matches "port". */
 function stem(token: string): string {
   if (token.length > 3 && token.endsWith("s") && !token.endsWith("ss")) return token.slice(0, -1);
@@ -454,12 +527,25 @@ export async function answerFromKnowledge(
   query: string,
   opts: { live?: boolean } = {}
 ): Promise<KnowledgeAnswer> {
+  const webHits: KnowledgeHit[] = [];
   if (opts.live) {
     const src = bestSourceFor(query);
     await fetchOfficialDoc(src.url).catch(() => undefined);
+
+    // Live web search restricted to official TeamViewer hosts (no cache).
+    const tokens = tokenize(query);
+    const results = await searchTeamViewerWeb(query).catch(() => [] as WebSearchResult[]);
+    for (const r of results) {
+      const raw = scoreText(tokens, `${r.title} ${r.snippet}`);
+      if (raw <= 0) continue;
+      const text = r.snippet || r.title;
+      // Official, site-restricted results are trustworthy: boost so a relevant
+      // hit clears the confidence bar even for short queries.
+      webHits.push({ kind: "doc", text, score: raw + 1.5, source: r.url, title: r.title });
+    }
   }
 
-  const hits = searchKnowledge(query, 5);
+  const hits = [...webHits, ...searchKnowledge(query, 5)].sort((a, b) => b.score - a.score).slice(0, 5);
   const confident = hits.length > 0 && hits[0].score >= 2;
   const citations = Array.from(new Set(hits.map((h) => h.source))).slice(0, 3);
 

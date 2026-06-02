@@ -286,6 +286,11 @@ Two layers (`src/knowledge/teamviewerDocs.ts`):
    (`twc docs ... --live`), strip them to text and cache them under `~/.twc/knowledge` for
    instant, offline reuse. Fetches are restricted to a `*.teamviewer.com` host allowlist (SSRF
    guard); there is **no archive/Wayback fallback** — docs come straight from the source.
+3. **Live web search (`--live`)** — because teamviewer.com rejects direct fetches behind its
+   WAF (TLS handshake failure), `--live` also runs a live search via the DuckDuckGo HTML
+   endpoint, **restricted to official `*.teamviewer.com` hosts** (no API key, no local cache).
+   The result titles, snippets and URLs ground the answer and are cited as sources — so even
+   pages that can't be fetched directly still yield a grounded, sourced answer.
 
 Every specialist agent and the gateway agent get a `tw-official-docs` tool. When a model is
 unsure it calls the tool; if the answer isn't grounded the tool returns `confident: false` and
