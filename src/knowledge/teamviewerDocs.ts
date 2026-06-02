@@ -89,6 +89,19 @@ export interface DocFetchResult {
 }
 
 // ── Curated official documentation sources ──────────────────────────────────
+
+/**
+ * Generic landing source used as an honest fallback when a query matches no
+ * specific document. Pointing here (instead of an arbitrary first article)
+ * avoids misleading users toward an unrelated topic.
+ */
+export const GENERAL_SUPPORT_SOURCE: DocSource = {
+  id: "support-home",
+  title: "TeamViewer Knowledge Base",
+  url: "https://www.teamviewer.com/en/global/support/knowledge-base/",
+  topics: ["general"]
+};
+
 export const OFFICIAL_DOCS: DocSource[] = [
   {
     id: "ports",
@@ -407,8 +420,8 @@ export function searchKnowledge(query: string, limit = 5): KnowledgeHit[] {
 /** Pick the official source most relevant to a query, for honest fallbacks. */
 export function bestSourceFor(query: string): DocSource {
   const tokens = tokenize(query);
-  let best = OFFICIAL_DOCS[0];
-  let bestScore = -1;
+  let best = GENERAL_SUPPORT_SOURCE;
+  let bestScore = 0;
   for (const doc of OFFICIAL_DOCS) {
     const score = scoreText(tokens, `${doc.title} ${doc.topics.join(" ")} ${doc.id}`);
     if (score > bestScore) {
