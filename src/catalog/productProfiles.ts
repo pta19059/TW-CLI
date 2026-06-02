@@ -57,16 +57,22 @@ export interface ProductDiagnosticProfile {
 }
 
 // ── Shared TeamViewer backbone (used by every product) ──────────────────────
+// Ports verified against the official KB "Which ports are used by TeamViewer?"
+// (TCP/UDP 5938 primary → TCP 443 → TCP 80). NOTE: TeamViewer does NOT publish a
+// fixed hostname list — all server IPs resolve via PTR to *.teamviewer.com — so the
+// specific hostnames below are best-effort/illustrative and should be confirmed per
+// tenant/region. webapi.teamviewer.com is the documented Web API base.
 const ROUTER_HOSTS: ProbeEndpoint[] = [
-  { host: "router1.teamviewer.com", ports: [5938, 443], purpose: "Session router (keepalive backbone)" },
-  { host: "router2.teamviewer.com", ports: [5938, 443], purpose: "Session router (failover)" },
-  { host: "router7.teamviewer.com", ports: [5938, 443], purpose: "Session router (failover)" }
+  { host: "router1.teamviewer.com", ports: [5938, 443, 80], purpose: "Session router (keepalive backbone)", bestEffort: true },
+  { host: "router2.teamviewer.com", ports: [5938, 443, 80], purpose: "Session router (failover)", bestEffort: true },
+  { host: "router7.teamviewer.com", ports: [5938, 443, 80], purpose: "Session router (failover)", bestEffort: true }
 ];
 const MASTER_HOST: ProbeEndpoint = {
   host: "master1.teamviewer.com",
   ports: [443],
   https: "https://master1.teamviewer.com/",
-  purpose: "Master server (initial assignment)"
+  purpose: "Master server (initial assignment)",
+  bestEffort: true
 };
 const LOGIN_HOST: ProbeEndpoint = {
   host: "login.teamviewer.com",
@@ -126,7 +132,8 @@ export const PRODUCT_PROFILES: Record<ProductKey, ProductDiagnosticProfile> = {
     processes: CORE_PROCESSES,
     logFilePattern: /teamviewer.*\.log$/i,
     // Tensor adds enterprise mgmt: users, managed groups, policies (conditional access).
-    webApiPaths: ["/account", "/devices", "/users", "/managedgroups"],
+    // Paths verified against the official Web API v1 OpenAPI spec.
+    webApiPaths: ["/account", "/devices", "/users", "/managed/groups"],
     notes: "Enterprise (Tensor) builds on the core client and adds SSO, Conditional Access and policy management."
   },
 

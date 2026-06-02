@@ -36,7 +36,7 @@ describe("product profiles catalog", () => {
   it("Tensor adds the policy/SSO api surface on top of the core client", () => {
     const tensor = getProductProfile("teamviewer-tensor");
     expect(tensor.webApiPaths).toContain("/users");
-    expect(tensor.webApiPaths).toContain("/managedgroups");
+    expect(tensor.webApiPaths).toContain("/managed/groups");
     expect(tensor.deliveryModel).toBe("local-agent");
   });
 
@@ -165,12 +165,12 @@ describe("fromAuth policy-check rendering", () => {
       product: "TeamViewer Tensor",
       policyChecks: [
         { path: "/users", status: 200, ok: true },
-        { path: "/managedgroups", status: 403, ok: false }
+        { path: "/managed/groups", status: 403, ok: false }
       ],
       diagnostics: []
     };
     const out = fromAuth(report, "host");
-    expect(out.rootCauses.some((r) => r.title === "Web API /managedgroups not accessible")).toBe(true);
+    expect(out.rootCauses.some((r) => r.title === "Web API /managed/groups not accessible")).toBe(true);
     expect(out.evidence.join(" ")).toContain("policy/API surface");
   });
 });
