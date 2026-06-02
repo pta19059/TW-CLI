@@ -76,6 +76,8 @@ export interface KnowledgeHit {
   score: number;
   source: string;
   title?: string;
+  /** Semantic cosine similarity to the query (docs only; facts are keyword). */
+  sem?: number;
 }
 
 export interface KnowledgeAnswer {
@@ -539,9 +541,10 @@ export async function retrieveJustInTime(query: string, limit = 5): Promise<Know
     const r = await fetchOfficialDoc(l.url).catch(() => null);
     if (!r || !r.ok || !r.text) continue;
     const docId = createHash("sha1").update(l.url).digest("hex").slice(0, 12);
-    chunkMarkdown(r.text).forEach((text, i) =>
-      freshChunks.push({ id: `jit-${docId}#${i}`, docId: `jit-${docId}`, url: l.url, title: l.title, text })
-    );
+    chunkMarkdown(r.text).forEach((text, i) => {
+      if (isJunkChunk(text)) return; // don't index or rank error-page bodies
+      freshChunks.push({ id: `jit-${docId}#${i}`, docId: `jit-${docId}`, url: l.url, title: l.title, text });
+    });
   }
   if (freshChunks.length === 0) return [];
 
@@ -552,25 +555,27 @@ export async function retrieveJustInTime(query: string, limit = 5): Promise<Know
     c.embedding = vectors[i + 1];
   });
 
-  const scored = freshChunks
-    .map((c) => {
-      const kw = scoreText(tokens, `${c.title} ${c.text}`);
-      const sem = cosineSimilarity(queryVec, c.embedding!);
-      return { c, score: kw + sem * 3 };
-    })
-    .filter((s) => s.score > 0)
-    .sort((a, b) => b.score - a.score);
+  const scored = freshChunks.map((c) => ({
+    c,
+    kw: scoreText(tokens, `${c.title} ${c.text}`),
+    sem: cosineSimilarity(queryVec, c.embedding!)
+  }));
 
   // Fold the fetched chunks into the local index for next time (best-effort).
   enrichLocalIndex(freshChunks, model);
 
-  return scored.slice(0, limit).map((s) => ({
+  // Same hybrid RRF fusion + dedup as the core index, so live results are
+  // ranked on equal footing.
+  const ranked = fuseHybrid(scored, Math.max(limit * 4, 20));
+  const hits = ranked.map((s) => ({
     kind: "doc" as const,
     text: bestSnippet(s.c.text, tokens),
-    score: s.score,
+    score: s.kw + s.sem * 3,
+    sem: s.sem,
     source: s.c.url,
     title: s.c.title
   }));
+  return dedupeHits(hits).slice(0, limit);
 }
 
 /** Append freshly embedded chunks to the on-disk index (deduped by id). */
@@ -807,24 +812,28 @@ export async function retrieveLocal(query: string, limit = 5): Promise<Knowledge
   const queryVec = (await embedTexts([query])).vectors[0];
 
   const scored = idx.chunks
-    .map((c) => {
-      const kw = scoreText(tokens, `${c.title} ${c.text}`);
-      const sem = cosineSimilarity(queryVec, c.embedding!);
-      // Hybrid: keyword overlap is the deterministic backbone; semantic cosine
-      // boosts and reranks. A strong semantic match can surface on its own.
-      return { c, score: kw + sem * 3 };
-    })
-    .filter((s) => s.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+    .filter((c) => !isJunkChunk(c.text))
+    .map((c) => ({
+      c,
+      kw: scoreText(tokens, `${c.title} ${c.text}`),
+      sem: cosineSimilarity(queryVec, c.embedding!)
+    }));
 
-  return scored.map((s) => ({
+  // Azure-Search-style hybrid: fuse the keyword ranking and the vector ranking
+  // with Reciprocal Rank Fusion over a generous candidate pool, then drop
+  // near-identical passages (overlapping chunks of the same page) before
+  // returning the top `limit`. RRF keeps a strong lexical match from being
+  // buried by semantic noise and vice-versa.
+  const ranked = fuseHybrid(scored, Math.max(limit * 4, 20));
+  const hits = ranked.map((s) => ({
     kind: "doc" as const,
     text: bestSnippet(s.c.text, tokens),
-    score: s.score,
+    score: s.kw + s.sem * 3,
+    sem: s.sem,
     source: s.c.url,
     title: s.c.title
   }));
+  return dedupeHits(hits).slice(0, limit);
 }
 
 /** Light singular/plural normalization so "ports" matches "port". */
@@ -848,12 +857,109 @@ function scoreText(queryTokens: string[], haystack: string, extraKeywords: strin
 }
 
 /**
+ * Fraction of distinct query content-tokens (stemmed) that actually appear in a
+ * passage. This is the lexical-grounding signal behind confidence: a passage
+ * that only shares one common word (e.g. "windows") with a multi-word question
+ * scores low and is rejected, routing the query to the live KB instead.
+ * Matching is tolerant of inflections (use/used/using, connect/connection) via a
+ * shared 4-char prefix, since the light stemmer only strips a trailing "s".
+ */
+function queryCoverage(queryTokens: string[], text: string): number {
+  if (queryTokens.length === 0) return 0;
+  const hayTokens = tokenize(text);
+  const hayStems = new Set(hayTokens.map(stem));
+  const q = new Set(queryTokens.map(stem));
+  let matched = 0;
+  for (const t of q) {
+    if (hayStems.has(t)) {
+      matched += 1;
+      continue;
+    }
+    const p = t.slice(0, 4);
+    if (t.length >= 3 && hayTokens.some((h) => h.startsWith(p) || (h.length >= 4 && t.startsWith(h.slice(0, 4))))) {
+      matched += 1;
+    }
+  }
+  return matched / q.size;
+}
+
+/**
+ * Blended relevance for ranking a mixed pool of doc + fact hits. Lexical
+ * coverage leads; semantic similarity is a half-weight tiebreaker (the heavy
+ * vector lifting already happened during RRF retrieval); a curated fact that
+ * genuinely matches the question gets a decisive bonus so a precise verified
+ * statement headlines instead of a generic page that merely scores high on
+ * cosine.
+ */
+function hitRelevance(queryTokens: string[], h: KnowledgeHit): number {
+  const cov = queryCoverage(queryTokens, `${h.title ?? ""} ${h.text}`);
+  const factBonus = h.kind === "fact" && cov >= 0.5 ? 0.4 : 0;
+  return cov + 0.5 * (h.sem ?? 0) + factBonus;
+}
+
+function normalizeForDedup(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+/**
+ * Reject error/placeholder chunks that Jina sometimes captures (a moved page
+ * returns a "404 page not found" body). These embed and keyword-match like any
+ * other passage, so without an explicit guard they leak into answers as noise.
+ */
+function isJunkChunk(text: string): boolean {
+  return /404 page not found|page not found|page (?:could not|couldn'?t) be found|the page you (?:are|were) looking for/i.test(
+    text
+  );
+}
+
+/** Drop near-identical passages, keeping the first (highest-ranked) occurrence. */
+function dedupeHits(hits: KnowledgeHit[]): KnowledgeHit[] {
+  const seen = new Set<string>();
+  const out: KnowledgeHit[] = [];
+  for (const h of hits) {
+    const key = `${h.source}|${normalizeForDedup(h.text).slice(0, 80)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(h);
+  }
+  return out;
+}
+
+/**
+ * Reciprocal Rank Fusion of a keyword ranking and a semantic ranking — the same
+ * idea Azure AI Search uses to combine BM25 and vector results. Each list
+ * contributes 1/(K+rank); chunks ranked highly by either signal float to the
+ * top. K=60 is the standard RRF constant.
+ */
+function fuseHybrid(
+  scored: { c: IndexChunk; kw: number; sem: number }[],
+  limit: number
+): { c: IndexChunk; kw: number; sem: number }[] {
+  const K = 60;
+  const fused = new Map<IndexChunk, number>();
+  [...scored]
+    .filter((s) => s.kw > 0)
+    .sort((a, b) => b.kw - a.kw)
+    .forEach((s, i) => fused.set(s.c, (fused.get(s.c) ?? 0) + 1 / (K + i + 1)));
+  [...scored]
+    .sort((a, b) => b.sem - a.sem)
+    .forEach((s, i) => fused.set(s.c, (fused.get(s.c) ?? 0) + 1 / (K + i + 1)));
+  return scored
+    .map((s) => ({ s, fused: fused.get(s.c) ?? 0 }))
+    // Require at least some signal (a keyword match or a non-trivial cosine).
+    .filter(({ s }) => s.kw > 0 || s.sem >= 0.2)
+    .sort((a, b) => b.fused - a.fused)
+    .slice(0, limit)
+    .map(({ s }) => s);
+}
+
+/**
  * Tidy a snippet for display: drop markdown header hashes, list bullets, table
  * rows and stray backticks, then collapse the remaining prose onto one line so
  * a multi-section chunk reads as a sentence instead of a soup of headings.
  */
-function tidySnippet(text: string, width = 320): string {
-  const flat = text
+function tidySnippet(text: string, width = 320, opts: { keepUrls?: boolean } = {}): string {
+  let flat = text
     .replace(/`/g, "")
     // Drop the Jina front-matter block (Title:/URL Source:/Published Time:/…)
     // that precedes the real content when a chunk starts at the page top.
@@ -870,20 +976,24 @@ function tidySnippet(text: string, width = 320): string {
     .join(" ")
     // Inline markdown cleanup (markers can sit mid-line after windowing):
     .replace(/^\S*:\/\/\S*\s*/, "") // leading URL fragment left by windowing
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ") // images
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") // links → label only
-    .replace(/\[\s*\]\(?[^)]*\)?/g, " ") // empty links (whole or windowed)
-    .replace(/https?:\/\/\S+/g, " ") // bare/leftover URLs
+    .replace(/!\[[^\]]*\]\([^)\s]*\)?/g, " ") // images (tolerant of cut close)
+    .replace(/\[([^\]]*)\]\([^)\s]*\)?/g, "$1") // links → label only (tolerant)
+    .replace(/\[\s*\]\(?[^)\s]*\)?/g, " "); // empty links (whole or windowed)
+  // Strip bare URLs only for doc snippets (Jina link soup). Curated facts may
+  // contain a meaningful URL (e.g. the Web API base URL) that IS the answer.
+  if (!opts.keepUrls) flat = flat.replace(/https?:\/\/\S+/g, " ");
+  flat = flat
     .replace(/(^|\s)#{1,6}(?=\s)/g, " ") // stray ## headers
     .replace(/\*\*|__/g, " ") // bold markers → space (avoid gluing words)
     .replace(/(^|\s)[*+]\s+/g, " ") // residual list bullets
-    .replace(/[*\s]*\[[^\]]*$/, "") // dangling link fragment at the end
+    .replace(/\[[^\]]*$/, "") // dangling link label with no closing bracket
+    .replace(/[*_#>\s]+$/g, "") // trailing stray markdown / bullets
     .replace(/\s{2,}/g, " ")
     .trim();
   return flat.length > width ? `${flat.slice(0, width).trim()}…` : flat;
 }
 
-function bestSnippet(text: string, queryTokens: string[], width = 280): string {
+function bestSnippet(text: string, queryTokens: string[], width = 300): string {
   const lower = text.toLowerCase();
   let bestIdx = -1;
   for (const t of queryTokens) {
@@ -891,8 +1001,22 @@ function bestSnippet(text: string, queryTokens: string[], width = 280): string {
     if (i >= 0 && (bestIdx < 0 || i < bestIdx)) bestIdx = i;
   }
   if (bestIdx < 0) return text.slice(0, width).trim();
-  const start = Math.max(0, bestIdx - 60);
-  return (start > 0 ? "…" : "") + text.slice(start, start + width).trim() + "…";
+  // Open the window at the start of the sentence containing the match so the
+  // snippet reads as a complete thought rather than a mid-sentence fragment.
+  let start = Math.max(0, bestIdx - 90);
+  const lead = text.slice(start, bestIdx);
+  const boundary = lead.match(/.*[.!?]\s+/s);
+  if (boundary) start += boundary[0].length;
+  let window = text.slice(start, start + width);
+  // Close the window at the last sentence boundary inside it (when past the
+  // halfway point) so we don't cut a word in half.
+  const lastEnd = Math.max(window.lastIndexOf(". "), window.lastIndexOf("! "), window.lastIndexOf("? "));
+  let cleanEnd = false;
+  if (lastEnd > width * 0.5) {
+    window = window.slice(0, lastEnd + 1);
+    cleanEnd = true;
+  }
+  return (start > 0 ? "…" : "") + window.trim() + (cleanEnd ? "" : "…");
 }
 
 /**
@@ -957,19 +1081,28 @@ export async function answerFromKnowledge(
   query: string
 ): Promise<KnowledgeAnswer> {
   const tokens = tokenize(query);
-  // A hit is trustworthy only when it is both highly ranked AND lexically
-  // anchored to the question. Purely-semantic neighbours (high cosine, zero
-  // keyword overlap) score ~2 on noise alone, so we require a real token match
-  // before declaring confidence — otherwise we fall through to the live KB.
-  const isConfident = (h: KnowledgeHit[]): boolean =>
-    h.length > 0 &&
-    h[0].score >= 2 &&
-    scoreText(tokens, `${h[0].title ?? ""} ${h[0].text}`) >= 1;
+  // A doc hit is trustworthy only when it is BOTH lexically grounded (a real
+  // fraction of the question's words appear in the passage, not just one common
+  // word) AND semantically close. Verified facts are curated, so a strong
+  // keyword coverage alone suffices. Anything weaker falls through to the live
+  // KB rather than answering from an off-topic page.
+  const COVERAGE_MIN = 0.6;
+  const SEM_MIN = 0.42;
+  const isConfident = (h: KnowledgeHit[]): boolean => {
+    if (h.length === 0) return false;
+    const top = h[0];
+    const cov = queryCoverage(tokens, `${top.title ?? ""} ${top.text}`);
+    if (top.kind === "fact") return cov >= 0.5;
+    return cov >= COVERAGE_MIN && (top.sem ?? 0) >= SEM_MIN;
+  };
+
+  // Rank the mixed pool by blended relevance (lexical coverage + semantic
+  // similarity), which keeps doc and fact hits on a single comparable scale.
+  const rerank = (pool: KnowledgeHit[]): KnowledgeHit[] =>
+    dedupeHits([...pool].sort((a, b) => hitRelevance(tokens, b) - hitRelevance(tokens, a))).slice(0, 5);
 
   const localHits = await retrieveLocal(query, 5);
-  let hits = [...localHits, ...searchKnowledge(query, 5)]
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 5);
+  let hits = rerank([...localHits, ...searchKnowledge(query, 5)]);
   let confident = isConfident(hits);
 
   // Just-in-time fallback: the curated core didn't answer confidently, so reach
@@ -977,43 +1110,64 @@ export async function answerFromKnowledge(
   if (!confident && process.env.TWC_NO_JIT !== "1") {
     const jit = await retrieveJustInTime(query, 5).catch(() => [] as KnowledgeHit[]);
     if (jit.length > 0) {
-      hits = [...hits, ...jit].sort((a, b) => b.score - a.score).slice(0, 5);
+      hits = rerank([...hits, ...jit]);
       confident = isConfident(hits);
     }
   }
 
-  const citations = Array.from(new Set(hits.map((h) => h.source))).slice(0, 3);
-
-
   if (!confident) {
     const src = bestSourceFor(query);
-    const lead = hits.length > 0
-      ? `I only have partial information. Best available: ${tidySnippet(hits[0].text)}`
-      : "I don't have a verified answer to that.";
+    // Only surface a partial passage if it is at least lexically on-topic;
+    // otherwise an off-topic snippet is worse than an honest "I don't know".
+    const lead =
+      hits.length > 0 && queryCoverage(tokens, `${hits[0].title ?? ""} ${hits[0].text}`) >= 0.34
+        ? `I only have partial information. Best available: ${tidySnippet(hits[0].text)}`
+        : "I don't have a verified answer to that.";
     return {
       answer:
         `${lead}\nFor an authoritative answer, consult the official TeamViewer documentation: ${src.title} — ${src.url}` +
         (localIndexInfo().built ? "" : " (run 'twc docs reindex' to build the local index)."),
       confident: false,
-      citations: citations.length > 0 ? citations : [src.url],
+      // Cite only sources we actually drew on; never invent a citation.
+      citations: hits.length > 0 ? Array.from(new Set(hits.map((h) => h.source))).slice(0, 3) : [src.url],
       hits
     };
   }
 
   // Anchor the answer to the single best-matching page so we never stitch
   // fragments of unrelated product pages into one reply. Supporting lines are
-  // taken ONLY from the same source as the top hit (a coherent passage), and a
-  // single strongly-overlapping verified fact may be appended for grounding.
+  // taken ONLY from the same source as the top hit (a coherent passage),
+  // de-duplicated, and a single strongly-overlapping verified fact may be
+  // appended for grounding.
   const top = hits[0];
   const sameSource = hits.filter((h) => h.source === top.source);
-  const lines = sameSource
-    .slice(0, 3)
-    .map((h) => (h.kind === "fact" ? `• ${tidySnippet(h.text)}` : `• ${h.title}: ${tidySnippet(h.text)}`));
-  if (top.kind === "doc") {
-    const fact = hits.find((h) => h.kind === "fact" && h.source !== top.source);
-    if (fact) lines.push(`• ${tidySnippet(fact.text)}`);
+  const seenLines: string[] = [];
+  const lines: string[] = [];
+  // True when `cand` adds nothing over a line we already kept (identical, or one
+  // contains the other — e.g. a short header fragment of a longer passage).
+  const isRedundant = (cand: string): boolean =>
+    seenLines.some((s) => s.includes(cand) || cand.includes(s));
+  for (const h of sameSource) {
+    const snip = tidySnippet(h.text, 320, { keepUrls: h.kind === "fact" });
+    const norm = normalizeForDedup(snip);
+    if (snip.length < 15 || isRedundant(norm)) continue;
+    seenLines.push(norm);
+    lines.push(h.kind === "fact" ? `• ${snip}` : `• ${h.title}: ${snip}`);
+    if (lines.length >= 3) break;
   }
-  const orderedCitations = [top.source, ...citations.filter((c) => c !== top.source)].slice(0, 3);
+  if (top.kind === "doc") {
+    const fact = hits.find(
+      (h) => h.kind === "fact" && h.source !== top.source && queryCoverage(tokens, h.text) >= 0.5
+    );
+    if (fact) {
+      const snip = tidySnippet(fact.text, 320, { keepUrls: true });
+      if (snip && !isRedundant(normalizeForDedup(snip))) lines.push(`• ${snip}`);
+    }
+  }
+  // Citations: the anchor source first, then any other source actually used in
+  // the answer lines — nothing fabricated.
+  const usedSources = Array.from(new Set([top.source, ...sameSource.map((h) => h.source)]));
+  const orderedCitations = usedSources.slice(0, 3);
   return {
     answer: lines.join("\n") || tidySnippet(top.text),
     confident: true,
