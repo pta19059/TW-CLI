@@ -169,6 +169,8 @@ static void DrawAnimatedIntro()
     }
 
     Console.WriteLine();
+    DrawBlinkingFigure(useAnsi, cCyan, cReset);
+    Console.WriteLine();
     Console.WriteLine($"{cGreen}{tip}{cReset}");
     Console.WriteLine();
 
@@ -183,6 +185,42 @@ static void DrawAnimatedIntro()
 
     Console.WriteLine();
     Console.WriteLine();
+}
+
+// Stylized little man (omino) that blinks its eyes exactly once.
+static void DrawBlinkingFigure(bool useAnsi, string cCyan, string cReset)
+{
+    var figure = new[]
+    {
+        "    .---.",
+        "   ( o o )",
+        "    \\   /",
+        "   __| |__",
+        "     | |",
+        "    /   \\"
+    };
+    const int eyeIndex = 1;            // line that holds the eyes
+    const string eyesOpen = "   ( o o )";
+    const string eyesClosed = "   ( - - )";
+
+    foreach (var line in figure)
+    {
+        Console.WriteLine($"{cCyan}{line}{cReset}");
+    }
+
+    // Without a real terminal we can't reposition the cursor, so leave the
+    // figure drawn with its eyes open and skip the animation.
+    if (!useAnsi)
+    {
+        return;
+    }
+
+    var up = figure.Length - eyeIndex; // lines to move back up to the eyes
+
+    Thread.Sleep(650);                 // eyes open
+    Console.Write($"\u001b[{up}A\r\u001b[2K{cCyan}{eyesClosed}{cReset}\u001b[{up}B\r");
+    Thread.Sleep(150);                 // eyes shut (the single blink)
+    Console.Write($"\u001b[{up}A\r\u001b[2K{cCyan}{eyesOpen}{cReset}\u001b[{up}B\r");
 }
 
 static List<string> SplitArgs(string commandLine)
