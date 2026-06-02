@@ -73,15 +73,20 @@ static int RunNode(string root, IReadOnlyList<string> args)
     return process.ExitCode;
 }
 
-static void RunClickMode(string root)
+static void PrintShellHeader()
 {
-    DrawAnimatedIntro();
     Console.WriteLine("Icon mode active. Type a command and press Enter (the 'twc' prefix is optional).");
     Console.WriteLine("Commands:    products list | jobs list | jobs show <jobId> | doctor");
     Console.WriteLine("Troubleshoot: troubleshoot teamviewer-remote --target ep-001 --issue \"Session drop\"");
     Console.WriteLine("Natural language: tensor cannot reach device vm-twc-demo");
-    Console.WriteLine("Type 'help' for assistance, 'exit' to close.");
+    Console.WriteLine("Type 'help' for assistance, 'cls'/'clear' to clear, 'exit' to close.");
     Console.WriteLine();
+}
+
+static void RunClickMode(string root)
+{
+    DrawAnimatedIntro();
+    PrintShellHeader();
 
     // Ctrl+C must NOT close the window. Intercept it: it cancels the current
     // input line (or the running child command) and returns to the prompt.
@@ -131,7 +136,9 @@ static void RunClickMode(string root)
         if (trimmed.Equals("cls", StringComparison.OrdinalIgnoreCase) ||
             trimmed.Equals("clear", StringComparison.OrdinalIgnoreCase))
         {
-            Console.Clear();
+            // Clear and redraw the full intro screen (logo, figure, header).
+            DrawAnimatedIntro();
+            PrintShellHeader();
             continue;
         }
 
