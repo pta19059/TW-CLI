@@ -847,6 +847,42 @@ function scoreText(queryTokens: string[], haystack: string, extraKeywords: strin
   return score;
 }
 
+/**
+ * Tidy a snippet for display: drop markdown header hashes, list bullets, table
+ * rows and stray backticks, then collapse the remaining prose onto one line so
+ * a multi-section chunk reads as a sentence instead of a soup of headings.
+ */
+function tidySnippet(text: string, width = 320): string {
+  const flat = text
+    .replace(/`/g, "")
+    // Drop the Jina front-matter block (Title:/URL Source:/Published Time:/…)
+    // that precedes the real content when a chunk starts at the page top.
+    .replace(/^[\s\S]*?Markdown Content:\s*/i, "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(
+      (l) =>
+        l.length > 0 &&
+        !/^\|.*\|$/.test(l) &&
+        !/^[-|: ]+$/.test(l) &&
+        !/^(Title|URL Source|Published Time|Last Modified):/i.test(l)
+    )
+    .join(" ")
+    // Inline markdown cleanup (markers can sit mid-line after windowing):
+    .replace(/^\S*:\/\/\S*\s*/, "") // leading URL fragment left by windowing
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ") // images
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") // links → label only
+    .replace(/\[\s*\]\(?[^)]*\)?/g, " ") // empty links (whole or windowed)
+    .replace(/https?:\/\/\S+/g, " ") // bare/leftover URLs
+    .replace(/(^|\s)#{1,6}(?=\s)/g, " ") // stray ## headers
+    .replace(/\*\*|__/g, " ") // bold markers → space (avoid gluing words)
+    .replace(/(^|\s)[*+]\s+/g, " ") // residual list bullets
+    .replace(/[*\s]*\[[^\]]*$/, "") // dangling link fragment at the end
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return flat.length > width ? `${flat.slice(0, width).trim()}…` : flat;
+}
+
 function bestSnippet(text: string, queryTokens: string[], width = 280): string {
   const lower = text.toLowerCase();
   let bestIdx = -1;
@@ -952,7 +988,7 @@ export async function answerFromKnowledge(
   if (!confident) {
     const src = bestSourceFor(query);
     const lead = hits.length > 0
-      ? `I only have partial information. Best available: ${hits[0].text}`
+      ? `I only have partial information. Best available: ${tidySnippet(hits[0].text)}`
       : "I don't have a verified answer to that.";
     return {
       answer:
@@ -964,13 +1000,24 @@ export async function answerFromKnowledge(
     };
   }
 
-  const factLines = hits.filter((h) => h.kind === "fact").slice(0, 3).map((h) => `• ${h.text}`);
-  const docLines = hits.filter((h) => h.kind === "doc").slice(0, 2).map((h) => `• ${h.title}: ${h.text}`);
-  const body = [...factLines, ...docLines].join("\n");
+  // Anchor the answer to the single best-matching page so we never stitch
+  // fragments of unrelated product pages into one reply. Supporting lines are
+  // taken ONLY from the same source as the top hit (a coherent passage), and a
+  // single strongly-overlapping verified fact may be appended for grounding.
+  const top = hits[0];
+  const sameSource = hits.filter((h) => h.source === top.source);
+  const lines = sameSource
+    .slice(0, 3)
+    .map((h) => (h.kind === "fact" ? `• ${tidySnippet(h.text)}` : `• ${h.title}: ${tidySnippet(h.text)}`));
+  if (top.kind === "doc") {
+    const fact = hits.find((h) => h.kind === "fact" && h.source !== top.source);
+    if (fact) lines.push(`• ${tidySnippet(fact.text)}`);
+  }
+  const orderedCitations = [top.source, ...citations.filter((c) => c !== top.source)].slice(0, 3);
   return {
-    answer: body || hits[0].text,
+    answer: lines.join("\n") || tidySnippet(top.text),
     confident: true,
-    citations,
+    citations: orderedCitations,
     hits
   };
 }
