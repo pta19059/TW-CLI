@@ -40,19 +40,13 @@ describe("knowledge layer", () => {
     expect(hits.some((h) => h.text.includes("webapi.teamviewer.com"))).toBe(true);
   });
 
-  it("answers confidently for a known question", async () => {
-    const result = await answerFromKnowledge("what ports does teamviewer use 5938");
-    expect(result.confident).toBe(true);
-    expect(result.answer).toContain("5938");
-    expect(result.citations.length).toBeGreaterThan(0);
-  });
-
-  it("is honest and cites an official source for an unknown question", async () => {
-    const result = await answerFromKnowledge("what is the airspeed velocity of an unladen swallow");
-    expect(result.confident).toBe(false);
-    expect(result.answer.toLowerCase()).toContain("official");
-    expect(result.citations.length).toBeGreaterThan(0);
-    expect(result.citations[0]).toMatch(/teamviewer\.com/);
+  it("requires Foundry Local hybrid retrieval (no offline fallback)", async () => {
+    // answerFromKnowledge now mandates Foundry Local embeddings: with no
+    // embedded index (or Foundry Local down) it must throw rather than silently
+    // degrading to keyword/verified-facts-only.
+    await expect(answerFromKnowledge("what ports does teamviewer use 5938")).rejects.toThrow(
+      /Foundry Local|index|embedding/i
+    );
   });
 
   it("rejects non-allowlisted hosts (SSRF guard)", async () => {

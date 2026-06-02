@@ -307,15 +307,17 @@ export function buildCli(): Command {
     .description("Answer a TeamViewer question from verified facts and the local doc index")
     .option("--live", "Refresh the most relevant official page (via Jina) before answering", false)
     .action(async (question: string, options: { live?: boolean }) => {
-      const result = await answerFromKnowledge(question, { live: Boolean(options.live) });
-      console.log(result.answer);
-      if (result.citations.length > 0) {
-        console.log("\nSources:");
-        for (const c of result.citations) console.log(`  - ${c}`);
-      }
-      console.log(`\nConfident: ${result.confident ? "yes" : "no"}`);
-      if (!localIndexInfo().built) {
-        console.log("\nTip: run 'twc docs reindex' to build the local documentation index.");
+      try {
+        const result = await answerFromKnowledge(question, { live: Boolean(options.live) });
+        console.log(result.answer);
+        if (result.citations.length > 0) {
+          console.log("\nSources:");
+          for (const c of result.citations) console.log(`  - ${c}`);
+        }
+        console.log(`\nConfident: ${result.confident ? "yes" : "no"}`);
+      } catch (err) {
+        console.error(`\n${err instanceof Error ? err.message : String(err)}`);
+        process.exitCode = 1;
       }
     });
 
@@ -346,21 +348,24 @@ export function buildCli(): Command {
 
   docs
     .command("reindex")
-    .description("Rebuild the local documentation index from official sources (via Jina), with embeddings when Foundry Local is available")
+    .description("Rebuild the local documentation index from official sources (via Jina); embeddings via Foundry Local are required")
     .action(async () => {
       console.log("Rebuilding local documentation index (fetching via Jina Reader)...");
-      const results = await reindexOfficialDocs();
-      for (const r of results) {
-        console.log(`  ${r.ok ? "OK " : "ERR"} ${r.id.padEnd(24)} ${r.detail}`);
-      }
-      const info = localIndexInfo();
-      const failed = results.filter((r) => !r.ok).length;
-      console.log(
-        `\nIndex: ${info.chunks} chunks, ${info.embeddings} embedded` +
-          (info.model ? ` (model: ${info.model})` : " (keyword-only — Foundry Local embedding model not found)")
-      );
-      if (failed > 0) {
-        console.log(`${failed} source(s) failed. Verified facts remain available offline.`);
+      try {
+        const results = await reindexOfficialDocs();
+        for (const r of results) {
+          console.log(`  ${r.ok ? "OK " : "ERR"} ${r.id.padEnd(24)} ${r.detail}`);
+        }
+        const info = localIndexInfo();
+        const failed = results.filter((r) => !r.ok).length;
+        console.log(`\nIndex: ${info.chunks} chunks, ${info.embeddings} embedded (model: ${info.model})`);
+        console.log("Retrieval: hybrid (keyword + Foundry Local embeddings).");
+        if (failed > 0) {
+          console.log(`${failed} source(s) failed to fetch.`);
+        }
+      } catch (err) {
+        console.error(`\n${err instanceof Error ? err.message : String(err)}`);
+        process.exitCode = 1;
       }
     });
 
@@ -376,7 +381,7 @@ export function buildCli(): Command {
       console.log(`Built:      ${info.builtAt}`);
       console.log(`Chunks:     ${info.chunks}`);
       console.log(`Embedded:   ${info.embeddings}${info.model ? ` (model: ${info.model})` : ""}`);
-      console.log(`Retrieval:  ${info.embeddings > 0 ? "hybrid (keyword + semantic)" : "keyword-only"}`);
+      console.log("Retrieval:  hybrid (keyword + Foundry Local embeddings)");
     });
 
   program

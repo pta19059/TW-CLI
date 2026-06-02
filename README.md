@@ -282,18 +282,22 @@ Two layers (`src/knowledge/teamviewerDocs.ts`):
    `https://webapi.teamviewer.com/api/v1` and its documented endpoints; the fact that
    TeamViewer publishes no fixed server IP/hostname list; DEX = 1E Client; per-product delivery
    models). These ground every specialist prompt and are always available with no network.
-2. **Local documentation index (hybrid RAG)** — `twc docs reindex` builds a local index from
-   the official doc pages and then answers run **fully offline against that index** — there is
-   **no web search at query time**. Because teamviewer.com rejects direct fetches behind its WAF
-   (TLS handshake failure), the index is populated through **[Jina Reader](https://jina.ai/reader/)**
-   (`https://r.jina.ai/...`), which fetches the pages server-side and returns clean Markdown.
-   Jina is **free and needs no API key** (set `JINA_API_KEY` only to raise rate limits). The
-   Markdown is split into chunks and stored under `~/.twc/knowledge/rag-index.json`.
-   Retrieval is **hybrid**:
-   - **Keyword** overlap scoring — always available, deterministic, the backbone of confidence.
-   - **Semantic** cosine similarity — best-effort embeddings via **Foundry Local**
-     (`/embeddings`). If no embedding model is loaded, retrieval degrades cleanly to keyword-only
-     (no error). Override the model with `TWC_EMBED_MODEL`.
+2. **Local documentation index (hybrid RAG, Foundry Local required)** — `twc docs reindex`
+   builds a local index from the official doc pages and then answers run **fully offline against
+   that index** — there is **no web search at query time**. Because teamviewer.com rejects direct
+   fetches behind its WAF (TLS handshake failure), the index is populated through
+   **[Jina Reader](https://jina.ai/reader/)** (`https://r.jina.ai/...`), which fetches the pages
+   server-side and returns clean Markdown. Jina is **free and needs no API key** (set
+   `JINA_API_KEY` only to raise rate limits). The Markdown is split into chunks and stored under
+   `~/.twc/knowledge/rag-index.json`.
+   Retrieval is **always hybrid** — there is **no keyword-only fallback**:
+   - **Keyword** overlap scoring — deterministic, the backbone of confidence.
+   - **Semantic** cosine similarity — embeddings via **Foundry Local** (`/embeddings`).
+   Foundry Local is **mandatory**: both `docs reindex` and `docs ask` embed text through it. If
+   Foundry Local is not running or **no embedding model is loaded**, the commands fail with an
+   actionable error instead of degrading. Load an embedding model (e.g.
+   `foundry model run text-embedding-3-small`) or point `TWC_EMBED_MODEL` at a loaded embedding
+   model before indexing/querying.
 3. **`--live` refresh** — `twc docs ask "..." --live` re-fetches the single most relevant
    official page via Jina before answering, so the freshest content is searchable. No key
    required. "Always up to date" simply means: re-run `twc docs reindex` whenever you want.

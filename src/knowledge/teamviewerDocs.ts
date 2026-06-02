@@ -440,49 +440,68 @@ export function cosineSimilarity(a: number[], b: number[]): number {
 }
 
 /**
- * Embed texts with Foundry Local (OpenAI-compatible /embeddings). Best-effort:
- * if no loopback endpoint, no embedding-capable model, or any error, returns
- * nulls so the caller degrades cleanly to keyword-only retrieval. The model is
- * taken from TWC_EMBED_MODEL, else any loaded model whose id contains "embed".
+ * Embed texts with Foundry Local (OpenAI-compatible /embeddings). Foundry Local
+ * is MANDATORY — there is no keyword-only fallback. If no loopback endpoint is
+ * configured, no embedding-capable model is loaded, or any request fails, this
+ * throws an actionable error. The model is taken from TWC_EMBED_MODEL, else the
+ * first loaded model whose id contains "embed".
  */
-async function embedTexts(texts: string[]): Promise<{ vectors: (number[] | null)[]; model?: string }> {
-  const nulls = () => ({ vectors: texts.map(() => null) as (number[] | null)[] });
-  if (texts.length === 0) return { vectors: [] };
+async function embedTexts(texts: string[]): Promise<{ vectors: number[][]; model: string }> {
+  if (texts.length === 0) throw new Error("embedTexts called with no input.");
   const endpoint = discoverFoundryEndpoint();
-  if (!endpoint || !isLoopbackEndpoint(endpoint)) return nulls();
+  if (!endpoint) {
+    throw new Error(
+      "Foundry Local is required for hybrid retrieval but no endpoint is configured. Start it with 'foundry service start' or set FOUNDRY_LOCAL_ENDPOINT. There is no fallback."
+    );
+  }
+  if (!isLoopbackEndpoint(endpoint)) {
+    throw new Error(
+      `Foundry Local endpoint '${endpoint}' is not a loopback address. Only localhost/127.0.0.1/::1 are allowed.`
+    );
+  }
   const base = endpoint.replace(/\/+$/, "");
 
   let model = process.env.TWC_EMBED_MODEL;
   if (!model) {
+    let data: { data?: Array<{ id?: string }> } | null = null;
     try {
       const res = await fetch(`${base}/models`);
-      const data = (await res.json().catch(() => null)) as { data?: Array<{ id?: string }> } | null;
-      model = data?.data?.find((m) => /embed/i.test(m.id ?? ""))?.id;
-    } catch {
-      return nulls();
+      data = (await res.json().catch(() => null)) as { data?: Array<{ id?: string }> } | null;
+    } catch (err) {
+      throw new Error(
+        `Foundry Local is not reachable at ${base} (${err instanceof Error ? err.message : "unknown error"}). Start it with 'foundry service start'. There is no fallback.`
+      );
     }
+    model = data?.data?.find((m) => /embed/i.test(m.id ?? ""))?.id;
   }
-  if (!model) return nulls(); // No embedding model available — keyword-only.
+  if (!model) {
+    throw new Error(
+      "No embedding model is loaded in Foundry Local. Load one (e.g. 'foundry model run text-embedding-3-small') or set TWC_EMBED_MODEL to a loaded embedding model. Hybrid retrieval requires embeddings — there is no fallback."
+    );
+  }
 
-  const vectors: (number[] | null)[] = [];
+  const vectors: number[][] = [];
   const BATCH = 32;
   for (let i = 0; i < texts.length; i += BATCH) {
     const batch = texts.slice(i, i + BATCH);
-    try {
-      const res = await fetch(`${base}/embeddings`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, input: batch })
-      });
-      if (!res.ok) {
-        for (const _ of batch) vectors.push(null);
-        continue;
+    const res = await fetch(`${base}/embeddings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, input: batch })
+    });
+    if (!res.ok) {
+      throw new Error(
+        `Foundry Local /embeddings returned HTTP ${res.status} for model '${model}'. Verify the model supports embeddings. There is no fallback.`
+      );
+    }
+    const data = (await res.json()) as { data?: Array<{ embedding?: number[] }> };
+    const rows = data.data ?? [];
+    for (let j = 0; j < batch.length; j++) {
+      const v = rows[j]?.embedding;
+      if (!v || v.length === 0) {
+        throw new Error(`Foundry Local returned an empty embedding for model '${model}'. There is no fallback.`);
       }
-      const data = (await res.json()) as { data?: Array<{ embedding?: number[] }> };
-      const rows = data.data ?? [];
-      for (let j = 0; j < batch.length; j++) vectors.push(rows[j]?.embedding ?? null);
-    } catch {
-      for (const _ of batch) vectors.push(null);
+      vectors.push(v);
     }
   }
   return { vectors, model };
@@ -518,7 +537,9 @@ export function localIndexInfo(): {
 
 /**
  * Rebuild the local RAG index from the official sources via Jina, then embed
- * the chunks with Foundry Local (best-effort). Returns a per-source result.
+ * every chunk with Foundry Local. Embeddings are MANDATORY: if Foundry Local is
+ * unavailable or has no embedding model, this throws (no keyword-only index is
+ * written). Returns a per-source result.
  */
 export async function reindexOfficialDocs(): Promise<
   { id: string; ok: boolean; detail: string; chunks: number }[]
@@ -538,9 +559,15 @@ export async function reindexOfficialDocs(): Promise<
     results.push({ id: doc.id, ok: true, detail: `${pieces.length} chunks`, chunks: pieces.length });
   }
 
+  if (allChunks.length === 0) {
+    throw new Error("No documentation could be fetched, so the index cannot be built.");
+  }
+
+  // Mandatory embeddings — throws if Foundry Local is unavailable. We do not
+  // write a keyword-only index: hybrid retrieval requires embeddings.
   const { vectors, model } = await embedTexts(allChunks.map((c) => c.text));
   vectors.forEach((v, i) => {
-    if (v && v.length > 0) allChunks[i].embedding = v;
+    allChunks[i].embedding = v;
   });
 
   const index: LocalIndex = {
@@ -549,37 +576,40 @@ export async function reindexOfficialDocs(): Promise<
     embeddingModel: model,
     chunks: allChunks
   };
-  try {
-    mkdirSync(KNOWLEDGE_DIR, { recursive: true });
-    writeFileSync(INDEX_FILE, JSON.stringify(index), "utf8");
-  } catch {
-    /* index write is best-effort */
-  }
+  mkdirSync(KNOWLEDGE_DIR, { recursive: true });
+  writeFileSync(INDEX_FILE, JSON.stringify(index), "utf8");
   return results;
 }
 
 /**
- * Retrieve from the local RAG index with hybrid scoring: keyword overlap
- * (always) plus semantic cosine similarity (when embeddings are present and a
- * query embedding can be produced). Pure-local: no web search.
+ * Retrieve from the local RAG index with mandatory hybrid scoring: keyword
+ * overlap plus semantic cosine similarity. Foundry Local embeddings are
+ * required — both the chunks (built by `docs reindex`) and the query are
+ * embedded. If the index lacks embeddings or Foundry Local is unavailable, this
+ * throws (no keyword-only fallback). Pure-local: no web search.
  */
 export async function retrieveLocal(query: string, limit = 5): Promise<KnowledgeHit[]> {
   const idx = loadLocalIndex();
-  if (!idx || idx.chunks.length === 0) return [];
+  if (!idx || idx.chunks.length === 0) {
+    throw new Error("No local documentation index found. Run 'twc docs reindex' first.");
+  }
+  if (!idx.chunks.every((c) => c.embedding && c.embedding.length > 0)) {
+    throw new Error(
+      "The local index has no embeddings. Rebuild it with 'twc docs reindex' while Foundry Local is running. Hybrid retrieval requires embeddings — there is no fallback."
+    );
+  }
   const tokens = tokenize(query);
   if (tokens.length === 0) return [];
 
-  let queryVec: number[] | null = null;
-  if (idx.chunks.some((c) => c.embedding && c.embedding.length > 0)) {
-    queryVec = (await embedTexts([query]).catch(() => ({ vectors: [null] }))).vectors[0];
-  }
+  // Mandatory query embedding — throws if Foundry Local is unavailable.
+  const queryVec = (await embedTexts([query])).vectors[0];
 
   const scored = idx.chunks
     .map((c) => {
       const kw = scoreText(tokens, `${c.title} ${c.text}`);
-      const sem = queryVec && c.embedding ? cosineSimilarity(queryVec, c.embedding) : 0;
-      // Keyword stays the backbone (clears the confidence bar); semantic boosts
-      // and reranks. A strong semantic-only match can still surface.
+      const sem = cosineSimilarity(queryVec, c.embedding!);
+      // Hybrid: keyword overlap is the deterministic backbone; semantic cosine
+      // boosts and reranks. A strong semantic match can surface on its own.
       return { c, score: kw + sem * 3 };
     })
     .filter((s) => s.score > 0)
@@ -693,7 +723,7 @@ export async function answerFromKnowledge(
     await fetchOfficialDoc(bestSourceFor(query).url, true).catch(() => undefined);
   }
 
-  const localHits = await retrieveLocal(query, 5).catch(() => [] as KnowledgeHit[]);
+  const localHits = await retrieveLocal(query, 5);
   const hits = [...localHits, ...searchKnowledge(query, 5)]
     .sort((a, b) => b.score - a.score)
     .slice(0, 5);
