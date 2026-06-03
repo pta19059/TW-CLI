@@ -357,7 +357,7 @@ export function buildCli(): Command {
         for (const r of results) {
           console.log(`  ${r.ok ? "OK " : "ERR"} ${r.id.padEnd(24)} ${r.detail}`);
         }
-        const info = localIndexInfo();
+        const info = await localIndexInfo();
         const failed = results.filter((r) => !r.ok).length;
         console.log(`\nIndex: ${info.chunks} chunks, ${info.embeddings} embedded (model: ${info.model})`);
         console.log("Retrieval: hybrid (keyword + local ONNX embeddings).");
@@ -373,8 +373,8 @@ export function buildCli(): Command {
   docs
     .command("index")
     .description("Show the status of the local documentation index")
-    .action(() => {
-      const info = localIndexInfo();
+    .action(async () => {
+      const info = await localIndexInfo();
       if (!info.built) {
         console.log("No local index yet. Run 'twc docs reindex' to build it.");
         return;

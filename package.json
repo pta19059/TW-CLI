@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^3.8.1",
+    "@lancedb/lancedb": "^0.30.0",
     "@mastra/core": "^1.37.1",
     "@mastra/loggers": "^1.1.1",
     "@mastra/memory": "^1.20.0",

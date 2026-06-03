@@ -19,6 +19,7 @@ import path from "node:path";
 import { KNOWLEDGE_DIR } from "../paths.js";
 import { ProductKey } from "../types.js";
 import { embedLocal, embedModelId } from "./localEmbedder.js";
+import * as lanceStore from "./lanceStore.js";
 
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 // Jina AI Reader fetches pages server-side and returns clean Markdown, which
@@ -27,8 +28,6 @@ const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 // API key required (an optional JINA_API_KEY raises rate limits).
 const JINA_READER_BASE = "https://r.jina.ai/";
 const JINA_TIMEOUT_MS = 25_000;
-// Local hybrid RAG index built from the official docs (see reindexOfficialDocs).
-const INDEX_FILE = path.join(KNOWLEDGE_DIR, "rag-index.json");
 
 /** Only these hosts may be fetched by the knowledge layer. */
 const DOC_HOST_ALLOWLIST = [
@@ -562,7 +561,7 @@ export async function retrieveJustInTime(query: string, limit = 5): Promise<Know
   }));
 
   // Fold the fetched chunks into the local index for next time (best-effort).
-  enrichLocalIndex(freshChunks, model);
+  void enrichLocalIndex(freshChunks, model);
 
   // Same hybrid RRF fusion + dedup as the core index, so live results are
   // ranked on equal footing.
@@ -578,18 +577,12 @@ export async function retrieveJustInTime(query: string, limit = 5): Promise<Know
   return dedupeHits(hits).slice(0, limit);
 }
 
-/** Append freshly embedded chunks to the on-disk index (deduped by id). */
-function enrichLocalIndex(chunks: IndexChunk[], model: string): void {
+/** Append freshly embedded chunks to the local index (deduped by id). */
+async function enrichLocalIndex(chunks: IndexChunk[], model: string): Promise<void> {
   try {
-    const idx = loadLocalIndex();
-    if (!idx) return; // no core index yet; nothing to enrich
-    const have = new Set(idx.chunks.map((c) => c.id));
-    const additions = chunks.filter((c) => c.embedding && c.embedding.length > 0 && !have.has(c.id));
+    const additions = chunks.filter((c) => c.embedding && c.embedding.length > 0);
     if (additions.length === 0) return;
-    idx.chunks.push(...additions);
-    idx.builtAt = new Date().toISOString();
-    if (!idx.embeddingModel) idx.embeddingModel = model;
-    writeFileSync(INDEX_FILE, JSON.stringify(idx), "utf8");
+    await lanceStore.addChunks(additions, model);
   } catch {
     /* enrichment is best-effort */
   }
@@ -714,31 +707,36 @@ async function embedTexts(texts: string[]): Promise<{ vectors: number[][]; model
   }
 }
 
-function loadLocalIndex(): LocalIndex | null {
-  try {
-    if (!existsSync(INDEX_FILE)) return null;
-    return JSON.parse(readFileSync(INDEX_FILE, "utf8")) as LocalIndex;
-  } catch {
-    return null;
-  }
+function loadLocalIndex(): Promise<LocalIndex | null> {
+  return lanceStore.loadAllChunks().then((res) => {
+    if (!res) return null;
+    return {
+      version: 1,
+      builtAt: res.meta.builtAt,
+      embeddingModel: res.meta.embeddingModel,
+      chunks: res.chunks
+    } satisfies LocalIndex;
+  });
 }
 
 /** Summary of the on-disk index for `docs index`. */
-export function localIndexInfo(): {
+export async function localIndexInfo(): Promise<{
   built: boolean;
   builtAt?: string;
   chunks: number;
   embeddings: number;
   model?: string;
-} {
-  const idx = loadLocalIndex();
-  if (!idx) return { built: false, chunks: 0, embeddings: 0 };
+}> {
+  const stats = await lanceStore.indexStats();
+  if (!stats.built) return { built: false, chunks: 0, embeddings: 0 };
+  // Every stored chunk carries an embedding (the table only accepts embedded
+  // rows), so embeddings === chunks.
   return {
     built: true,
-    builtAt: idx.builtAt,
-    chunks: idx.chunks.length,
-    embeddings: idx.chunks.filter((c) => c.embedding && c.embedding.length > 0).length,
-    model: idx.embeddingModel
+    builtAt: stats.builtAt,
+    chunks: stats.chunks,
+    embeddings: stats.chunks,
+    model: stats.model
   };
 }
 
@@ -777,14 +775,8 @@ export async function reindexOfficialDocs(): Promise<
     allChunks[i].embedding = v;
   });
 
-  const index: LocalIndex = {
-    version: 1,
-    builtAt: new Date().toISOString(),
-    embeddingModel: model,
-    chunks: allChunks
-  };
   mkdirSync(KNOWLEDGE_DIR, { recursive: true });
-  writeFileSync(INDEX_FILE, JSON.stringify(index), "utf8");
+  await lanceStore.replaceAllChunks(allChunks, model);
   return results;
 }
 
@@ -796,7 +788,7 @@ export async function reindexOfficialDocs(): Promise<
  * throws (no keyword-only fallback). Pure-local: no web search.
  */
 export async function retrieveLocal(query: string, limit = 5): Promise<KnowledgeHit[]> {
-  const idx = loadLocalIndex();
+  const idx = await loadLocalIndex();
   if (!idx || idx.chunks.length === 0) {
     throw new Error("No local documentation index found. Run 'twc docs reindex' first.");
   }
@@ -1126,7 +1118,7 @@ export async function answerFromKnowledge(
     return {
       answer:
         `${lead}\nFor an authoritative answer, consult the official TeamViewer documentation: ${src.title} — ${src.url}` +
-        (localIndexInfo().built ? "" : " (run 'twc docs reindex' to build the local index)."),
+        (((await localIndexInfo()).built) ? "" : " (run 'twc docs reindex' to build the local index)."),
       confident: false,
       // Cite only sources we actually drew on; never invent a citation.
       citations: hits.length > 0 ? Array.from(new Set(hits.map((h) => h.source))).slice(0, 3) : [src.url],
