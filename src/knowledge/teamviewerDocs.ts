@@ -160,6 +160,10 @@ const CRAWL_CONCURRENCY = 4; // parallel Jina fetches per level (polite)
 const ANN_SCAN_THRESHOLD = 1500;
 /** Candidate pool pulled by native ANN before the hybrid re-rank, at scale. */
 const ANN_CANDIDATES = 400;
+/** Max characters shown per answer line. Generous so a full intro passage is
+ * displayed instead of a cut-off fragment; truncation (when it must happen) is
+ * sentence-aware so the text never ends mid-word. Override via TWC_SNIPPET_WIDTH. */
+const SNIPPET_WIDTH = Math.max(120, Number(process.env.TWC_SNIPPET_WIDTH) || 1200);
 
 /** Drop obvious navigation/chrome links that are not documentation pages. */
 const NAV_LINK_RE = /sign\s?in|skip to|cookie|privacy|imprint|legal|contact|careers/i;
@@ -1255,7 +1259,7 @@ function fuseHybrid(
  * rows and stray backticks, then collapse the remaining prose onto one line so
  * a multi-section chunk reads as a sentence instead of a soup of headings.
  */
-function tidySnippet(text: string, width = 320, opts: { keepUrls?: boolean } = {}): string {
+function tidySnippet(text: string, width = SNIPPET_WIDTH, opts: { keepUrls?: boolean } = {}): string {
   let flat = text
     .replace(/`/g, "")
     // Drop the Jina front-matter block (Title:/URL Source:/Published Time:/…)
@@ -1287,10 +1291,18 @@ function tidySnippet(text: string, width = 320, opts: { keepUrls?: boolean } = {
     .replace(/[*_#>\s]+$/g, "") // trailing stray markdown / bullets
     .replace(/\s{2,}/g, " ")
     .trim();
-  return flat.length > width ? `${flat.slice(0, width).trim()}…` : flat;
+  if (flat.length <= width) return flat;
+  // Prefer ending on a sentence boundary within budget so the line reads as a
+  // complete thought rather than a word chopped in half with an ellipsis.
+  const slice = flat.slice(0, width);
+  const lastEnd = Math.max(slice.lastIndexOf(". "), slice.lastIndexOf("! "), slice.lastIndexOf("? "));
+  if (lastEnd > width * 0.6) return slice.slice(0, lastEnd + 1).trim();
+  // Otherwise cut at the last whole word, not mid-token.
+  const lastSpace = slice.lastIndexOf(" ");
+  return `${(lastSpace > width * 0.6 ? slice.slice(0, lastSpace) : slice).trim()}…`;
 }
 
-function bestSnippet(text: string, queryTokens: string[], width = 300): string {
+function bestSnippet(text: string, queryTokens: string[], width = SNIPPET_WIDTH): string {
   const lower = text.toLowerCase();
   let bestIdx = -1;
   for (const t of queryTokens) {
@@ -1449,7 +1461,7 @@ export async function answerFromKnowledge(
   const isRedundant = (cand: string): boolean =>
     seenLines.some((s) => s.includes(cand) || cand.includes(s));
   for (const h of sameSource) {
-    const snip = tidySnippet(h.text, 320, { keepUrls: h.kind === "fact" });
+    const snip = tidySnippet(h.text, SNIPPET_WIDTH, { keepUrls: h.kind === "fact" });
     const norm = normalizeForDedup(snip);
     if (snip.length < 15 || isRedundant(norm)) continue;
     seenLines.push(norm);
@@ -1461,7 +1473,7 @@ export async function answerFromKnowledge(
       (h) => h.kind === "fact" && h.source !== top.source && queryCoverage(tokens, h.text) >= 0.5
     );
     if (fact) {
-      const snip = tidySnippet(fact.text, 320, { keepUrls: true });
+      const snip = tidySnippet(fact.text, SNIPPET_WIDTH, { keepUrls: true });
       if (snip && !isRedundant(normalizeForDedup(snip))) lines.push(`• ${snip}`);
     }
   }
