@@ -32,7 +32,8 @@ The `twc` prefix is optional inside the interactive shell. Run `twc --help` or `
 | `twc jobs cancel <jobId>` | Kill a running or queued job |
 | `twc explain <jobId>` | Turn a job report into a plain-language narrative |
 | `twc docs ask "<question>"` | Answer a TeamViewer question from official docs |
-| `twc docs reindex` | Rebuild the local hybrid RAG index from official sources (via Jina) + local ONNX embeddings |
+| `twc docs reindex` | Crawl the **entire** TeamViewer KB (via Jina) and rebuild the local hybrid RAG index + local ONNX embeddings |
+| `twc docs refresh` | Incrementally add only KB pages not already indexed |
 | `twc docs index` | Show local index status (chunks, embeddings, model) |
 | `twc docs map [--rebuild]` | Build/show the lightweight KB URL map used for just-in-time live lookups |
 | `twc docs sources` | List the official documentation sources |
@@ -286,13 +287,15 @@ Two layers (`src/knowledge/teamviewerDocs.ts`):
    TeamViewer publishes no fixed server IP/hostname list; DEX = 1E Client; per-product delivery
    models). These ground every specialist prompt and are always available with no network.
 2. **Local documentation index (hybrid RAG, local ONNX embeddings)** — `twc docs reindex`
-   builds a local index from the official doc pages and then answers run **fully offline against
-   that index** — there is **no web search at query time**. Because teamviewer.com rejects direct
+   crawls the **entire** official TeamViewer Knowledge Base in one pass and builds a local
+   index; answers then run **fully offline against that index** — there is **no web search at
+   query time**. Because teamviewer.com rejects direct
    fetches behind its WAF (TLS handshake failure), the index is populated through
    **[Jina Reader](https://jina.ai/reader/)** (`https://r.jina.ai/...`), which fetches the pages
    server-side and returns clean Markdown. Jina is **free and needs no API key** (set
-   `JINA_API_KEY` only to raise rate limits). The Markdown is split into chunks and stored under
-   `~/.twc/knowledge/rag-index.json`.
+   `JINA_API_KEY` only to raise rate limits). The Markdown is split into chunks and stored in an
+   embedded **[LanceDB](https://lancedb.com/)** table under
+   `~/.twc/knowledge/lancedb/` (with a small `lance-meta.json` sidecar).
    Retrieval is **always hybrid** — there is **no keyword-only fallback**:
    - **Keyword** overlap scoring — deterministic, the backbone of confidence.
    - **Semantic** cosine similarity — embeddings computed **in-process by a local ONNX model**
@@ -303,8 +306,9 @@ Two layers (`src/knowledge/teamviewerDocs.ts`):
    Face hub on first `docs reindex`, then reused offline; override it with `TWC_EMBED_MODEL`.
    Foundry Local cannot serve embeddings (its catalog ships only chat-completion models), so the
    embedder is independent — it remains the hard gate only for the **chat agents**.
-3. **Staying current** — the index is a snapshot; re-run `twc docs reindex` whenever you want
-   to refresh the local knowledge from the official sources (fetched via Jina).
+3. **Staying current** — the index is a snapshot; re-run `twc docs reindex` to rebuild the whole
+   KB, or `twc docs refresh` for an incremental top-up of only the pages not already indexed
+   (both fetched via Jina).
 4. **Just-in-time KB retrieval (live fallback)** — the curated index covers a small, high-value
    core; the wider TeamViewer Knowledge Base is far larger. When the core **cannot answer a
    question confidently** (no real keyword anchor among the top hits), a just-in-time pass kicks
@@ -321,14 +325,25 @@ Every specialist agent and the gateway agent get a `tw-official-docs` tool. When
 unsure it calls the tool; if the answer isn't grounded the tool returns `confident: false` and
 the agent points the user to the cited official URL rather than guessing.
 
+**`docs ask` is LLM-grounded by default (Foundry Local required, no fallback)**
+([src/knowledge/llmCompose.ts](src/knowledge/llmCompose.ts)): the hybrid LanceDB retriever
+selects the most relevant chunks, a local Foundry Local model rephrases **only** that retrieved
+context, and every generated sentence is then **verified by embedding similarity** against the
+same context — unsupported sentences are dropped. If nothing is grounded the command declines
+honestly (`Confident: no`) instead of guessing, and the cited `Sources:` always come from the
+real retrieved pages. The agents' `tw-official-docs` tool stays extractive
+([src/mastra/tools/knowledgeTool.ts](src/mastra/tools/knowledgeTool.ts)) to avoid agent→tool→agent
+recursion.
+
 ```powershell
-twc docs reindex                                       # build the local index (fetch via Jina)
-twc docs index                                         # show index status (chunks / embeddings)
-twc docs map                                            # show the KB URL map (just-in-time lookups)
-twc docs ask "which ports does teamviewer use"      # answer from verified facts + local index
-twc docs ask "how does Tensor SSO work"               # answer from verified facts + local index
-twc docs sources                                       # list the official doc URLs
-twc docs sync                                          # pre-fetch & cache raw doc text (offline)
+twc docs reindex                                       # crawl the whole KB + build the local index (via Jina)
+twc docs refresh                                        # incremental top-up of new KB pages only
+twc docs index                                          # show index status (chunks / embeddings)
+twc docs map                                             # show the KB URL map (just-in-time lookups)
+twc docs ask "which ports does teamviewer use"      # LLM answer grounded on the local index
+twc docs ask "how does Tensor SSO work"               # LLM answer grounded on the local index
+twc docs sources                                        # list the official doc URLs
+twc docs sync                                           # pre-fetch & cache raw doc text (offline)
 ```
 
 ## Azure Demo (laptop ↔ remote VM)
@@ -638,13 +653,13 @@ Inside the REPL:
 ```
 twc › /models           # list catalog
 twc › /model            # show active
-twc › /model deepseek-r1-7b
+twc › /model qwen2.5-1.5b-cpu
 ```
 
 One-shot override (does not persist if you also call `models unset` after):
 
 ```bash
-twc -p "Session drops" --product teamviewer-remote --model deepseek-r1-7b
+twc -p "Session drops" --product teamviewer-remote --model qwen2.5-1.5b-cpu
 ```
 
 Priority: persisted choice (`models use` / `/model`) > `FOUNDRY_LOCAL_MODEL` env var. To install a model on the host: `foundry model run <id>`.
@@ -702,31 +717,48 @@ References used:
 ```text
 src/
   agents/
+    explain.ts             # plain-language narrative of a finished report
     formatReport.ts        # text + Markdown report renderers
+    intent.ts              # deterministic product/target detection from free text
     mastraAdapter.ts       # entry point used by the worker (local-only)
     profiles.ts            # logical agent role catalogue
     routing.ts             # issue bucket inference + agent selection
   catalog/
+    productProfiles.ts     # per-product diagnostic profiles (delivery model, probe targets)
     teamviewerProducts.ts  # whitelist
   jobs/
     dispatch.ts            # detached worker spawn + per-job log redirect
     jobStore.ts            # atomic JSON store + retention + log paths
+    killTree.ts            # Windows process-tree kill on cancel
+    redact.ts              # email / IP / JWT / token / secret redaction
   knowledge/
-    teamviewerDocs.ts      # local hybrid RAG: Jina ingestion, chunking, retrieval
+    teamviewerDocs.ts      # local hybrid RAG: Jina ingestion, KB crawl, chunking, retrieval
+    lanceStore.ts          # LanceDB storage layer (table + sidecar meta, legacy import)
+    llmCompose.ts          # LLM-grounded `docs ask` answer + per-sentence verification
     localEmbedder.ts       # in-process ONNX embeddings (Transformers.js)
   mastra/
     agents/
       index.ts             # Mastra Agent definitions + lazy model resolver
     tools/
+      knowledgeTool.ts     # tw-official-docs tool (extractive, for the agents)
       specialistTools.ts   # createTool + deterministic baseline functions
     util/
       llmJson.ts           # tolerant JSON extractor + generateStructured()
-      sanitize.ts           # prompt input sanitization
+      sanitize.ts          # prompt input sanitization
     workflows/
       teamviewerTroubleshootWorkflow.ts  # classify → parallel specialists → aggregate
     foundryLocal.ts        # endpoint discovery + /models probe + loopback guard
     index.ts               # Mastra instance (agents + workflow + logger)
+    modelCatalog.ts        # curated Foundry Local model catalog + id/alias resolver
     runtime.ts             # createRun + run.start wrapper
+  probes/
+    authPolicy.ts          # TeamViewer Web API probe (ping/account/devices)
+    connectivity.ts        # DNS / TCP 5938 / HTTPS reachability probe
+    endpointHealth.ts      # services / processes / install detection (Win/Linux/macOS)
+    logs.ts                # TeamViewer log tail + error-signature clustering
+  runtime/
+    bootstrap.ts           # .env autoload + undici inference-timeout relaxation
+    stderrFilter.ts        # re-exec wrapper that filters native onnxruntime stderr noise
   cli.ts                   # commander definitions (subcommand mode)
   index.ts                 # bin entry (REPL / one-shot / commander dispatch / worker)
   oneShot.ts               # synchronous workflow runner with spinner
@@ -734,6 +766,8 @@ src/
   repl.ts                  # interactive REPL + slash commands
   types.ts                 # shared types (AgentJob, WorkflowReport, …)
   ui.ts                    # ANSI colors + spinner + banner helpers
+  userConfig.ts            # persisted active-model choice (`twc models use`)
+  version.ts               # runtime version read from package.json
   worker.ts                # standalone worker entry (dev mode)
   workerCore.ts            # shared worker job execution
 tests/
@@ -757,7 +791,9 @@ dist-cjs/                  # optional CJS output (legacy)
 ~/.twc/                  # per-user data dir (production default; legacy ./.twc-data)
   jobs.json                # job store (last 200 jobs)
   logs/<jobId>.log         # per-job stdout/stderr
-  knowledge/rag-index.json # local hybrid RAG index (chunks + embeddings)
+  knowledge/lancedb/       # local hybrid RAG index (LanceDB table: chunks + embeddings)
+  knowledge/lance-meta.json # sidecar: builtAt + embedding model
+  knowledge/url-map.json   # lightweight KB URL map for just-in-time lookups
 vitest.config.ts
 tsconfig.json
 package.json
