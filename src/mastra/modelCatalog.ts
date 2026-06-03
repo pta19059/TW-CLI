@@ -74,6 +74,22 @@ export const MODEL_CATALOG: ReadonlyArray<ModelEntry> = [
     family: "Microsoft Phi",
     accelerator: "npu",
     description: "Phi-3 Mini 128K, NPU build — long-context variant for large log bundles."
+  },
+  // --- CPU builds (reliable fallback when the Snapdragon QNN/NPU provider
+  //     is unavailable or wedges; CPU inference is steady and predictable). ---
+  {
+    id: "qwen2.5-0.5b-instruct-generic-cpu:4",
+    alias: "qwen2.5-0.5b-cpu",
+    family: "Alibaba Qwen",
+    accelerator: "cpu",
+    description: "Qwen2.5 0.5B Instruct, CPU build — tiny + very fast (~2s/answer), reliable when the NPU stalls. Good default for docs Q&A."
+  },
+  {
+    id: "qwen2.5-1.5b-instruct-generic-cpu:4",
+    alias: "qwen2.5-1.5b-cpu",
+    family: "Alibaba Qwen",
+    accelerator: "cpu",
+    description: "Qwen2.5 1.5B Instruct, CPU build — small + fast on CPU, higher quality than 0.5B, still NPU-independent."
   }
 ];
 

@@ -6,8 +6,34 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
+import { Agent, setGlobalDispatcher } from "undici";
 
 let bootstrapped = false;
+
+/**
+ * Disable undici's headers/body timeouts for the whole process.
+ *
+ * Node's global `fetch` (used by the Mastra / AI-SDK OpenAI-compatible client)
+ * is backed by undici, whose default `headersTimeout` is ~300s. Foundry Local
+ * does NOT send HTTP response headers until it has produced the first token —
+ * even in streaming mode — so a slow local NPU model processing a large prompt
+ * blows past that limit and the request dies with UND_ERR_HEADERS_TIMEOUT.
+ * Foundry Local is a trusted loopback server, so we wait as long as the model
+ * needs (0 = no timeout). The hard gate (ensureFoundryLocalReady) still proves
+ * the server is reachable before we ever start a generation.
+ */
+function relaxLocalInferenceTimeouts(): void {
+  try {
+    setGlobalDispatcher(
+      new Agent({
+        headersTimeout: 0,
+        bodyTimeout: 0
+      })
+    );
+  } catch {
+    /* never let dispatcher setup break the CLI */
+  }
+}
 
 /** Minimal `.env` parser (KEY=VALUE, supports quotes and # comments). */
 function loadDotEnv(file: string): void {
@@ -67,6 +93,10 @@ function attachGlobalHandlers(): void {
 export function bootstrap(): void {
   if (bootstrapped) return;
   bootstrapped = true;
+
+  // Wait indefinitely on slow local NPU inference instead of letting undici's
+  // default headers timeout abort the Foundry Local request.
+  relaxLocalInferenceTimeouts();
 
   // Load .env from several locations so the CLI finds its config whether it is
   // run from the project root, installed globally (npm link), or driven from a

@@ -73,7 +73,7 @@ twc docs ask "which ports does teamviewer use"
 twc explain 8fK2aQ9xLp
 
 # Pick a different on-device model, then run with it:
-twc models use deepseek-r1-7b
+twc models use qwen2.5-0.5b-cpu
 twc -p "Web API token rejected" --product teamviewer-tensor
 ```
 
@@ -620,11 +620,18 @@ A curated catalog of Foundry Local models is available — switch at any time, n
 
 ```bash
 twc models list                         # show catalog + currently active
-twc models use deepseek-r1-7b           # accept alias or full Foundry id
+twc models use qwen2.5-0.5b-cpu          # accept alias or full Foundry id
 twc models use qwen2.5-7b-instruct-generic-gpu:1
 twc models current                      # print active id
 twc models unset                        # clear persisted choice (falls back to env)
 ```
+
+> **NPU note (Snapdragon / Copilot+ PCs):** on some Arm64 hosts the QNN/NPU
+> execution provider stalls and `*-qnn-npu` chat models can hang indefinitely
+> (even a trivial prompt never returns). If `docs ask` appears stuck, switch to
+> a **CPU build** — `twc models use qwen2.5-0.5b-cpu` (tiny, ~2s/answer) or
+> `twc models use qwen2.5-1.5b-cpu` (higher quality). CPU builds are
+> NPU-independent and steady.
 
 Inside the REPL:
 
@@ -661,8 +668,8 @@ This project is configured for **local-only LLM execution**.
 Recommended environment variables:
 
 ```powershell
-$env:FOUNDRY_LOCAL_ENDPOINT = "http://127.0.0.1:58991/v1"
-$env:FOUNDRY_LOCAL_MODEL = "deepseek-r1-distill-qwen-7b-qnn-npu:2"
+# Leave FOUNDRY_LOCAL_ENDPOINT unset to auto-discover the (dynamic) port.
+$env:FOUNDRY_LOCAL_MODEL = "qwen2.5-0.5b-instruct-generic-cpu:4"
 $env:FOUNDRY_LOCAL_API_KEY = "local-dev-key"
 ```
 
@@ -782,3 +789,6 @@ package.json
 | Version drift | `--version` reads `package.json` at runtime |
 | REPL ergonomics | Persisted history across sessions (`~/.twc/history`, last 500 entries) |
 | Wrong-model picked at runtime | Explicit `models use` / `/model` wins over `FOUNDRY_LOCAL_MODEL` env |
+| `docs ask` hangs for minutes on Snapdragon/NPU | Broken QNN/NPU provider stalls `*-qnn-npu` models; switch to a CPU build (`twc models use qwen2.5-0.5b-cpu`). If the inference queue is wedged, restart Foundry: `foundry service start` (a new dynamic port is auto-discovered) |
+| Stale Foundry port after service restart | `FOUNDRY_LOCAL_ENDPOINT` left unset → endpoint auto-discovered from `foundry service status` (origin + `/v1`), so a new dynamic port just works |
+| Small CPU model repeats the same sentence | Sentence-split + dedup in [src/knowledge/llmCompose.ts](src/knowledge/llmCompose.ts) collapses looped output; `maxOutputTokens` bounded |

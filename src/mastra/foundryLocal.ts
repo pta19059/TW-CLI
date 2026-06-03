@@ -36,8 +36,16 @@ export function discoverFoundryEndpoint(): string | undefined {
     const output = execSync("foundry service status", { encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] });
     const match = output.match(/https?:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?(?:\/\S*)?/i);
     if (match) {
-      const base = match[0].replace(/\/+$/, "");
-      return base.endsWith("/v1") ? base : `${base}/v1`;
+      // The status line can include a path (e.g. ".../openai/status"). Only the
+      // scheme+host+port (the origin) is the real server base; the OpenAI-
+      // compatible API lives at <origin>/v1. Strip any path before appending.
+      try {
+        const origin = new URL(match[0]).origin;
+        return `${origin}/v1`;
+      } catch {
+        const base = match[0].replace(/\/+$/, "");
+        return base.endsWith("/v1") ? base : `${base}/v1`;
+      }
     }
   } catch {
     // Foundry CLI not present or service down
