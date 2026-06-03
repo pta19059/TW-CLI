@@ -794,6 +794,8 @@ dist-cjs/                  # optional CJS output (legacy)
   knowledge/lancedb/       # local hybrid RAG index (LanceDB table: chunks + embeddings)
   knowledge/lance-meta.json # sidecar: builtAt + embedding model
   knowledge/url-map.json   # lightweight KB URL map for just-in-time lookups
+  config.json              # active model + user config (twc models use)
+  foundry-endpoint.json    # last-known-good Foundry Local endpoint (desktop-icon fallback)
 vitest.config.ts
 tsconfig.json
 package.json
@@ -827,4 +829,5 @@ package.json
 | Wrong-model picked at runtime | Explicit `models use` / `/model` wins over `FOUNDRY_LOCAL_MODEL` env |
 | `docs ask` hangs for minutes on Snapdragon/NPU | Broken QNN/NPU provider stalls `*-qnn-npu` models; switch to a CPU build (`twc models use qwen2.5-0.5b-cpu`). If the inference queue is wedged, restart Foundry: `foundry service start` (a new dynamic port is auto-discovered) |
 | Stale Foundry port after service restart | `FOUNDRY_LOCAL_ENDPOINT` left unset → endpoint auto-discovered from `foundry service status` (origin + `/v1`), so a new dynamic port just works |
+| `docs ask` says "no endpoint is configured" only when launched from the **desktop icon** | The `foundry` command is a Windows *App Execution Alias* that does not resolve in the icon-launched child process. Discovery now also tries `foundry.exe` by absolute path and falls back to a last-known-good endpoint cached at `~/.twc/foundry-endpoint.json` (refreshed on every successful run from a terminal). [src/mastra/foundryLocal.ts](src/mastra/foundryLocal.ts) |
 | Small CPU model repeats the same sentence | Sentence-split + dedup in [src/knowledge/llmCompose.ts](src/knowledge/llmCompose.ts) collapses looped output; `maxOutputTokens` bounded |

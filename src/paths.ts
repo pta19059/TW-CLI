@@ -31,6 +31,13 @@ export const LOGS_DIR = path.join(APP_DIR, "logs");
 export const KNOWLEDGE_DIR = path.join(APP_DIR, "knowledge");
 export const HISTORY_FILE = path.join(APP_DIR, "history");
 export const CONFIG_FILE = path.join(APP_DIR, "config.json");
+/**
+ * Last-known-good Foundry Local endpoint. Written whenever the endpoint is
+ * successfully probed and reused when the `foundry` CLI cannot be resolved
+ * (e.g. when launched from the Windows desktop icon, where the WindowsApps
+ * `foundry` execution alias does not resolve in the spawned child process).
+ */
+export const FOUNDRY_ENDPOINT_FILE = path.join(APP_DIR, "foundry-endpoint.json");
 
 export function ensureDataDir(): void {
   mkdirSync(APP_DIR, { recursive: true });
