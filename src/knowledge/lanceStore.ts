@@ -128,6 +128,35 @@ export async function loadAllChunks(): Promise<{ chunks: IndexChunk[]; meta: Lan
   }
 }
 
+/**
+ * Native ANN vector search: return the `k` chunks closest to `queryVec` without
+ * materializing the whole table. Used by retrieval once the corpus grows past
+ * the point where an in-memory full scan is cheap (e.g. after a full-KB
+ * `docs reindex`). Returns [] when there is no table.
+ */
+export async function searchSimilar(queryVec: number[], k: number): Promise<IndexChunk[]> {
+  const tbl = await openTable();
+  if (!tbl) return [];
+  try {
+    const rows = (await tbl.search(queryVec).limit(k).toArray()) as Record<string, unknown>[];
+    return rows.map(fromRow);
+  } catch {
+    return [];
+  }
+}
+
+/** Distinct docIds already stored — lets incremental refresh skip known pages. */
+export async function existingDocIds(): Promise<Set<string>> {
+  const tbl = await openTable();
+  if (!tbl) return new Set();
+  try {
+    const rows = (await tbl.query().select(["docId"]).limit(1_000_000).toArray()) as Record<string, unknown>[];
+    return new Set(rows.map((r) => String(r.docId)));
+  } catch {
+    return new Set();
+  }
+}
+
 /** Lightweight summary for `docs index` without materializing every row. */
 export async function indexStats(): Promise<{ built: boolean; builtAt?: string; chunks: number; model?: string }> {
   const tbl = await openTable();

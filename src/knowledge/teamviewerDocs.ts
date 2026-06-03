@@ -28,6 +28,14 @@ const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 // API key required (an optional JINA_API_KEY raises rate limits).
 const JINA_READER_BASE = "https://r.jina.ai/";
 const JINA_TIMEOUT_MS = 25_000;
+// Transient-failure retry: the free Jina Reader rate-limits bursts (HTTP 429)
+// and occasionally returns 5xx/timeouts. Without backoff a full-KB crawl loses
+// most pages, so retry transient errors a few times, honouring Retry-After.
+const FETCH_MAX_RETRIES = 4;
+const FETCH_BACKOFF_BASE_MS = 1_500;
+const FETCH_BACKOFF_CAP_MS = 20_000;
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /** Only these hosts may be fetched by the knowledge layer. */
 const DOC_HOST_ALLOWLIST = [
@@ -141,6 +149,17 @@ const URL_MAP_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const KB_ROOT_URL = "https://www.teamviewer.com/en/global/support/knowledge-base/";
 /** How many candidate pages just-in-time retrieval may fetch per question. */
 const JIT_MAX_PAGES = 3;
+
+/** Full-crawl bounds for `docs reindex` (one command, whole KB). */
+const CRAWL_MAX_DEPTH = 2; // landing → category → article
+const CRAWL_MAX_PAGES = 600; // safety cap on total pages fetched
+const CRAWL_CONCURRENCY = 4; // parallel Jina fetches per level (polite)
+/** Above this many chunks, retrieval uses native LanceDB ANN instead of a full
+ * in-memory scan. Keeps the curated/small corpus on the exact tuned code path
+ * (so behaviour and tests are unchanged) while scaling to a full-KB index. */
+const ANN_SCAN_THRESHOLD = 1500;
+/** Candidate pool pulled by native ANN before the hybrid re-rank, at scale. */
+const ANN_CANDIDATES = 400;
 
 /** Drop obvious navigation/chrome links that are not documentation pages. */
 const NAV_LINK_RE = /sign\s?in|skip to|cookie|privacy|imprint|legal|contact|careers/i;
@@ -426,25 +445,50 @@ export async function fetchOfficialDoc(url: string, force = false): Promise<DocF
     if (cached) return { ok: true, url, text: cached.text, fromCache: true };
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), JINA_TIMEOUT_MS);
-  try {
-    const headers: Record<string, string> = { Accept: "text/plain", "X-Return-Format": "markdown" };
-    const key = process.env.JINA_API_KEY;
-    if (key) headers.Authorization = `Bearer ${key}`;
-    const res = await fetch(`${JINA_READER_BASE}${url}`, { signal: controller.signal, headers });
-    const text = await res.text();
-    if (!res.ok) {
-      return { ok: false, url, status: res.status, error: `HTTP ${res.status}` };
+  let lastError = "fetch failed";
+  let lastStatus: number | undefined;
+  for (let attempt = 0; attempt <= FETCH_MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), JINA_TIMEOUT_MS);
+    try {
+      const headers: Record<string, string> = { Accept: "text/plain", "X-Return-Format": "markdown" };
+      const key = process.env.JINA_API_KEY;
+      if (key) headers.Authorization = `Bearer ${key}`;
+      const res = await fetch(`${JINA_READER_BASE}${url}`, { signal: controller.signal, headers });
+      const text = await res.text();
+      if (res.ok) {
+        const title = OFFICIAL_DOCS.find((d) => d.url === url)?.title;
+        writeCacheEntry({ url, title, text: text.slice(0, 300_000), fetchedAt: new Date().toISOString() });
+        return { ok: true, url, status: res.status, text };
+      }
+      lastStatus = res.status;
+      lastError = `HTTP ${res.status}`;
+      // Only retry transient server-side conditions; 4xx (except 429) are final.
+      if (res.status !== 429 && res.status < 500) {
+        return { ok: false, url, status: res.status, error: lastError };
+      }
+      if (attempt < FETCH_MAX_RETRIES) {
+        const retryAfter = Number(res.headers.get("retry-after"));
+        const backoff = Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : Math.min(FETCH_BACKOFF_BASE_MS * 2 ** attempt, FETCH_BACKOFF_CAP_MS);
+        await sleep(backoff + Math.floor(Math.random() * 500));
+        continue;
+      }
+      return { ok: false, url, status: res.status, error: lastError };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      // Network errors / timeouts are transient — back off and retry.
+      if (attempt < FETCH_MAX_RETRIES) {
+        await sleep(Math.min(FETCH_BACKOFF_BASE_MS * 2 ** attempt, FETCH_BACKOFF_CAP_MS) + Math.floor(Math.random() * 500));
+        continue;
+      }
+      return { ok: false, url, status: lastStatus, error: lastError };
+    } finally {
+      clearTimeout(timer);
     }
-    const title = OFFICIAL_DOCS.find((d) => d.url === url)?.title;
-    writeCacheEntry({ url, title, text: text.slice(0, 300_000), fetchedAt: new Date().toISOString() });
-    return { ok: true, url, status: res.status, text };
-  } catch (err) {
-    return { ok: false, url, error: err instanceof Error ? err.message : String(err) };
-  } finally {
-    clearTimeout(timer);
   }
+  return { ok: false, url, status: lastStatus, error: lastError };
 }
 
 /** Pre-fetch and cache every curated source. Returns a per-source result. */
@@ -740,36 +784,140 @@ export async function localIndexInfo(): Promise<{
   };
 }
 
-/**
- * Rebuild the local RAG index from the official sources via Jina, then embed
- * every chunk with Foundry Local. Embeddings are MANDATORY: if Foundry Local is
- * unavailable or has no embedding model, this throws (no keyword-only index is
- * written). Returns a per-source result.
- */
-export async function reindexOfficialDocs(): Promise<
-  { id: string; ok: boolean; detail: string; chunks: number }[]
-> {
-  const results: { id: string; ok: boolean; detail: string; chunks: number }[] = [];
-  const allChunks: IndexChunk[] = [];
-  for (const doc of OFFICIAL_DOCS) {
-    const r = await fetchOfficialDoc(doc.url, true);
-    if (!r.ok || !r.text) {
-      results.push({ id: doc.id, ok: false, detail: r.error ?? "failed", chunks: 0 });
-      continue;
+/** One fetched documentation page (markdown) discovered during a crawl. */
+interface CrawledPage {
+  url: string;
+  title: string;
+  text: string;
+}
+
+/** Summary returned by `docs reindex` (full) and `docs refresh` (incremental). */
+export interface IndexBuildSummary {
+  pages: number; // pages whose chunks were written
+  chunks: number; // chunks written
+  fetched: number; // pages attempted over the network
+  failed: number; // pages that failed to fetch
+  added?: number; // (refresh) new pages appended
+  skipped?: number; // (refresh) pages already indexed, not re-fetched
+}
+
+/** Stable, collision-resistant chunk namespace for a crawled URL. */
+function docIdForUrl(url: string): string {
+  return `kb-${createHash("sha1").update(url).digest("hex").slice(0, 12)}`;
+}
+
+/** Run async `fn` over `items` with at most `limit` in flight (polite fetch). */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i]);
     }
-    const pieces = chunkMarkdown(r.text);
-    pieces.forEach((text, i) =>
-      allChunks.push({ id: `${doc.id}#${i}`, docId: doc.id, url: doc.url, title: doc.title, text })
-    );
-    results.push({ id: doc.id, ok: true, detail: `${pieces.length} chunks`, chunks: pieces.length });
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return out;
+}
+
+const KB_ROOT_NORM = `${new URL(KB_ROOT_URL).origin}${new URL(KB_ROOT_URL).pathname.replace(/\/+$/, "")}`.toLowerCase();
+
+/**
+ * Breadth-first crawl of the whole TeamViewer knowledge base via Jina, seeded by
+ * the KB landing page plus the curated OFFICIAL_DOCS and following KB links to
+ * CRAWL_MAX_DEPTH. Returns every reachable documentation page with its markdown.
+ * Bounded by CRAWL_MAX_PAGES; fetches are disk-cached so re-runs are cheap. Only
+ * allowlisted hosts/KB paths are ever followed (harvestKbLinks enforces this),
+ * so the crawl cannot be steered to arbitrary URLs.
+ */
+async function crawlKbDocs(
+  onProgress?: (fetched: number, discovered: number, title: string) => void
+): Promise<{ pages: CrawledPage[]; fetched: number; failed: number }> {
+  const visited = new Set<string>();
+  const pages = new Map<string, CrawledPage>();
+  let fetched = 0;
+  let failed = 0;
+
+  let frontier: KbLink[] = [
+    { url: KB_ROOT_URL.replace(/\/+$/, ""), title: "Knowledge Base" },
+    ...OFFICIAL_DOCS.map((d) => ({ url: d.url.replace(/\/+$/, ""), title: d.title }))
+  ];
+
+  for (let depth = 0; depth <= CRAWL_MAX_DEPTH && frontier.length > 0; depth++) {
+    const batch: KbLink[] = [];
+    for (const l of frontier) {
+      const norm = l.url.toLowerCase();
+      if (visited.has(norm)) continue;
+      visited.add(norm);
+      batch.push(l);
+      if (visited.size >= CRAWL_MAX_PAGES) break;
+    }
+    if (batch.length === 0) break;
+
+    const level = await mapLimit(batch, CRAWL_CONCURRENCY, async (l) => {
+      const r = await fetchOfficialDoc(l.url, false).catch(() => null);
+      fetched++;
+      if (onProgress) onProgress(fetched, visited.size, l.title);
+      return { l, text: r && r.ok ? r.text ?? null : null };
+    });
+
+    const nextByUrl = new Map<string, KbLink>();
+    for (const { l, text } of level) {
+      const norm = l.url.toLowerCase();
+      if (!text) {
+        failed++;
+        continue;
+      }
+      if (norm !== KB_ROOT_NORM) pages.set(norm, { url: l.url, title: l.title, text });
+      if (depth < CRAWL_MAX_DEPTH) {
+        for (const child of harvestKbLinks(text)) {
+          const cn = child.url.toLowerCase();
+          if (!visited.has(cn) && !pages.has(cn)) nextByUrl.set(cn, child);
+        }
+      }
+    }
+    frontier = [...nextByUrl.values()];
   }
 
-  if (allChunks.length === 0) {
+  return { pages: [...pages.values()], fetched, failed };
+}
+
+/** Turn a fetched page into embeddable chunks (denoised, junk-filtered). */
+function pageToChunks(page: CrawledPage): IndexChunk[] {
+  const docId = docIdForUrl(page.url);
+  const out: IndexChunk[] = [];
+  chunkMarkdown(page.text).forEach((text, i) => {
+    if (isJunkChunk(text)) return; // never index error-page / nav-only bodies
+    out.push({ id: `${docId}#${i}`, docId, url: page.url, title: page.title, text });
+  });
+  return out;
+}
+
+/**
+ * Rebuild the local RAG index from the ENTIRE TeamViewer knowledge base in one
+ * command: crawl every reachable KB page via Jina (to CRAWL_MAX_DEPTH), chunk
+ * and embed them with the local ONNX embedder, then overwrite the LanceDB table.
+ * Embeddings are MANDATORY: if the embedder is unavailable this throws (no
+ * keyword-only index is written). For day-to-day top-ups use `refreshIndex`
+ * (incremental) instead of paying for a full rebuild.
+ */
+export async function reindexOfficialDocs(
+  onProgress?: (fetched: number, discovered: number, title: string) => void
+): Promise<IndexBuildSummary> {
+  const { pages, fetched, failed } = await crawlKbDocs(onProgress);
+  if (pages.length === 0) {
     throw new Error("No documentation could be fetched, so the index cannot be built.");
   }
 
-  // Mandatory embeddings — throws if Foundry Local is unavailable. We do not
-  // write a keyword-only index: hybrid retrieval requires embeddings.
+  const allChunks: IndexChunk[] = [];
+  for (const page of pages) allChunks.push(...pageToChunks(page));
+  if (allChunks.length === 0) {
+    throw new Error("The crawl returned pages but no usable text chunks.");
+  }
+
+  // Mandatory embeddings — throws if the local embedder is unavailable. We do
+  // not write a keyword-only index: hybrid retrieval requires embeddings.
   const { vectors, model } = await embedTexts(allChunks.map((c) => c.text));
   vectors.forEach((v, i) => {
     allChunks[i].embedding = v;
@@ -777,7 +925,69 @@ export async function reindexOfficialDocs(): Promise<
 
   mkdirSync(KNOWLEDGE_DIR, { recursive: true });
   await lanceStore.replaceAllChunks(allChunks, model);
-  return results;
+  return { pages: pages.length, chunks: allChunks.length, fetched, failed };
+}
+
+/**
+ * Incrementally top up the existing index without rebuilding it: discover KB
+ * pages (curated OFFICIAL_DOCS ∪ the lightweight URL map), skip any whose docId
+ * is already stored, then fetch, chunk, embed and append ONLY the new pages via
+ * LanceDB's incremental add. Cheap and safe to run often. Run
+ * `reindexOfficialDocs` first for the initial full build.
+ */
+export async function refreshIndex(
+  onProgress?: (fetched: number, total: number, title: string) => void
+): Promise<IndexBuildSummary> {
+  const known = await lanceStore.existingDocIds();
+  const map = await ensureUrlMap();
+  const candidates = new Map<string, KbLink>();
+  for (const d of OFFICIAL_DOCS) {
+    const url = d.url.replace(/\/+$/, "");
+    candidates.set(url.toLowerCase(), { url, title: d.title });
+  }
+  for (const l of map?.links ?? []) {
+    const url = l.url.replace(/\/+$/, "");
+    candidates.set(url.toLowerCase(), { url, title: l.title });
+  }
+
+  const fresh = [...candidates.values()].filter((l) => !known.has(docIdForUrl(l.url)));
+  const skipped = candidates.size - fresh.length;
+  if (fresh.length === 0) {
+    return { pages: 0, chunks: 0, fetched: 0, failed: 0, added: 0, skipped };
+  }
+
+  let fetched = 0;
+  let failed = 0;
+  const perPage = await mapLimit(fresh, CRAWL_CONCURRENCY, async (l) => {
+    const r = await fetchOfficialDoc(l.url, false).catch(() => null);
+    fetched++;
+    if (onProgress) onProgress(fetched, fresh.length, l.title);
+    if (!r || !r.ok || !r.text) return null;
+    return pageToChunks({ url: l.url, title: l.title, text: r.text });
+  });
+
+  const newChunks: IndexChunk[] = [];
+  let addedPages = 0;
+  for (const chunks of perPage) {
+    if (!chunks) {
+      failed++;
+      continue;
+    }
+    if (chunks.length > 0) {
+      addedPages++;
+      newChunks.push(...chunks);
+    }
+  }
+  if (newChunks.length === 0) {
+    return { pages: 0, chunks: 0, fetched, failed, added: 0, skipped };
+  }
+
+  const { vectors, model } = await embedTexts(newChunks.map((c) => c.text));
+  vectors.forEach((v, i) => {
+    newChunks[i].embedding = v;
+  });
+  await lanceStore.addChunks(newChunks, model);
+  return { pages: addedPages, chunks: newChunks.length, fetched, failed, added: addedPages, skipped };
 }
 
 /**
@@ -788,22 +998,42 @@ export async function reindexOfficialDocs(): Promise<
  * throws (no keyword-only fallback). Pure-local: no web search.
  */
 export async function retrieveLocal(query: string, limit = 5): Promise<KnowledgeHit[]> {
-  const idx = await loadLocalIndex();
-  if (!idx || idx.chunks.length === 0) {
-    throw new Error("No local documentation index found. Run 'twc docs reindex' first.");
-  }
-  if (!idx.chunks.every((c) => c.embedding && c.embedding.length > 0)) {
-    throw new Error(
-      "The local index has no embeddings. Rebuild it with 'twc docs reindex' while Foundry Local is running. Hybrid retrieval requires embeddings — there is no fallback."
-    );
-  }
   const tokens = tokenize(query);
   if (tokens.length === 0) return [];
 
-  // Mandatory query embedding — throws if Foundry Local is unavailable.
+  const stats = await lanceStore.indexStats();
+  if (!stats.built || stats.chunks === 0) {
+    throw new Error("No local documentation index found. Run 'twc docs reindex' first.");
+  }
+
+  // Mandatory query embedding — throws if the local embedder is unavailable.
   const queryVec = (await embedTexts([query])).vectors[0];
 
-  const scored = idx.chunks
+  // Candidate pool. Small corpus: score every chunk (exact, tuned path —
+  // unchanged behaviour). Large corpus (e.g. after a full-KB reindex): pull a
+  // generous candidate set with native LanceDB ANN so we never load the whole
+  // table into memory, then re-rank those candidates with the same hybrid math.
+  let pool: IndexChunk[];
+  if (stats.chunks <= ANN_SCAN_THRESHOLD) {
+    const idx = await loadLocalIndex();
+    pool = idx?.chunks ?? [];
+  } else {
+    pool = await lanceStore.searchSimilar(queryVec, ANN_CANDIDATES);
+    if (pool.length === 0) {
+      const idx = await loadLocalIndex();
+      pool = idx?.chunks ?? [];
+    }
+  }
+  if (pool.length === 0) {
+    throw new Error("No local documentation index found. Run 'twc docs reindex' first.");
+  }
+  if (!pool.every((c) => c.embedding && c.embedding.length > 0)) {
+    throw new Error(
+      "The local index has no embeddings. Rebuild it with 'twc docs reindex' while the local embedder is available. Hybrid retrieval requires embeddings — there is no fallback."
+    );
+  }
+
+  const scored = pool
     .filter((c) => !isJunkChunk(c.text))
     .map((c) => ({
       c,

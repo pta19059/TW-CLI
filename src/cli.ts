@@ -20,6 +20,7 @@ import {
   answerFromKnowledge,
   buildUrlMap,
   localIndexInfo,
+  refreshIndex,
   reindexOfficialDocs,
   syncOfficialDocs,
   urlMapInfo
@@ -349,20 +350,55 @@ export function buildCli(): Command {
 
   docs
     .command("reindex")
-    .description("Rebuild the local documentation index from official sources (via Jina); local ONNX embeddings are required")
+    .description("Rebuild the local index from the ENTIRE TeamViewer knowledge base in one pass (crawls every KB page via Jina; local ONNX embeddings required)")
     .action(async () => {
-      console.log("Rebuilding local documentation index (fetching via Jina Reader)...");
+      console.log("Rebuilding the full documentation index (crawling the TeamViewer KB via Jina Reader)...");
+      let last = 0;
       try {
-        const results = await reindexOfficialDocs();
-        for (const r of results) {
-          console.log(`  ${r.ok ? "OK " : "ERR"} ${r.id.padEnd(24)} ${r.detail}`);
-        }
+        const summary = await reindexOfficialDocs((fetched, discovered, title) => {
+          // Throttle progress to avoid flooding the terminal on large crawls.
+          if (fetched - last >= 10 || fetched <= 1) {
+            last = fetched;
+            const label = title.length > 48 ? `${title.slice(0, 47)}…` : title;
+            console.log(`  fetched ${fetched} (discovered ${discovered}) — ${label}`);
+          }
+        });
         const info = await localIndexInfo();
-        const failed = results.filter((r) => !r.ok).length;
-        console.log(`\nIndex: ${info.chunks} chunks, ${info.embeddings} embedded (model: ${info.model})`);
+        console.log(`\nIndex: ${info.chunks} chunks from ${summary.pages} pages (model: ${info.model})`);
         console.log("Retrieval: hybrid (keyword + local ONNX embeddings).");
-        if (failed > 0) {
-          console.log(`${failed} source(s) failed to fetch.`);
+        if (summary.failed > 0) {
+          console.log(`${summary.failed} page(s) failed to fetch and were skipped.`);
+        }
+        console.log("Tip: run 'twc docs refresh' later to add only new pages incrementally.");
+      } catch (err) {
+        console.error(`\n${err instanceof Error ? err.message : String(err)}`);
+        process.exitCode = 1;
+      }
+    });
+
+  docs
+    .command("refresh")
+    .description("Incrementally add only NEW KB pages to the existing index (does not rebuild; run 'twc docs reindex' first for the full build)")
+    .action(async () => {
+      console.log("Refreshing the documentation index (adding new KB pages only)...");
+      let last = 0;
+      try {
+        const summary = await refreshIndex((fetched, total, title) => {
+          if (fetched - last >= 5 || fetched <= 1) {
+            last = fetched;
+            const label = title.length > 48 ? `${title.slice(0, 47)}…` : title;
+            console.log(`  fetched ${fetched}/${total} — ${label}`);
+          }
+        });
+        const info = await localIndexInfo();
+        if ((summary.added ?? 0) === 0) {
+          console.log(`\nUp to date: no new pages found (${summary.skipped ?? 0} already indexed).`);
+        } else {
+          console.log(`\nAdded ${summary.added} new page(s), ${summary.chunks} chunk(s). Skipped ${summary.skipped ?? 0} already indexed.`);
+        }
+        console.log(`Index: ${info.chunks} chunks total (model: ${info.model}).`);
+        if (summary.failed > 0) {
+          console.log(`${summary.failed} page(s) failed to fetch and were skipped.`);
         }
       } catch (err) {
         console.error(`\n${err instanceof Error ? err.message : String(err)}`);
