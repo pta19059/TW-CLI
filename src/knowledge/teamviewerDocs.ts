@@ -793,7 +793,7 @@ export function cosineSimilarity(a: number[], b: number[]): number {
  * so embeddings run here. The model id comes from TWC_EMBED_MODEL (default
  * Xenova/all-MiniLM-L6-v2). Throws if the model cannot be loaded.
  */
-async function embedTexts(texts: string[]): Promise<{ vectors: number[][]; model: string }> {
+export async function embedTexts(texts: string[]): Promise<{ vectors: number[][]; model: string }> {
   if (texts.length === 0) throw new Error("embedTexts called with no input.");
   try {
     return await embedLocal(texts);
@@ -1386,9 +1386,14 @@ export function groundingFacts(topics: DocTopic[], product?: string, limit = 4):
  * Set TWC_NO_JIT=1 to disable the live pass. When nothing is confidently
  * grounded, return an honest "I don't know" pointing to the official source.
  */
-export async function answerFromKnowledge(
+/**
+ * Retrieve and rank the knowledge hits for a query (LanceDB hybrid retrieval +
+ * curated facts + just-in-time KB fetch). Shared by the extractive composer and
+ * the LLM-grounded composer so both rank from an identical hit pool.
+ */
+export async function retrieveKnowledgeHits(
   query: string
-): Promise<KnowledgeAnswer> {
+): Promise<{ hits: KnowledgeHit[]; confident: boolean }> {
   const tokens = tokenize(query);
   // A doc hit is trustworthy only when it is BOTH lexically grounded (a real
   // fraction of the question's words appear in the passage, not just one common
@@ -1427,6 +1432,18 @@ export async function answerFromKnowledge(
       confident = isConfident(hits);
     }
   }
+  return { hits, confident };
+}
+
+/**
+ * Extractive answer composer (no LLM): returns verbatim passages from the
+ * retrieved chunks. Used by the Mastra docs tool and as the non-LLM path.
+ */
+export async function answerFromKnowledge(
+  query: string
+): Promise<KnowledgeAnswer> {
+  const tokens = tokenize(query);
+  const { hits, confident } = await retrieveKnowledgeHits(query);
 
   if (!confident) {
     const src = bestSourceFor(query);

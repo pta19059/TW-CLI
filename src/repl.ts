@@ -15,7 +15,7 @@ import { MODEL_CATALOG, findEntry, resolveModelId } from "./mastra/modelCatalog.
 import { getActiveModelId, setActiveModelId } from "./userConfig.js";
 import { invalidateModelCache } from "./mastra/agents/index.js";
 import { runOneShot } from "./oneShot.js";
-import { answerFromKnowledge } from "./knowledge/teamviewerDocs.js";
+import { answerGrounded } from "./knowledge/llmCompose.js";
 import { JobType, ProductKey } from "./types.js";
 import { banner, color } from "./ui.js";
 import { killProcessTree } from "./jobs/killTree.js";
@@ -278,7 +278,7 @@ async function handleSlash(line: string, state: ReplState, rl: readline.Interfac
     case "doctor": await doctorCmd(); return true;
     case "docs": {
       if (!arg) { console.log(color.red("  usage: /docs <question>")); return true; }
-      const result = await answerFromKnowledge(arg);
+      const result = await answerGrounded(arg);
       console.log(result.answer);
       if (result.citations.length > 0) {
         console.log(color.dim(`  sources: ${result.citations.join(", ")}`));

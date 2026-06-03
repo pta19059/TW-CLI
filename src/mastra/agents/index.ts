@@ -86,6 +86,25 @@ export const gatewayAgent = new Agent({
   tools: { teamviewerDocsTool }
 });
 
+/**
+ * Strictly-grounded composer for `docs ask`. It has NO tools and is constrained
+ * to answer only from the CONTEXT passed in the prompt — the retrieval is done
+ * by our LanceDB hybrid retriever, this agent only rephrases what was retrieved.
+ * Output is verified sentence-by-sentence by the caller before being shown.
+ */
+export const docsComposerAgent = new Agent({
+  id: "tw-docs-composer",
+  name: "TeamViewer Docs Composer",
+  instructions:
+    "You answer TeamViewer questions using ONLY the CONTEXT passages provided in the prompt. " +
+    "Rules: (1) Use ONLY facts explicitly present in the CONTEXT — never add information, examples, " +
+    "marketing copy, or product names that are not in the CONTEXT. " +
+    "(2) If the CONTEXT does not contain the answer, reply with exactly NOT_IN_CONTEXT and nothing else. " +
+    "(3) Be concise and factual: 1 to 4 sentences. " +
+    "(4) Do NOT include URLs, citations, or markdown — the system adds sources separately.",
+  model: modelGetter
+});
+
 export const connectivityAgent = new Agent({
   id: "tw-connectivity-agent",
   name: "TeamViewer Connectivity Agent",

@@ -15,6 +15,7 @@ import { getActiveModelId, setActiveModelId, setLastJobId, getLastJobId } from "
 import { invalidateModelCache } from "./mastra/agents/index.js";
 import { killProcessTree } from "./jobs/killTree.js";
 import { getCliVersion } from "./version.js";
+import { answerGrounded } from "./knowledge/llmCompose.js";
 import {
   OFFICIAL_DOCS,
   answerFromKnowledge,
@@ -307,10 +308,10 @@ export function buildCli(): Command {
 
   docs
     .command("ask <question>")
-    .description("Answer a TeamViewer question from verified facts and the local doc index (falls back to live KB lookup)")
+    .description("Answer a TeamViewer question, grounded on the local doc index via a local LLM (Foundry Local required)")
     .action(async (question: string) => {
       try {
-        const result = await answerFromKnowledge(question);
+        const result = await answerGrounded(question);
         console.log(result.answer);
         if (result.citations.length > 0) {
           console.log("\nSources:");
