@@ -20,7 +20,6 @@ interface ResolvedModelConfig {
 }
 
 let cachedModel: ResolvedModelConfig | null = null;
-let warnedDefaultKey = false;
 
 /** Invalidate the cached config so the next agent call picks up a new model id. */
 export function invalidateModelCache(): void {
@@ -57,12 +56,6 @@ export function resolveModel(): ResolvedModelConfig {
   }
 
   const apiKey = process.env.FOUNDRY_LOCAL_API_KEY ?? process.env.OPENAI_API_KEY ?? "local-dev-key";
-  if (apiKey === "local-dev-key" && !warnedDefaultKey) {
-    warnedDefaultKey = true;
-    console.warn(
-      "[twc] Using default placeholder API key. Set FOUNDRY_LOCAL_API_KEY explicitly to silence this warning."
-    );
-  }
 
   cachedModel = {
     providerId: "openai",

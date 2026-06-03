@@ -143,9 +143,20 @@ async function verifyGrounding(
  * retrieved sources.
  */
 export async function answerGrounded(query: string): Promise<KnowledgeAnswer> {
+  const DEBUG = process.env.TWC_DOCS_DEBUG === "1";
+  const t0 = Date.now();
+  const dbg = (label: string, extra?: unknown) => {
+    if (!DEBUG) return;
+    const ms = `${Date.now() - t0}ms`.padStart(7);
+    if (extra === undefined) console.error(`[docs-debug ${ms}] ${label}`);
+    else console.error(`[docs-debug ${ms}] ${label}`, extra);
+  };
+
   await ensureFoundryLocalReady();
+  dbg("foundry-local ready");
 
   const { hits } = await retrieveKnowledgeHits(query);
+  dbg(`retrieval: ${hits.length} hits`, hits.slice(0, 5).map((h) => h.source));
   if (hits.length === 0) {
     const src = bestSourceFor(query);
     return { answer: DECLINE, confident: false, citations: [src.url], hits };
@@ -188,10 +199,13 @@ export async function answerGrounded(query: string): Promise<KnowledgeAnswer> {
   //  - temperature 0 makes the grounded rephrase deterministic.
   // Streaming is kept so we accumulate tokens as they arrive; we still await the
   // fully accumulated text before grounding.
+  dbg(`prompt built: ${prompt.length} chars, ${contextTexts.length} chunks`);
+  const llmStart = Date.now();
   const out = await docsComposerAgent.stream(prompt, {
     modelSettings: { maxOutputTokens: 256, temperature: 0 }
   });
   const raw = ((await out.text) ?? "").trim();
+  dbg(`LLM call done in ${Date.now() - llmStart}ms — raw output:`, raw);
   // Small local models often (a) glue a number to the next token ("5938TCP")
   // and (b) keep generating AFTER answering, emitting a stray NOT_IN_CONTEXT
   // marker in the middle of a perfectly good answer. A naive substring test for
@@ -214,6 +228,7 @@ export async function answerGrounded(query: string): Promise<KnowledgeAnswer> {
   }
 
   const { text: verified, groundedIdx } = await verifyGrounding(cleaned, contextTexts);
+  dbg(`grounding: verified=${verified.length} chars, groundedIdx=${[...groundedIdx].join(",")}`);
   if (!verified) {
     return { answer: DECLINE, confident: false, citations: orderedCitations([], hits), hits };
   }
