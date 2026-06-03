@@ -329,9 +329,13 @@ the agent points the user to the cited official URL rather than guessing.
 ([src/knowledge/llmCompose.ts](src/knowledge/llmCompose.ts)): the hybrid LanceDB retriever
 selects the most relevant chunks, a local Foundry Local model rephrases **only** that retrieved
 context, and every generated sentence is then **verified by embedding similarity** against the
-same context — unsupported sentences are dropped. If nothing is grounded the command declines
-honestly (`Confident: no`) instead of guessing, and the cited `Sources:` always come from the
-real retrieved pages. The agents' `tw-official-docs` tool stays extractive
+same context — unsupported sentences are dropped. To stay solid with small local models the
+composer hands the model the **whole retrieved chunk** (not a truncated half) and **sanitises**
+the raw output before grounding — de-gluing run-together tokens (`5938TCP` → `5938 TCP`),
+stripping stray `NOT_IN_CONTEXT` markers and markdown code fences, and collapsing looped repeats —
+so a correct answer is never thrown away over a formatting artifact. If nothing is grounded the
+command declines honestly (`Confident: no`) instead of guessing, and the cited `Sources:` always
+come from the real retrieved pages. The agents' `tw-official-docs` tool stays extractive
 ([src/mastra/tools/knowledgeTool.ts](src/mastra/tools/knowledgeTool.ts)) to avoid agent→tool→agent
 recursion.
 

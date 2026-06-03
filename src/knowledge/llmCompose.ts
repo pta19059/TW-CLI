@@ -13,25 +13,32 @@ import {
  * Per-sentence grounding threshold. A generated sentence is kept only if its
  * cosine similarity to at least one retrieved context chunk is >= this value.
  * Lower = more permissive (risk of drift), higher = stricter (risk of dropping
- * valid paraphrases). Tunable via TWC_GROUND_MIN. Default 0.45.
+ * valid paraphrases). Tunable via TWC_GROUND_MIN. Default 0.40 — small local
+ * models paraphrase heavily, so a slightly looser gate keeps faithful
+ * restatements of the CONTEXT instead of dropping them (which previously left
+ * an empty answer and forced an unwarranted DECLINE).
  */
-const GROUND_MIN = Math.max(0, Math.min(1, Number(process.env.TWC_GROUND_MIN) || 0.45));
+const GROUND_MIN = Math.max(0, Math.min(1, Number(process.env.TWC_GROUND_MIN) || 0.4));
 
 /** How many retrieved hits are handed to the model as CONTEXT.
  *
  * Foundry Local runs small models on a local NPU, where *prompt processing*
  * (ingesting the CONTEXT) dominates latency far more than token generation. A
- * large grounded context (5 hits x ~1200 chars) can push a single `docs ask`
- * into multiple minutes. We therefore keep the LLM context tight by default and
- * make it tunable via TWC_CONTEXT_HITS. Retrieval and citations are unaffected;
- * only what the model has to read is trimmed. */
-const CONTEXT_HITS = Math.max(1, Number(process.env.TWC_CONTEXT_HITS) || 3);
+ * large grounded context can push a single `docs ask` into multiple minutes on
+ * an NPU. On the CPU build (current default) prompt processing is far cheaper,
+ * so we hand the model MORE grounded passages by default to maximise the chance
+ * the answer is actually present — robustness over raw speed. Tunable via
+ * TWC_CONTEXT_HITS. Retrieval and citations are unaffected; only what the model
+ * has to read changes. */
+const CONTEXT_HITS = Math.max(1, Number(process.env.TWC_CONTEXT_HITS) || 5);
 
-/** Per-hit character budget for the text shown to the model. Trimming each
- * chunk keeps prompt-processing fast on a local NPU. Grounding still runs
- * against the same trimmed text, so citations stay honest. Tunable via
- * TWC_CONTEXT_CHARS. */
-const CONTEXT_CHARS = Math.max(120, Number(process.env.TWC_CONTEXT_CHARS) || 600);
+/** Per-hit character budget for the text shown to the model. Chunks are built
+ * at ~1200 chars (a single coherent passage), so the default now shows the
+ * WHOLE chunk: trimming to half a chunk frequently cut the sentence carrying
+ * the answer, leaving the model with only a boilerplate prefix and forcing a
+ * spurious NOT_IN_CONTEXT. Grounding still runs against this same text, so
+ * citations stay honest. Tunable via TWC_CONTEXT_CHARS. */
+const CONTEXT_CHARS = Math.max(120, Number(process.env.TWC_CONTEXT_CHARS) || 1200);
 
 const DECLINE = "The available documentation does not contain a verified answer to that question.";
 
@@ -52,6 +59,24 @@ function splitSentences(text: string): string[] {
 function orderedCitations(hits: KnowledgeHit[]): string[] {
   if (hits.length === 0) return [];
   return Array.from(new Set([hits[0].source, ...hits.map((h) => h.source)])).slice(0, 3);
+}
+
+/**
+ * Small local models frequently keep generating after they have answered,
+ * looping back to restate an earlier phrase (e.g. a ports answer ends
+ * "...port 80 TCP/UDP port 5938", repeating the opening). Remove the longest
+ * trailing run of >=3 words that already appears earlier in the text, repeating
+ * until the tail is original. Conservative (>=3 words, verbatim match) so it
+ * only strips genuine loop repeats, never distinct content.
+ */
+function collapseLoopedTail(text: string): string {
+  const words = text.split(/\s+/).filter(Boolean);
+  for (let len = Math.floor(words.length / 2); len >= 3; len--) {
+    const tail = words.slice(words.length - len).join(" ");
+    const head = words.slice(0, words.length - len).join(" ").trim();
+    if (head.includes(tail)) return collapseLoopedTail(head);
+  }
+  return text;
 }
 
 /**
@@ -77,7 +102,7 @@ async function verifyGrounding(answer: string, contextTexts: string[]): Promise<
     seen.add(key);
     return true;
   });
-  return deduped.join(" ");
+  return collapseLoopedTail(deduped.join(" "));
 }
 
 /**
@@ -100,8 +125,9 @@ export async function answerGrounded(query: string): Promise<KnowledgeAnswer> {
   }
 
   const context = hits.slice(0, CONTEXT_HITS);
-  // Trim each chunk to keep the prompt small: on a local NPU, prompt processing
-  // is the dominant cost. Grounding runs against these same trimmed texts.
+  // Show the model the whole retrieved chunk (CONTEXT_CHARS defaults to a full
+  // ~1200-char passage). Grounding runs against these same texts, so citations
+  // stay honest; the cap only guards against a pathologically long chunk.
   const contextTexts = context.map((h) => h.text.slice(0, CONTEXT_CHARS));
   const contextBlock = context
     .map((h, i) => `[${i + 1}] ${h.title ?? h.source}\n${contextTexts[i]}`)
@@ -117,21 +143,38 @@ export async function answerGrounded(query: string): Promise<KnowledgeAnswer> {
   // blow past undici's default headers timeout (UND_ERR_HEADERS_TIMEOUT). The
   // real fix lives in runtime/bootstrap.ts, which disables undici's
   // headers/body timeouts globally. On top of that we bound generation here:
-  //  - maxOutputTokens keeps the answer short (instructions ask for 1-4
-  //    sentences) and, crucially, prevents a small model from running away into
-  //    a multi-minute / looping generation.
+  //  - maxOutputTokens caps the answer (a few sentences) and, crucially,
+  //    prevents a small model from running away into a multi-minute / looping
+  //    generation.
   //  - temperature 0 makes the grounded rephrase deterministic.
   // Streaming is kept so we accumulate tokens as they arrive; we still await the
   // fully accumulated text before grounding.
   const out = await docsComposerAgent.stream(prompt, {
-    modelSettings: { maxOutputTokens: 160, temperature: 0 }
+    modelSettings: { maxOutputTokens: 256, temperature: 0 }
   });
   const raw = ((await out.text) ?? "").trim();
-  if (!raw || /NOT_IN_CONTEXT/i.test(raw)) {
+  // Small local models often (a) glue a number to the next token ("5938TCP")
+  // and (b) keep generating AFTER answering, emitting a stray NOT_IN_CONTEXT
+  // marker in the middle of a perfectly good answer. A naive substring test for
+  // NOT_IN_CONTEXT therefore threw away correct answers. We instead de-glue
+  // digit→capital boundaries, strip every NOT_IN_CONTEXT marker, and DECLINE
+  // only when nothing substantive is left — i.e. the model genuinely refused.
+  const cleaned = raw
+    // Small models sometimes wrap output in markdown code fences (```json …```)
+    // despite being told not to; strip balanced and dangling fences and any
+    // stray backticks so the answer is plain prose.
+    .replace(/```[a-z]*\r?\n?[\s\S]*?```/gi, " ")
+    .replace(/```[a-z]*/gi, " ")
+    .replace(/`+/g, " ")
+    .replace(/([0-9])([A-Z])/g, "$1 $2")
+    .replace(/NOT[_ ]?IN[_ ]?CONTEXT/gi, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  if (!cleaned) {
     return { answer: DECLINE, confident: false, citations: orderedCitations(hits), hits };
   }
 
-  const verified = await verifyGrounding(raw, contextTexts);
+  const verified = await verifyGrounding(cleaned, contextTexts);
   if (!verified) {
     return { answer: DECLINE, confident: false, citations: orderedCitations(hits), hits };
   }
