@@ -333,9 +333,14 @@ same context — unsupported sentences are dropped. To stay solid with small loc
 composer hands the model the **whole retrieved chunk** (not a truncated half) and **sanitises**
 the raw output before grounding — de-gluing run-together tokens (`5938TCP` → `5938 TCP`),
 stripping stray `NOT_IN_CONTEXT` markers and markdown code fences, and collapsing looped repeats —
-so a correct answer is never thrown away over a formatting artifact. If nothing is grounded the
-command declines honestly (`Confident: no`) instead of guessing, and the cited `Sources:` always
-come from the real retrieved pages. The agents' `tw-official-docs` tool stays extractive
+so a correct answer is never thrown away over a formatting artifact. The context is also stripped
+of the recurring **marketing/navigation footer** (the site-wide "TeamViewer ONE — Key
+integrations: Microsoft Intune, ServiceNow, …" promo block that ~66% of KB pages carry, plus
+footer-only chunks are dropped) so a small model can't paraphrase boilerplate and unrelated
+footer-bearing pages can't leak into `Sources:`. If nothing is grounded the
+command declines honestly (`Confident: no`) instead of guessing, and the cited `Sources:` come
+**only from the chunks that actually grounded a verified sentence** — not every retrieved page.
+The agents' `tw-official-docs` tool stays extractive
 ([src/mastra/tools/knowledgeTool.ts](src/mastra/tools/knowledgeTool.ts)) to avoid agent→tool→agent
 recursion.
 

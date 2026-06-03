@@ -695,7 +695,7 @@ const PROMO_FOOTER_MARKERS: RegExp[] = [
 ];
 
 /** Cut the recurring marketing/navigation footer (see PROMO_FOOTER_MARKERS). */
-function stripPromoFooter(text: string): string {
+export function stripPromoFooter(text: string): string {
   let cut = text.length;
   for (const re of PROMO_FOOTER_MARKERS) {
     const m = re.exec(text);
@@ -1198,7 +1198,7 @@ function normalizeForDedup(text: string): string {
  * returns a "404 page not found" body). These embed and keyword-match like any
  * other passage, so without an explicit guard they leak into answers as noise.
  */
-function isJunkChunk(text: string): boolean {
+export function isJunkChunk(text: string): boolean {
   if (
     /404 page not found|page not found|page (?:could not|couldn'?t) be found|the page you (?:are|were) looking for/i.test(
       text

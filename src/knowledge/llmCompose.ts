@@ -5,6 +5,8 @@ import {
   embedTexts,
   cosineSimilarity,
   bestSourceFor,
+  stripPromoFooter,
+  isJunkChunk,
   type KnowledgeAnswer,
   type KnowledgeHit
 } from "./teamviewerDocs.js";
@@ -55,10 +57,19 @@ function splitSentences(text: string): string[] {
     .filter((s) => s.length > 0);
 }
 
-/** Anchor source first, then any other source actually retrieved — never invented. */
-function orderedCitations(hits: KnowledgeHit[]): string[] {
-  if (hits.length === 0) return [];
-  return Array.from(new Set([hits[0].source, ...hits.map((h) => h.source)])).slice(0, 3);
+/**
+ * Build citations from ONLY the context hits that actually grounded the
+ * answer. Previously we cited every retrieved hit (sliced to 3), so passages
+ * the model never used — e.g. an unrelated "which ports" article surfacing on a
+ * "What is TeamViewer ONE?" query — leaked into Sources. We now pass the
+ * specific hits whose text supported a verified sentence; order is preserved
+ * and duplicate sources collapse. Falls back to the top hit only when nothing
+ * grounded (so Sources is never empty on a confident answer).
+ */
+function orderedCitations(groundedHits: KnowledgeHit[], allHits: KnowledgeHit[]): string[] {
+  const source = groundedHits.length > 0 ? groundedHits : allHits.slice(0, 1);
+  if (source.length === 0) return [];
+  return Array.from(new Set(source.map((h) => h.source))).slice(0, 3);
 }
 
 /**
@@ -85,13 +96,29 @@ function collapseLoopedTail(text: string): string {
  * model produced that does not align with a real chunk is dropped. It is NOT a
  * fallback to extractive text — unsupported content is simply removed.
  */
-async function verifyGrounding(answer: string, contextTexts: string[]): Promise<string> {
+async function verifyGrounding(
+  answer: string,
+  contextTexts: string[]
+): Promise<{ text: string; groundedIdx: Set<number> }> {
+  const empty = { text: "", groundedIdx: new Set<number>() };
   const sentences = splitSentences(answer);
-  if (sentences.length === 0 || contextTexts.length === 0) return "";
+  if (sentences.length === 0 || contextTexts.length === 0) return empty;
   const { vectors } = await embedTexts([...sentences, ...contextTexts]);
   const sentVecs = vectors.slice(0, sentences.length);
   const ctxVecs = vectors.slice(sentences.length);
-  const kept = sentences.filter((_, i) => ctxVecs.some((cv) => cosineSimilarity(sentVecs[i], cv) >= GROUND_MIN));
+  // Track which context chunks actually supported a kept sentence so callers
+  // can cite ONLY those sources (not every retrieved hit).
+  const groundedIdx = new Set<number>();
+  const kept = sentences.filter((_, i) => {
+    let supported = false;
+    ctxVecs.forEach((cv, ci) => {
+      if (cosineSimilarity(sentVecs[i], cv) >= GROUND_MIN) {
+        supported = true;
+        groundedIdx.add(ci);
+      }
+    });
+    return supported;
+  });
   // Small local models frequently loop, emitting the same sentence many times.
   // Drop near-identical repeats (case/space-insensitive) so the answer reads
   // once. Order is preserved; only later duplicates are removed.
@@ -102,7 +129,7 @@ async function verifyGrounding(answer: string, contextTexts: string[]): Promise<
     seen.add(key);
     return true;
   });
-  return collapseLoopedTail(deduped.join(" "));
+  return { text: collapseLoopedTail(deduped.join(" ")), groundedIdx };
 }
 
 /**
@@ -125,12 +152,24 @@ export async function answerGrounded(query: string): Promise<KnowledgeAnswer> {
   }
 
   const context = hits.slice(0, CONTEXT_HITS);
-  // Show the model the whole retrieved chunk (CONTEXT_CHARS defaults to a full
-  // ~1200-char passage). Grounding runs against these same texts, so citations
-  // stay honest; the cap only guards against a pathologically long chunk.
-  const contextTexts = context.map((h) => h.text.slice(0, CONTEXT_CHARS));
-  const contextBlock = context
-    .map((h, i) => `[${i + 1}] ${h.title ?? h.source}\n${contextTexts[i]}`)
+  // Build the CONTEXT the model reads (and grounds against) with the recurring
+  // marketing/navigation footer removed. ~66% of KB pages carry an identical
+  // "## TeamViewer ONE … Key integrations: Microsoft Intune, ServiceNow, …"
+  // promo block; left in, a small model paraphrases it and grounding then
+  // matches it across every footer-bearing page, so unrelated articles leaked
+  // into Sources. Stripping the footer (and dropping chunks that are pure
+  // footer) means the model only ever sees real article prose, so citations
+  // reflect the passages that actually answered the question.
+  const candidates = context
+    .map((h) => ({ hit: h, text: stripPromoFooter(h.text).slice(0, CONTEXT_CHARS).trim() }))
+    .filter((c) => c.text.length > 0 && !isJunkChunk(c.hit.text));
+  if (candidates.length === 0) {
+    return { answer: DECLINE, confident: false, citations: orderedCitations([], hits), hits };
+  }
+  const contextHits = candidates.map((c) => c.hit);
+  const contextTexts = candidates.map((c) => c.text);
+  const contextBlock = contextTexts
+    .map((t, i) => `[${i + 1}] ${contextHits[i].title ?? contextHits[i].source}\n${t}`)
     .join("\n\n");
   const prompt =
     `CONTEXT:\n${contextBlock}\n\n` +
@@ -171,13 +210,17 @@ export async function answerGrounded(query: string): Promise<KnowledgeAnswer> {
     .replace(/\s{2,}/g, " ")
     .trim();
   if (!cleaned) {
-    return { answer: DECLINE, confident: false, citations: orderedCitations(hits), hits };
+    return { answer: DECLINE, confident: false, citations: orderedCitations([], hits), hits };
   }
 
-  const verified = await verifyGrounding(cleaned, contextTexts);
+  const { text: verified, groundedIdx } = await verifyGrounding(cleaned, contextTexts);
   if (!verified) {
-    return { answer: DECLINE, confident: false, citations: orderedCitations(hits), hits };
+    return { answer: DECLINE, confident: false, citations: orderedCitations([], hits), hits };
   }
 
-  return { answer: verified, confident: true, citations: orderedCitations(hits), hits };
+  // Cite ONLY the context chunks that actually grounded a verified sentence, in
+  // their original retrieval order — so unrelated retrieved passages never leak
+  // into Sources.
+  const groundedHits = contextHits.filter((_, i) => groundedIdx.has(i));
+  return { answer: verified, confident: true, citations: orderedCitations(groundedHits, hits), hits };
 }
