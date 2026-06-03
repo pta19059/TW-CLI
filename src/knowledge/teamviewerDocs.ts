@@ -362,6 +362,22 @@ export function tokenize(text: string): string[] {
     .filter((t) => t.length >= 2 && !STOPWORDS.has(t));
 }
 
+/**
+ * Significant multi-word phrases in the raw query (e.g. "teamviewer one").
+ * Because "teamviewer" is a stopword, a product question like "What is
+ * TeamViewer ONE?" otherwise reduces to the single common word "one"; keeping
+ * the full brand+product phrase lets retrieval favour pages that actually
+ * describe that product over pages that merely use the word.
+ */
+export function queryPhrases(query: string): string[] {
+  const words = query.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  const phrases: string[] = [];
+  for (let i = 0; i < words.length - 1; i++) {
+    if (words[i] === "teamviewer") phrases.push(`teamviewer ${words[i + 1]}`);
+  }
+  return [...new Set(phrases)];
+}
+
 /** Remove scripts/styles/tags and collapse whitespace so text is searchable. */
 export function stripHtml(html: string): string {
   return html
@@ -650,6 +666,40 @@ async function enrichLocalIndex(chunks: IndexChunk[], model: string): Promise<vo
  * the [label](url) markup is removed — is essentially just a link, plus obvious
  * navigation boilerplate. Prose paragraphs (real sentences) are preserved.
  */
+// Markers for the recurring site-wide product/marketing footer that Jina
+// captures at the bottom of ~66% of KB pages (a product-promo grid plus
+// "Key integrations", "Core capabilities", "Gartner Report" and use-case
+// blocks). It is pure boilerplate, identical across pages, and floods semantic
+// search (e.g. the "## TeamViewer ONE — Get the full power…" promo made
+// hundreds of unrelated pages look like they answer "What is TeamViewer ONE?").
+// Used at retrieval time only — isJunkChunk drops chunks dominated by this
+// footer, and the product-phrase boost ignores it — so a chunk's real prose is
+// never truncated (cutting whole pages at index time over-trimmed legitimate
+// content). The footer always sits at the page bottom, so everything from the
+// first marker on is footer.
+const PROMO_FOOTER_MARKERS: RegExp[] = [
+  /Get the full power of TeamViewer,?\s*unified in one platform/i,
+  /Proactively manage and optimize your digital workplace/i,
+  /^#{1,6}\s*Key integrations\s*$/im,
+  /^#{1,6}\s*Core capabilities\s*$/im,
+  /^#{1,6}\s*Gartner Report/im,
+  /^#{1,6}\s*Popular use cases/im,
+  /^#{1,6}\s*Other use cases/im,
+  /^#{1,6}\s*By need\b/im,
+  /^#{1,6}\s*Real-time troubleshooting TeamViewer DEX/im,
+  /^#{1,6}\s*Connected worker TeamViewer Frontline/im
+];
+
+/** Cut the recurring marketing/navigation footer (see PROMO_FOOTER_MARKERS). */
+function stripPromoFooter(text: string): string {
+  let cut = text.length;
+  for (const re of PROMO_FOOTER_MARKERS) {
+    const m = re.exec(text);
+    if (m && m.index < cut) cut = m.index;
+  }
+  return cut < text.length ? text.slice(0, cut).trimEnd() : text;
+}
+
 export function denoiseMarkdown(text: string): string {
   const lines = text.replace(/\r/g, "").split("\n");
   const kept: string[] = [];
@@ -1000,6 +1050,7 @@ export async function refreshIndex(
 export async function retrieveLocal(query: string, limit = 5): Promise<KnowledgeHit[]> {
   const tokens = tokenize(query);
   if (tokens.length === 0) return [];
+  const phrases = queryPhrases(query);
 
   const stats = await lanceStore.indexStats();
   if (!stats.built || stats.chunks === 0) {
@@ -1035,11 +1086,20 @@ export async function retrieveLocal(query: string, limit = 5): Promise<Knowledge
 
   const scored = pool
     .filter((c) => !isJunkChunk(c.text))
-    .map((c) => ({
-      c,
-      kw: scoreText(tokens, `${c.title} ${c.text}`),
-      sem: cosineSimilarity(queryVec, c.embedding!)
-    }));
+    .map((c) => {
+      const hay = `${c.title} ${c.text}`;
+      let kw = scoreText(tokens, hay);
+      // Product-phrase boost. "teamviewer" is a stopword, so a query like
+      // "What is TeamViewer ONE?" collapses to the lone common word "one" and
+      // any page using that word competes on equal footing. Reward pages that
+      // mention the full product phrase ("teamviewer one") in their real body
+      // (footer promos excluded) so the actual product page wins decisively.
+      if (phrases.length) {
+        const body = stripPromoFooter(hay).toLowerCase();
+        for (const p of phrases) if (body.includes(p)) kw += 4;
+      }
+      return { c, kw, sem: cosineSimilarity(queryVec, c.embedding!) };
+    });
 
   // Azure-Search-style hybrid: fuse the keyword ranking and the vector ranking
   // with Reciprocal Rank Fusion over a generous candidate pool, then drop
@@ -1113,10 +1173,16 @@ function queryCoverage(queryTokens: string[], text: string): number {
  * statement headlines instead of a generic page that merely scores high on
  * cosine.
  */
-function hitRelevance(queryTokens: string[], h: KnowledgeHit): number {
-  const cov = queryCoverage(queryTokens, `${h.title ?? ""} ${h.text}`);
+function hitRelevance(queryTokens: string[], h: KnowledgeHit, phrases: string[] = []): number {
+  const body = `${h.title ?? ""} ${h.text}`;
+  const cov = queryCoverage(queryTokens, body);
   const factBonus = h.kind === "fact" && cov >= 0.5 ? 0.4 : 0;
-  return cov + 0.5 * (h.sem ?? 0) + factBonus;
+  // Decisive product-phrase bonus: a page whose real body (footer promos
+  // excluded) names the exact product asked about ("teamviewer one") must win
+  // over a page that merely shares the lone common word "one".
+  const phraseBonus =
+    phrases.length && phrases.some((p) => stripPromoFooter(body).toLowerCase().includes(p)) ? 1 : 0;
+  return cov + 0.5 * (h.sem ?? 0) + factBonus + phraseBonus;
 }
 
 function normalizeForDedup(text: string): string {
@@ -1129,9 +1195,18 @@ function normalizeForDedup(text: string): string {
  * other passage, so without an explicit guard they leak into answers as noise.
  */
 function isJunkChunk(text: string): boolean {
-  return /404 page not found|page not found|page (?:could not|couldn'?t) be found|the page you (?:are|were) looking for/i.test(
-    text
-  );
+  if (
+    /404 page not found|page not found|page (?:could not|couldn'?t) be found|the page you (?:are|were) looking for/i.test(
+      text
+    )
+  ) {
+    return true;
+  }
+  // Drop chunks dominated by the recurring marketing/navigation footer. This
+  // also filters footer chunks already stored before stripPromoFooter existed,
+  // so retrieval improves immediately without requiring a reindex.
+  const body = stripPromoFooter(text).trim();
+  return body.length < Math.max(40, text.trim().length * 0.4);
 }
 
 /** Drop near-identical passages, keeping the first (highest-ranked) occurrence. */
@@ -1310,6 +1385,7 @@ export async function answerFromKnowledge(
   // KB rather than answering from an off-topic page.
   const COVERAGE_MIN = 0.6;
   const SEM_MIN = 0.42;
+  const phrases = queryPhrases(query);
   const isConfident = (h: KnowledgeHit[]): boolean => {
     if (h.length === 0) return false;
     const top = h[0];
@@ -1321,7 +1397,10 @@ export async function answerFromKnowledge(
   // Rank the mixed pool by blended relevance (lexical coverage + semantic
   // similarity), which keeps doc and fact hits on a single comparable scale.
   const rerank = (pool: KnowledgeHit[]): KnowledgeHit[] =>
-    dedupeHits([...pool].sort((a, b) => hitRelevance(tokens, b) - hitRelevance(tokens, a))).slice(0, 5);
+    dedupeHits([...pool].sort((a, b) => hitRelevance(tokens, b, phrases) - hitRelevance(tokens, a, phrases))).slice(
+      0,
+      5
+    );
 
   const localHits = await retrieveLocal(query, 5);
   let hits = rerank([...localHits, ...searchKnowledge(query, 5)]);
