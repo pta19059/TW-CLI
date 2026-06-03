@@ -1186,7 +1186,19 @@ function hitRelevance(queryTokens: string[], h: KnowledgeHit, phrases: string[] 
   // over a page that merely shares the lone common word "one".
   const phraseBonus =
     phrases.length && phrases.some((p) => stripPromoFooter(body).toLowerCase().includes(p)) ? 1 : 0;
-  return cov + 0.5 * (h.sem ?? 0) + factBonus + phraseBonus;
+  // Title/URL-slug coverage boost. The TITLE and URL path encode an article's
+  // intent far more reliably than its body: a page slugged
+  // `.../install-teamviewer-classic-on-windows` is overwhelmingly more on-topic
+  // for "install Windows" than a page slugged
+  // `.../ibm-maas360-integration-installation-and-user-guide` that only happens
+  // to contain the word "installation". Slug separators and segment delimiters
+  // are flattened so tokenize() sees the slug words as ordinary tokens.
+  const titleHay = `${h.title ?? ""} ${h.source ?? ""}`.replace(/[-_/]+/g, " ");
+  const titleCov = queryCoverage(queryTokens, titleHay);
+  // Quadratic so a FULL-coverage title (every query token present) wins
+  // decisively, while a partial match still helps a little.
+  const titleBoost = titleCov * titleCov * 1.5;
+  return cov + 0.5 * (h.sem ?? 0) + titleBoost + factBonus + phraseBonus;
 }
 
 function normalizeForDedup(text: string): string {

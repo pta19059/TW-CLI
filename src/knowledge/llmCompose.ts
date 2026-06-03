@@ -24,15 +24,15 @@ const GROUND_MIN = Math.max(0, Math.min(1, Number(process.env.TWC_GROUND_MIN) ||
 
 /** How many retrieved hits are handed to the model as CONTEXT.
  *
- * Foundry Local runs small models on a local NPU, where *prompt processing*
- * (ingesting the CONTEXT) dominates latency far more than token generation. A
- * large grounded context can push a single `docs ask` into multiple minutes on
- * an NPU. On the CPU build (current default) prompt processing is far cheaper,
- * so we hand the model MORE grounded passages by default to maximise the chance
- * the answer is actually present — robustness over raw speed. Tunable via
- * TWC_CONTEXT_HITS. Retrieval and citations are unaffected; only what the model
- * has to read changes. */
-const CONTEXT_HITS = Math.max(1, Number(process.env.TWC_CONTEXT_HITS) || 5);
+ * Foundry Local on a 1.5B CPU build is dominated by *prompt processing*
+ * (ingesting the CONTEXT) far more than by token generation, so the cheapest
+ * speed win is a shorter prompt. With the title/URL-slug boost in
+ * teamviewerDocs.hitRelevance the most on-topic page is reliably rank #1, so 3
+ * grounded hits suffice for robustness without forcing the model to read
+ * unrelated boilerplate. Bump back up via TWC_CONTEXT_HITS for harder queries.
+ * Retrieval and citations are unaffected; only what the model has to read
+ * changes. */
+const CONTEXT_HITS = Math.max(1, Number(process.env.TWC_CONTEXT_HITS) || 3);
 
 /** Per-hit character budget for the text shown to the model. Chunks are built
  * at ~1200 chars (a single coherent passage), so the default now shows the
@@ -106,18 +106,28 @@ async function verifyGrounding(
   const { vectors } = await embedTexts([...sentences, ...contextTexts]);
   const sentVecs = vectors.slice(0, sentences.length);
   const ctxVecs = vectors.slice(sentences.length);
-  // Track which context chunks actually supported a kept sentence so callers
-  // can cite ONLY those sources (not every retrieved hit).
+  // For each kept sentence record ONLY the single best-matching context chunk
+  // (argmax cosine), not every chunk above the threshold. Short generic answers
+  // ("install... by going to teamviewer.com/download") otherwise loosely match
+  // every chunk of a similar-topic page set, so Sources ballooned with
+  // unrelated pages. Argmax means each sentence cites the one passage that
+  // actually most supports it.
   const groundedIdx = new Set<number>();
   const kept = sentences.filter((_, i) => {
-    let supported = false;
+    let bestSim = -1;
+    let bestIdx = -1;
     ctxVecs.forEach((cv, ci) => {
-      if (cosineSimilarity(sentVecs[i], cv) >= GROUND_MIN) {
-        supported = true;
-        groundedIdx.add(ci);
+      const sim = cosineSimilarity(sentVecs[i], cv);
+      if (sim > bestSim) {
+        bestSim = sim;
+        bestIdx = ci;
       }
     });
-    return supported;
+    if (bestSim >= GROUND_MIN && bestIdx >= 0) {
+      groundedIdx.add(bestIdx);
+      return true;
+    }
+    return false;
   });
   // Small local models frequently loop, emitting the same sentence many times.
   // Drop near-identical repeats (case/space-insensitive) so the answer reads
@@ -202,7 +212,12 @@ export async function answerGrounded(query: string): Promise<KnowledgeAnswer> {
   dbg(`prompt built: ${prompt.length} chars, ${contextTexts.length} chunks`);
   const llmStart = Date.now();
   const out = await docsComposerAgent.stream(prompt, {
-    modelSettings: { maxOutputTokens: 256, temperature: 0 }
+    // 160 tokens is enough for the 1–4 sentence answers the composer is
+    // instructed to produce; a smaller cap meaningfully cuts wall-clock time on
+    // CPU builds (token generation dominates total latency) and prevents the
+    // small model from running away into a multi-minute NOT_IN_CONTEXT loop
+    // (each NOT_IN_CONTEXT marker is ~6 tokens — 256 cap = up to 40 of them).
+    modelSettings: { maxOutputTokens: 160, temperature: 0 }
   });
   const raw = ((await out.text) ?? "").trim();
   dbg(`LLM call done in ${Date.now() - llmStart}ms — raw output:`, raw);
@@ -219,6 +234,12 @@ export async function answerGrounded(query: string): Promise<KnowledgeAnswer> {
     .replace(/```[a-z]*\r?\n?[\s\S]*?```/gi, " ")
     .replace(/```[a-z]*/gi, " ")
     .replace(/`+/g, " ")
+    // Strip markdown links the composer was told not to emit: `[label](url)`
+    // becomes just `url` (so URL answers like the Web API base URL stay
+    // visible), and a bare URL embedded as a label is left as the URL.
+    .replace(/\[([^\]]*?)\]\((https?:\/\/[^)\s]+)\)/g, (_m, label, url) =>
+      /^https?:\/\//i.test(label) ? url : `${label} (${url})`
+    )
     .replace(/([0-9])([A-Z])/g, "$1 $2")
     .replace(/NOT[_ ]?IN[_ ]?CONTEXT/gi, " ")
     .replace(/\s{2,}/g, " ")
