@@ -2,6 +2,7 @@
 import { bootstrap } from "./runtime/bootstrap.js";
 bootstrap();
 
+import type { Command } from "commander";
 import { buildCli } from "./cli.js";
 import { runRepl } from "./repl.js";
 import { runOneShot, resolveProductOrThrow } from "./oneShot.js";
@@ -40,25 +41,21 @@ function hasFlag(argv: string[], names: string[]): boolean {
   return argv.some((a) => names.includes(a) || names.some((n) => a.startsWith(`${n}=`)));
 }
 
-const KNOWN_COMMANDS = new Set([
-  "products",
-  "agents",
-  "debug",
-  "troubleshoot",
-  "probe",
-  "inspect-remote",
-  "jobs",
-  "doctor",
-  "config",
-  "models",
-  "docs",
-  "explain",
-  "help",
-  "--help",
-  "-h",
-  "--version",
-  "-V"
-]);
+// The set of recognised first tokens is derived from Commander itself so we
+// never have to hand-maintain this list when adding a new command. Anything
+// not registered as a Commander command falls through to the natural-language
+// troubleshoot path (mirrors `copilot "do something"`).
+const FALLBACK_FLAGS = new Set(["help", "--help", "-h", "--version", "-V"]);
+
+function isKnownCommand(token: string, cli: Command): boolean {
+  if (FALLBACK_FLAGS.has(token)) return true;
+  for (const cmd of cli.commands) {
+    if (cmd.name() === token) return true;
+    const aliases = cmd.aliases?.() ?? [];
+    if (aliases.includes(token)) return true;
+  }
+  return false;
+}
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
@@ -119,9 +116,10 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Fall back to Commander for all known subcommands.
-  if (KNOWN_COMMANDS.has(argv[0])) {
-    const cli = buildCli();
+  // Fall back to Commander for all known subcommands (list is derived from
+  // the Commander tree itself — see isKnownCommand above).
+  const cli = buildCli();
+  if (isKnownCommand(argv[0], cli)) {
     await cli.parseAsync(process.argv);
     return;
   }
