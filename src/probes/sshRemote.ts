@@ -42,18 +42,22 @@ export interface MacDiagnostics {
 export const MAC_INSPECTION_COMMANDS: { label: string; command: string }[] = [
   { label: "macOS version", command: "sw_vers" },
   { label: "Hostname & uptime", command: "hostname && uptime" },
-  { label: "Network interfaces (IPv4 only)", command: "ifconfig | awk '/inet / && $2 != \"127.0.0.1\"{print $1\" \"$2}'" },
+  { label: "Primary IPv4 address(es)", command: "for i in en0 en1 en2 en3 en4 en5; do a=$(/usr/sbin/ipconfig getifaddr $i 2>/dev/null); if [ -n \"$a\" ]; then echo \"$i $a\"; fi; done; r=$(/sbin/route -n get default 2>/dev/null | /usr/bin/awk '/interface:/{print $2}'); if [ -n \"$r\" ]; then echo \"default route via: $r\"; fi" },
   { label: "TeamViewer app version", command: "defaults read /Applications/TeamViewer.app/Contents/Info CFBundleShortVersionString 2>/dev/null || echo 'TeamViewer.app not found in /Applications'" },
-  { label: "TeamViewer daemon on port 5938", command: "sudo -n lsof -nP -iTCP:5938 -sTCP:LISTEN 2>/dev/null || lsof -nP -iTCP:5938 -sTCP:LISTEN 2>/dev/null || echo 'lsof returned nothing (port not in LISTEN or insufficient privileges)'" },
+  { label: "Local listeners on :5938 (informational \u2014 TV uses outbound, not inbound)", command: "sudo -n lsof -nP -iTCP:5938 -sTCP:LISTEN 2>/dev/null || lsof -nP -iTCP:5938 -sTCP:LISTEN 2>/dev/null || echo 'no local listener on :5938 (this is normal: TeamViewer is a client, not a server)'" },
   { label: "TeamViewer launchd jobs", command: "launchctl list 2>/dev/null | grep -i teamview || echo 'no launchd entries for teamviewer'" },
   { label: "TeamViewer running processes", command: "pgrep -lf -i teamviewer || echo 'no teamviewer processes running'" },
-  { label: "Latest TeamViewer logfile (last 40 lines)", command: "ls -t \"$HOME/Library/Logs/TeamViewer/\"TeamViewer*_Logfile*.log 2>/dev/null | head -1 | xargs -I{} tail -40 \"{}\" 2>/dev/null || echo 'no TeamViewer log files found'" },
+  { label: "Latest TeamViewer logfile (last 40 lines)", command: "latest=$(ls -t \"$HOME/Library/Logs/TeamViewer/\"TeamViewer*_Logfile*.log /Library/Logs/TeamViewer/TeamViewer*_Logfile*.log 2>/dev/null | head -1); if [ -n \"$latest\" ]; then echo \"== $latest\"; tail -40 \"$latest\"; else echo 'no TeamViewer log files found in ~/Library/Logs/TeamViewer/ or /Library/Logs/TeamViewer/'; fi" },
   { label: "Outbound reachability to TeamViewer cloud", command: "for h in router1.teamviewer.com router7.teamviewer.com master1.teamviewer.com; do /usr/bin/nc -z -G 3 $h 5938 && echo \"$h:5938 OPEN\" || echo \"$h:5938 FAIL\"; done" },
   { label: "Public IP (NAT-side)", command: "curl -fsS --max-time 5 https://api.ipify.org || echo 'public IP lookup failed'" }
 ];
 
 function buildSshArgs(opts: SshOptions, remoteCommand: string): string[] {
   const args: string[] = [
+    // -n: redirect stdin from /dev/null. Critical on Windows OpenSSH when
+    // launched via child_process: without it, ssh inherits Node's stdin and
+    // hangs until the per-command timeout fires.
+    "-n",
     "-o", "BatchMode=yes",
     "-o", "StrictHostKeyChecking=accept-new",
     "-o", "ConnectTimeout=5",
