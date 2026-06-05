@@ -60,6 +60,16 @@ async function resolveHost(host: string): Promise<DnsResult> {
   }
 }
 
+/** Public DNS A-record probe (used by `twc probe` CLI). */
+export async function probeDnsHost(host: string): Promise<DnsResult> {
+  return resolveHost(host);
+}
+
+/** Public TCP connect probe (used by `twc probe` CLI). */
+export async function probeTcpHost(host: string, port: number, timeoutMs?: number): Promise<TcpResult> {
+  return tcpProbe(host, port, timeoutMs);
+}
+
 function tcpProbe(host: string, port: number, timeoutMs = PROBE_TIMEOUT_MS): Promise<TcpResult> {
   return new Promise((resolve) => {
     const t0 = Date.now();

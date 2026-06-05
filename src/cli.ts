@@ -10,6 +10,7 @@ import { inferIssueBuckets, selectAgents } from "./agents/routing.js";
 import { renderReportMarkdown } from "./agents/formatReport.js";
 import { explainReport } from "./agents/explain.js";
 import { discoverFoundryEndpoint, probeFoundryLocal } from "./mastra/foundryLocal.js";
+import { probeDnsHost, probeTcpHost } from "./probes/connectivity.js";
 import { MODEL_CATALOG, findEntry, resolveModelId } from "./mastra/modelCatalog.js";
 import { getActiveModelId, setActiveModelId, setLastJobId, getLastJobId } from "./userConfig.js";
 import { invalidateModelCache } from "./mastra/agents/index.js";
@@ -195,6 +196,47 @@ export function buildCli(): Command {
     .description("Start a background troubleshooting task with Mastra agents")
     .action((product, options: { target: string; issue: string; context?: string; wait?: boolean }) => {
       enqueue("troubleshoot", product, options);
+    });
+
+  program
+    .command("probe <target>")
+    .option("--port <port>", "TCP port to probe", "5938")
+    .option("--timeout <ms>", "Per-check timeout in ms", "3000")
+    .option("--no-dns", "Skip DNS resolution (use when target is an IP)")
+    .description("Probe a host: DNS resolution + TCP connect (default port 5938 = TeamViewer)")
+    .action(async (target: string, options: { port: string; timeout: string; dns: boolean }) => {
+      const port = Number(options.port);
+      const timeoutMs = Number(options.timeout);
+      if (!Number.isFinite(port) || port < 1 || port > 65535) {
+        console.error(`Invalid port: ${options.port}`);
+        process.exit(2);
+      }
+      const isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(target);
+      console.log(`Target: ${target}  port=${port}  timeout=${timeoutMs}ms`);
+
+      if (options.dns && !isIp) {
+        const dnsResult = await probeDnsHost(target);
+        if (dnsResult.ok) {
+          console.log(`DNS  : OK   ${dnsResult.host} -> ${(dnsResult.addresses ?? []).join(", ")} (${dnsResult.ms}ms)`);
+        } else {
+          console.log(`DNS  : FAIL ${dnsResult.host} -> ${dnsResult.error} (${dnsResult.ms}ms)`);
+          process.exit(1);
+        }
+      } else if (isIp) {
+        console.log(`DNS  : skipped (target is an IPv4 literal)`);
+      } else {
+        console.log(`DNS  : skipped (--no-dns)`);
+      }
+
+      const tcpResult = await probeTcpHost(target, port, timeoutMs);
+      if (tcpResult.ok) {
+        console.log(`TCP  : OPEN ${tcpResult.host}:${tcpResult.port} (${tcpResult.ms}ms)`);
+        if (port === 5938) console.log("       -> TeamViewer daemon LISTENING (or NAT-forwarded)");
+        process.exit(0);
+      } else {
+        console.log(`TCP  : CLOSED/FILTERED ${tcpResult.host}:${tcpResult.port} -> ${tcpResult.error} (${tcpResult.ms}ms)`);
+        process.exit(1);
+      }
     });
 
   const jobs = program.command("jobs").description("Inspect background tasks");

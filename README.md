@@ -53,6 +53,7 @@ The `twc` prefix is optional inside the interactive shell. Run `twc --help` or `
 | `twc agents plan --task <t> --issue "<text>"` | Show which agents would be selected (dry run) |
 | `twc debug <product> --target <v> --issue "<text>" [--context <c>] [--wait]` | Run a background **debug** job |
 | `twc troubleshoot <product> --target <v> --issue "<text>" [--context <c>] [--wait]` | Run a background **troubleshoot** job |
+| `twc probe <target> [--port N] [--timeout ms] [--no-dns]` | Raw DNS + TCP connect probe (default port 5938 = TeamViewer daemon). No LLM. |
 | `twc jobs list [--limit N]` | List recent background jobs |
 | `twc jobs show [jobId] [--json\|--markdown]` | Show a job report (no id = last queued job) |
 | `twc jobs logs [jobId] [--tail N]` | Tail a job's worker log (no id = last queued job) |
