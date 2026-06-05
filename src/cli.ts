@@ -11,6 +11,7 @@ import { renderReportMarkdown } from "./agents/formatReport.js";
 import { explainReport } from "./agents/explain.js";
 import { discoverFoundryEndpoint, probeFoundryLocal } from "./mastra/foundryLocal.js";
 import { probeDnsHost, probeTcpHost } from "./probes/connectivity.js";
+import { runMacInspection, renderMacDiagnostics } from "./probes/sshRemote.js";
 import { MODEL_CATALOG, findEntry, resolveModelId } from "./mastra/modelCatalog.js";
 import { getActiveModelId, setActiveModelId, setLastJobId, getLastJobId } from "./userConfig.js";
 import { invalidateModelCache } from "./mastra/agents/index.js";
@@ -237,6 +238,36 @@ export function buildCli(): Command {
         console.log(`TCP  : CLOSED/FILTERED ${tcpResult.host}:${tcpResult.port} -> ${tcpResult.error} (${tcpResult.ms}ms)`);
         process.exit(1);
       }
+    });
+
+  program
+    .command("inspect-remote <target>")
+    .requiredOption("--user <user>", "SSH user on the remote host")
+    .option("--port <port>", "SSH port", "22")
+    .option("--key <path>", "Path to a private key file (default: ssh-agent / ~/.ssh/id_*)")
+    .option("--timeout <ms>", "Per-command timeout in ms", "8000")
+    .option("--json", "Emit raw JSON instead of the rendered report")
+    .description("SSH into a remote macOS host and collect TeamViewer diagnostics (read-only).")
+    .action(async (target: string, options: { user: string; port: string; key?: string; timeout: string; json?: boolean }) => {
+      const port = Number(options.port);
+      const timeoutMs = Number(options.timeout);
+      if (!Number.isFinite(port) || port < 1 || port > 65535) {
+        console.error(`Invalid SSH port: ${options.port}`);
+        process.exit(2);
+      }
+      const diag = await runMacInspection({
+        host: target,
+        user: options.user,
+        port,
+        identity: options.key,
+        timeoutMs
+      });
+      if (options.json) {
+        console.log(JSON.stringify(diag, null, 2));
+      } else {
+        console.log(renderMacDiagnostics(diag));
+      }
+      process.exit(diag.reachableSsh ? 0 : 1);
     });
 
   const jobs = program.command("jobs").description("Inspect background tasks");

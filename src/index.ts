@@ -46,6 +46,7 @@ const KNOWN_COMMANDS = new Set([
   "debug",
   "troubleshoot",
   "probe",
+  "inspect-remote",
   "jobs",
   "doctor",
   "config",
