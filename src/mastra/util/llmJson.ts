@@ -1,4 +1,4 @@
-import { z, ZodSchema } from "zod";
+import { z } from "zod";
 
 /**
  * Tolerant JSON extraction from LLM text output.
@@ -40,7 +40,7 @@ export interface GenerateLike {
 }
 
 export interface ParseOptions<T> {
-  schema: ZodSchema<T>;
+  schema: z.ZodType<T, z.ZodTypeDef, any>;
   retries?: number;
   /**
    * Optional safety net. When provided, it is returned if every LLM attempt

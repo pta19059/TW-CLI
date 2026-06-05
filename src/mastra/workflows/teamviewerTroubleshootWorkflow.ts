@@ -45,7 +45,10 @@ const rootCauseSchema = z.object({
 
 const actionSchema = z.object({
   step: z.string(),
-  risk: z.enum(["low", "medium", "high"]),
+  risk: z
+    .string()
+    .transform((s) => s.trim().toLowerCase())
+    .pipe(z.enum(["low", "medium", "high"])),
   rollback: z.string()
 });
 
