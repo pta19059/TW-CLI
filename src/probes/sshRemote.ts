@@ -128,11 +128,35 @@ export function renderMacDiagnostics(diag: MacDiagnostics): string {
     lines.push("Reachability probe failed:");
     if (reach.stderr) lines.push(`  stderr: ${reach.stderr.split("\n").slice(0, 3).join(" | ")}`);
     lines.push(`  exitCode: ${reach.exitCode}`);
+
+    // Diagnose the most common silent-failure modes for end users.
+    const stderrL = (reach.stderr ?? "").toLowerCase();
+    const likelyKeyMissing =
+      reach.exitCode === null ||
+      reach.exitCode === 255 ||
+      stderrL.includes("permission denied") ||
+      stderrL.includes("publickey") ||
+      stderrL.includes("batchmode");
+    const likelyHostKey = stderrL.includes("host key verification failed");
+    const likelyTimeout = stderrL.includes("timed out") || stderrL.includes("connection timed out");
+
     lines.push("");
-    lines.push("Hints:");
-    lines.push("  - Enable Remote Login on the Mac: System Settings -> General -> Sharing -> Remote Login.");
-    lines.push("  - Copy your public key: ssh-copy-id <user>@<host> (or append id_ed25519.pub to ~/.ssh/authorized_keys).");
-    lines.push("  - Confirm: ssh -o BatchMode=yes <user>@<host> echo ok");
+    lines.push("Most likely cause:");
+    if (likelyHostKey) {
+      lines.push("  Stale host key — the Mac's SSH identity changed (reinstall / new IP).");
+      lines.push(`  Fix: ssh-keygen -R ${diag.host}`);
+    } else if (likelyTimeout) {
+      lines.push("  Network timeout — host unreachable or sshd not listening.");
+      lines.push(`  Fix: twc probe ${diag.host} --port 22  (expect TCP : OPEN)`);
+    } else if (likelyKeyMissing) {
+      lines.push("  Public-key authentication is not set up (BatchMode never prompts for a password).");
+      lines.push("  Fix in 3 steps from PowerShell (not from the twc REPL):");
+      lines.push("    1) if (-not (Test-Path \"$env:USERPROFILE\\.ssh\\id_ed25519\")) { ssh-keygen -t ed25519 -N '\"\"' -f \"$env:USERPROFILE\\.ssh\\id_ed25519\" }");
+      lines.push(`    2) Get-Content "$env:USERPROFILE\\.ssh\\id_ed25519.pub" | ssh ${diag.user}@${diag.host} "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo OK"`);
+      lines.push(`    3) ssh -o BatchMode=yes ${diag.user}@${diag.host} "echo ok"   # must print only 'ok'`);
+    } else {
+      lines.push("  Unexpected error — inspect the stderr above and confirm sshd is reachable.");
+    }
     return lines.join("\n");
   }
   lines.push("");
