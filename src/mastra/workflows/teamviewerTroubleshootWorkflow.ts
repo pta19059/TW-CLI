@@ -25,7 +25,7 @@ import {
   runLogIntelligenceAnalysis
 } from "../tools/specialistTools.js";
 import { sanitizePromptInput } from "../util/sanitize.js";
-import { groundingFacts, type DocTopic } from "../../knowledge/teamviewerDocs.js";
+import { groundingFacts, retrieveKnowledgeHits, type DocTopic, type KnowledgeHit } from "../../knowledge/teamviewerDocs.js";
 import { generateStructured } from "../util/llmJson.js";
 
 const inputSchema = z.object({
@@ -241,15 +241,38 @@ function buildSpecialistStep(def: SpecialistDef) {
       const referenceLine =
         facts.length > 0 ? `Official references (verified): ${facts.join(" | ")}\n` : "";
 
+      // KB-grounded anchor passages from the LanceDB hybrid retriever.
+      // Build a focused query from the issue + specialty topic so each
+      // specialist gets passages tuned to its slice (connectivity / auth /
+      // endpoint / logs), then inject the top-3 as ANCHOR snippets in the
+      // prompt. Failure here is non-fatal — retrieval may be offline or empty
+      // (no index yet) and the specialist still has groundingFacts + baseline.
+      let kbAnchors = "";
+      try {
+        const kbQuery = `${def.topic} ${issue}`.slice(0, 240);
+        const { hits } = await retrieveKnowledgeHits(kbQuery);
+        const top = hits.slice(0, 3).map((h: KnowledgeHit) => {
+          const snippet = h.text.replace(/\s+/g, " ").trim().slice(0, 220);
+          const label = h.title ? `${h.title}` : h.source;
+          return `- [${label}] ${snippet}`;
+        });
+        if (top.length > 0) {
+          kbAnchors = `KB anchors (use these to ground hypotheses/actions; cite the bracketed label inline if you reuse a passage):\n${top.join("\n")}\n`;
+        }
+      } catch { /* retrieval optional */ }
+
       const prompt =
         `You are the TeamViewer ${def.key} specialist. Focus exclusively on ${def.topic}.\n` +
         `Issue: ${issue}\n` +
         `Context: ${context || "none"}\n` +
         referenceLine +
+        kbAnchors +
         `Baseline evidence: ${baseline.evidence.join(" | ")}\n` +
         `Baseline root cause: ${baseline.rootCauses.map((r) => r.title).join(" | ")}\n\n` +
         "Add up to 3 prioritized hypotheses, up to 2 additional root causes (score 0.0-1.0), " +
-        "and up to 3 actions (risk: low|medium|high, with rollback). Stay strictly within your specialty.\n" +
+        "and up to 3 actions (risk: low|medium|high, with rollback). Stay strictly within your specialty. " +
+        "Prefer hypotheses/actions that are SUPPORTED by the KB anchors above. " +
+        "Do NOT contradict the baseline evidence (e.g. do not suggest opening a port that the baseline already proved reachable).\n" +
         'Reply ONLY with JSON: {"hypotheses":["..."],"rootCauses":[{"title":"...","score":0.7,"rationale":"..."}],"actions":[{"step":"...","risk":"low","rollback":"..."}]}';
 
       type Enrichment = z.infer<typeof enrichmentSchema>;

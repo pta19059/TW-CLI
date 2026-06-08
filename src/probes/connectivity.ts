@@ -43,6 +43,9 @@ export interface HttpResult {
   ms?: number;
   error?: string;
   bestEffort?: boolean;
+  /** True when the server is reachable but TLS validation failed (cert/CA/clock).
+   *  HTTPS itself is up at the network layer — NOT a firewall/connectivity issue. */
+  tlsValidationFailed?: boolean;
 }
 
 export interface ConnectivityReport {
@@ -153,14 +156,56 @@ async function remoteTcpProbe(ctx: ExecutionContext, host: string, port: number,
 async function remoteHttpsProbe(ctx: ExecutionContext, url: string, timeoutMs = PROBE_TIMEOUT_MS): Promise<HttpResult> {
   const t0 = Date.now();
   const safe = url.replace(/['"`$\\]/g, "");
-  // `-o /dev/null` suppresses body, `-w "%{http_code}"` prints just the status.
-  const cmd = `curl -sS -o /dev/null -w "%{http_code}" --max-time ${Math.ceil(timeoutMs / 1000)} '${safe}' 2>&1 || echo 000`;
+  // Run curl with explicit exit-code capture so we can tell apart:
+  //   exit 0     → got an HTTP code (handle as before)
+  //   exit 60/35 → TLS validation failed (cert/CA/clock) — server IS reachable
+  //   anything else → real connectivity failure (DNS, timeout, refused)
+  // Bundling stdout+stderr behind a sentinel keeps the parse robust across shells.
+  const sec = Math.ceil(timeoutMs / 1000);
+  const cmd = `out=$(curl -sS -o /dev/null -w "%{http_code}" --max-time ${sec} '${safe}' 2>&1); rc=$?; printf "__TWC_RC__:%s\\n__TWC_OUT__:%s\\n" "$rc" "$out"`;
   const r = await ctx.runShell(cmd, { timeoutMs: timeoutMs + 1500 });
-  const code = parseInt((r.stdout || "").trim().slice(-3), 10);
-  if (!isNaN(code) && code > 0) {
-    return { url, ok: code > 0 && code < 600, status: code, ms: Date.now() - t0 };
+  const combined = (r.stdout || "") + (r.stderr || "");
+  const rcMatch = combined.match(/__TWC_RC__:(\d+)/);
+  const outMatch = combined.match(/__TWC_OUT__:([\s\S]*)$/);
+  const rc = rcMatch ? parseInt(rcMatch[1], 10) : NaN;
+  const out = (outMatch ? outMatch[1] : combined).trim();
+  if (rc === 0) {
+    const code = parseInt(out.slice(-3), 10);
+    if (!isNaN(code) && code > 0) {
+      return { url, ok: code > 0 && code < 600, status: code, ms: Date.now() - t0 };
+    }
   }
-  return { url, ok: false, error: (r.stdout || r.stderr || "curl failed").trim().slice(0, 160), ms: Date.now() - t0 };
+  // curl(60) = SSL_PEER_CERTIFICATE; curl(35) = SSL_CONNECT_ERROR; curl(51) = peer cert mismatch.
+  if (rc === 60 || rc === 35 || rc === 51) {
+    // Confirm with -k: if the server returns ANY HTTP code, it's purely a TLS
+    // verification problem (server reachable, cert chain not trusted). The user
+    // gets a clear, actionable message instead of a scary "failed".
+    try {
+      const insecure = await ctx.runShell(
+        `curl -ksS -o /dev/null -w "%{http_code}" --max-time ${sec} '${safe}' 2>&1 || echo 000`,
+        { timeoutMs: timeoutMs + 1500 }
+      );
+      const codeK = parseInt((insecure.stdout || "").trim().slice(-3), 10);
+      if (!isNaN(codeK) && codeK > 0) {
+        return {
+          url,
+          ok: false,
+          status: codeK,
+          tlsValidationFailed: true,
+          error: `TLS validation failed (server reachable, HTTP ${codeK} with -k). Likely outdated CA bundle on this host (macOS Monterey ships with an old root store).`,
+          ms: Date.now() - t0
+        };
+      }
+    } catch { /* fall through to plain failure */ }
+    return {
+      url,
+      ok: false,
+      tlsValidationFailed: true,
+      error: `TLS validation failed (curl exit ${rc}) — outdated CA bundle / clock skew on host.`,
+      ms: Date.now() - t0
+    };
+  }
+  return { url, ok: false, error: (out || "curl failed").slice(0, 160), ms: Date.now() - t0 };
 }
 
 // ───────────────────────── Public single-shot probes (used by `twc probe`) ─────────────────────────

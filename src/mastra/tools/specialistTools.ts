@@ -93,14 +93,38 @@ export function fromConnectivity(report: ConnectivityReport, target: string): Sp
   }
 
   evidence.push(
-    `HTTPS webapi probe: ${report.https.ok ? `HTTP ${report.https.status} in ${report.https.ms}ms` : `failed (${report.https.error})`}`
+    `HTTPS webapi probe: ${
+      report.https.ok
+        ? `HTTP ${report.https.status} in ${report.https.ms}ms`
+        : report.https.tlsValidationFailed
+          ? `reachable but TLS validation failed (${report.https.error})`
+          : `failed (${report.https.error})`
+    }`
   );
   if (!report.https.ok) {
-    rootCauses.push({
-      title: "TeamViewer Web API unreachable over HTTPS",
-      score: 0.7,
-      rationale: report.https.error ?? `HTTP ${report.https.status}`
-    });
+    if (report.https.tlsValidationFailed) {
+      // Server IS reachable — NOT a connectivity / firewall issue. Distinct
+      // root cause + actionable remediation. Score lower than a true
+      // unreachable since traffic still flows.
+      rootCauses.push({
+        title: "TeamViewer Web API reachable but TLS certificate validation failed",
+        score: 0.55,
+        rationale: report.https.error ?? "TLS handshake failed during certificate verification"
+      });
+      actions.push({
+        step:
+          "Update the host CA bundle / system trust store (macOS: install latest macOS updates; " +
+          "Linux: refresh ca-certificates; verify system clock). Do NOT change firewall rules — connectivity is fine.",
+        risk: "low",
+        rollback: "Revert to the previous ca-certificates package if the new bundle breaks an internal CA"
+      });
+    } else {
+      rootCauses.push({
+        title: "TeamViewer Web API unreachable over HTTPS",
+        score: 0.7,
+        rationale: report.https.error ?? `HTTP ${report.https.status}`
+      });
+    }
   }
 
   // ── Product-specific endpoint reachability (e.g. 443 to SaaS consoles) ──
