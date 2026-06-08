@@ -87,7 +87,6 @@ static void RunClickMode(string root)
 {
     DrawAnimatedIntro();
     PrintShellHeader();
-    StartTypingAnimation();
 
     // Ctrl+C must NOT close the window. Intercept it: it cancels the current
     // input line (or the running child command) and returns to the prompt.
@@ -137,15 +136,8 @@ static void RunClickMode(string root)
         if (trimmed.Equals("cls", StringComparison.OrdinalIgnoreCase) ||
             trimmed.Equals("clear", StringComparison.OrdinalIgnoreCase))
         {
-            // Clear and redraw the full intro screen (logo, figure, header).
-            // Serialize with the typing-animation timer so a tick that lands
-            // mid-redraw can't paint a ghost figure on the new buffer.
-            lock (FigureAnim.Lock)
-            {
-                FigureAnim.TopRow = -1;   // disable repaints until the new figure is captured
-                DrawAnimatedIntro();
-                PrintShellHeader();
-            }
+            DrawAnimatedIntro();
+            PrintShellHeader();
             continue;
         }
 
@@ -167,30 +159,14 @@ static void RunClickMode(string root)
             continue;
         }
 
-        // Pause the typing animation while a child process owns the console.
-        FigureAnim.Busy = true;
-        try
-        {
-            RunNode(root, args);
-        }
-        finally
-        {
-            FigureAnim.Busy = false;
-        }
+        RunNode(root, args);
         Console.WriteLine();
     }
-
-    StopTypingAnimation();
 }
 
 static void DrawAnimatedIntro()
 {
-    // Suppress the typing animation for the entire intro. The timer is set
-    // up once (in RunClickMode) and keeps firing across cls redraws, so we
-    // need this guard every time the intro re-runs.
-    FigureAnim.Busy = true;
-    try { DrawAnimatedIntroCore(); }
-    finally { FigureAnim.Busy = false; }
+    DrawAnimatedIntroCore();
 }
 
 static void DrawAnimatedIntroCore()
@@ -252,116 +228,16 @@ static void DrawAnimatedIntroCore()
     Console.WriteLine();
 }
 
-// Stylized person seated in front of a computer + keyboard. Drawn once at
-// intro time. Performs a single intro blink, then the periodic typing
-// animation (StartTypingAnimation) repaints the figure in place every 20s.
 // Stylized person seated in front of a computer + keyboard. Drawn ONCE at
-// intro time using only plain WriteLine — no cursor positioning, no blink —
-// so we cannot possibly produce a duplicate / phantom figure during the
-// intro. The periodic typing animation (StartTypingAnimation) repaints
-// the figure in place every 20s using absolute SetCursorPosition.
+// intro time using only plain WriteLine — no cursor positioning, no timers,
+// no animation. The figure renders as N consecutive lines in the natural
+// buffer position, exactly like any normal print, so it can never be
+// duplicated by a mid-write scroll or a stale absolute-row repaint.
 static void DrawSeatedFigure(bool useAnsi, string cCyan, string cReset)
 {
-    // Plain streaming draw. No cursor moves, no blink. If conhost scrolls
-    // mid-draw, that's fine — the whole figure scrolls together.
     foreach (var line in FigureAnim.Idle)
     {
         Console.WriteLine($"{cCyan}{line}{cReset}");
-    }
-
-    // Record TopRow ONLY for the typing-animation timer. The cursor is on
-    // the line below the figure's last row, so TopRow = CursorTop - height.
-    // If this happens to be wrong (e.g. buffer wrap), the timer will simply
-    // skip ticks (its off-screen guard catches it) — it CANNOT produce a
-    // duplicate, because the painter only ever overwrites N consecutive rows
-    // starting at TopRow, and never streams new lines.
-    FigureAnim.TopRow = Console.CursorTop - FigureAnim.Idle.Length;
-    FigureAnim.LeftCol = 0;
-    FigureAnim.UseAnsi = useAnsi;
-    FigureAnim.Cyan = cCyan;
-    FigureAnim.Reset = cReset;
-}
-
-// Paint every row of the given frame at the figure's absolute top row.
-// Used ONLY by the typing-animation timer (not by the intro). Saves +
-// restores the caller's cursor so the REPL prompt continues from the
-// right buffer position after the repaint.
-static void PaintFigureAbsolute(string[] frame)
-{
-    if (FigureAnim.TopRow < 0) return;
-    int saveTop = Console.CursorTop;
-    int saveLeft = Console.CursorLeft;
-    try
-    {
-        int winTop = Console.WindowTop;
-        int winBot = winTop + Console.WindowHeight - 1;
-        for (int i = 0; i < frame.Length; i++)
-        {
-            int row = FigureAnim.TopRow + i;
-            if (row < winTop || row > winBot) continue;
-            Console.SetCursorPosition(FigureAnim.LeftCol, row);
-            Console.Write("\u001b[2K");
-            Console.Write($"{FigureAnim.Cyan}{frame[i]}{FigureAnim.Reset}");
-        }
-    }
-    catch { /* resize / out-of-range → skip */ }
-    finally
-    {
-        try { Console.SetCursorPosition(saveLeft, saveTop); } catch { }
-    }
-}
-
-// Start a background timer that, every 20 seconds, briefly animates the
-// seated figure so it looks like it's typing on its keyboard. The animation
-// runs for ~600ms, then the idle pose is restored. The user's prompt cursor
-// is saved (ESC[s) and restored (ESC[u) around the repaint.
-static void StartTypingAnimation()
-{
-    if (FigureAnim.Timer != null) return;
-    if (!FigureAnim.UseAnsi) return;        // no TTY → no animation
-    FigureAnim.Enabled = true;
-    FigureAnim.Timer = new System.Threading.Timer(
-        _ => RunTypingTick(),
-        null,
-        TimeSpan.FromSeconds(20),
-        TimeSpan.FromSeconds(20));
-}
-
-static void StopTypingAnimation()
-{
-    FigureAnim.Enabled = false;
-    FigureAnim.Timer?.Dispose();
-    FigureAnim.Timer = null;
-}
-
-static void RunTypingTick()
-{
-    if (!FigureAnim.Enabled || FigureAnim.Busy) return;
-    if (FigureAnim.TopRow < 0) return;
-
-    lock (FigureAnim.Lock)
-    {
-        if (!FigureAnim.Enabled || FigureAnim.Busy) return;
-        try
-        {
-            int top = FigureAnim.TopRow;
-            int bot = top + FigureAnim.Idle.Length - 1;
-            int winTop = Console.WindowTop;
-            int winBot = winTop + Console.WindowHeight - 1;
-            if (top < winTop || bot > winBot) return;
-
-            for (int i = 0; i < 4; i++)
-            {
-                if (!FigureAnim.Enabled || FigureAnim.Busy) break;
-                PaintFigureAbsolute(FigureAnim.Typing[i % FigureAnim.Typing.Length]);
-                Thread.Sleep(150);
-            }
-            PaintFigureAbsolute(FigureAnim.Idle);
-        }
-        catch
-        {
-            // Any console resize / position error → just skip this tick.
-        }
     }
 }
 
@@ -421,15 +297,11 @@ catch (Exception ex)
     Environment.Exit(1);
 }
 
-// Mutable state + ASCII frames for the seated-at-computer figure that types
-// every 20s. Kept in a dedicated static class so the timer callback (which
-// runs on the threadpool) can reach the same fields the main REPL writes.
+// ASCII frames for the seated-at-computer figure. Kept in a dedicated
+// static class so the data lives near the rendering code.
 static class FigureAnim
 {
-    // Person at desk + monitor + keyboard. All frames MUST share the same
-    // line count and column width so SetCursorPosition + ESC[2K overwrites
-    // cleanly without leaving stray characters from the previous frame.
-    // Width = 36 cols, height = 8 rows.
+    // Person at desk + monitor + keyboard. Width = 36 cols, height = 8 rows.
     public static readonly string[] Idle = new[]
     {
         "    .---.       .-----------.      ",
@@ -441,40 +313,4 @@ static class FigureAnim
         "     | |          .---'---.        ",
         "    /   \\       [_=_=_=_=_=_]      "
     };
-
-    public static readonly string[][] Typing = new[]
-    {
-        new[]   // left hand on keys, screen cursor on
-        {
-            "    .---.       .-----------.      ",
-            "   ( o o )      |  _______  |      ",
-            "    \\   /       | |       | |      ",
-            "   __| |__      | | twc>_ | |      ",
-            "     | |        | |_______| |      ",
-            "   _/| |\\       '-----+-----'      ",
-            "     | |          .---'---.        ",
-            "    /   \\       [#_=_=_=_=_]      "
-        },
-        new[]   // right hand on keys, screen cursor off
-        {
-            "    .---.       .-----------.      ",
-            "   ( o o )      |  _______  |      ",
-            "    \\   /       | |       | |      ",
-            "   __| |__      | | twc>  | |      ",
-            "     | |        | |_______| |      ",
-            "    /| |\\_      '-----+-----'      ",
-            "     | |          .---'---.        ",
-            "    /   \\       [_=_=_=_=_#]      "
-        }
-    };
-
-    public static readonly object Lock = new();
-    public static int TopRow = -1;
-    public static int LeftCol = 0;
-    public static bool UseAnsi;
-    public static string Cyan = string.Empty;
-    public static string Reset = string.Empty;
-    public static volatile bool Busy = false;
-    public static volatile bool Enabled = false;
-    public static System.Threading.Timer? Timer;
 }
