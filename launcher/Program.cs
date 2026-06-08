@@ -87,6 +87,7 @@ static void RunClickMode(string root)
 {
     DrawAnimatedIntro();
     PrintShellHeader();
+    StartTypingAnimation();
 
     // Ctrl+C must NOT close the window. Intercept it: it cancels the current
     // input line (or the running child command) and returns to the prompt.
@@ -137,6 +138,8 @@ static void RunClickMode(string root)
             trimmed.Equals("clear", StringComparison.OrdinalIgnoreCase))
         {
             // Clear and redraw the full intro screen (logo, figure, header).
+            // The figure animation re-captures the new buffer row inside
+            // DrawSeatedFigure, so the running timer keeps targeting it.
             DrawAnimatedIntro();
             PrintShellHeader();
             continue;
@@ -160,9 +163,20 @@ static void RunClickMode(string root)
             continue;
         }
 
-        RunNode(root, args);
+        // Pause the typing animation while a child process owns the console.
+        FigureAnim.Busy = true;
+        try
+        {
+            RunNode(root, args);
+        }
+        finally
+        {
+            FigureAnim.Busy = false;
+        }
         Console.WriteLine();
     }
+
+    StopTypingAnimation();
 }
 
 static void DrawAnimatedIntro()
@@ -206,7 +220,7 @@ static void DrawAnimatedIntro()
     }
 
     Console.WriteLine();
-    DrawBlinkingFigure(useAnsi, cCyan, cReset);
+    DrawSeatedFigure(useAnsi, cCyan, cReset);
     Console.WriteLine();
     Console.WriteLine($"{cGreen}{tip}{cReset}");
     Console.WriteLine();
@@ -224,40 +238,122 @@ static void DrawAnimatedIntro()
     Console.WriteLine();
 }
 
-// Stylized little man (omino) that blinks its eyes exactly once.
-static void DrawBlinkingFigure(bool useAnsi, string cCyan, string cReset)
+// Stylized person seated in front of a computer + keyboard. Drawn once at
+// intro time. Performs a single intro blink, then the periodic typing
+// animation (StartTypingAnimation) repaints the figure in place every 20s.
+static void DrawSeatedFigure(bool useAnsi, string cCyan, string cReset)
 {
-    var figure = new[]
-    {
-        "    .---.",
-        "   ( o o )",
-        "    \\   /",
-        "   __| |__",
-        "     | |",
-        "    /   \\"
-    };
-    const int eyeIndex = 1;            // line that holds the eyes
-    const string eyesOpen = "   ( o o )";
-    const string eyesClosed = "   ( - - )";
+    // Capture the buffer row BEFORE writing the figure so the timer knows
+    // where to repaint. Also recaptured on every `cls` (which re-runs the
+    // intro), so the animation always targets the current copy.
+    int top = Console.CursorTop;
 
-    foreach (var line in figure)
+    foreach (var line in FigureAnim.Idle)
     {
         Console.WriteLine($"{cCyan}{line}{cReset}");
     }
 
-    // Without a real terminal we can't reposition the cursor, so leave the
-    // figure drawn with its eyes open and skip the animation.
+    FigureAnim.TopRow = top;
+    FigureAnim.LeftCol = 0;
+    FigureAnim.UseAnsi = useAnsi;
+    FigureAnim.Cyan = cCyan;
+    FigureAnim.Reset = cReset;
+
     if (!useAnsi)
     {
+        // No real terminal — skip the intro blink and any later repainting.
         return;
     }
 
-    var up = figure.Length - eyeIndex; // lines to move back up to the eyes
+    // One intro blink (preserves the original launcher beat).
+    const int eyeIndex = 1;
+    string eyesOpen = FigureAnim.Idle[eyeIndex];
+    string eyesClosed = eyesOpen.Replace("o o", "- -");
+    int up = FigureAnim.Idle.Length - eyeIndex;
 
-    Thread.Sleep(650);                 // eyes open
+    Thread.Sleep(650);
     Console.Write($"\u001b[{up}A\r\u001b[2K{cCyan}{eyesClosed}{cReset}\u001b[{up}B\r");
-    Thread.Sleep(150);                 // eyes shut (the single blink)
+    Thread.Sleep(150);
     Console.Write($"\u001b[{up}A\r\u001b[2K{cCyan}{eyesOpen}{cReset}\u001b[{up}B\r");
+}
+
+// Start a background timer that, every 20 seconds, briefly animates the
+// seated figure so it looks like it's typing on its keyboard. The animation
+// runs for ~600ms, then the idle pose is restored. The user's prompt cursor
+// is saved (ESC[s) and restored (ESC[u) around the repaint.
+static void StartTypingAnimation()
+{
+    if (FigureAnim.Timer != null) return;
+    if (!FigureAnim.UseAnsi) return;        // no TTY → no animation
+    FigureAnim.Enabled = true;
+    FigureAnim.Timer = new System.Threading.Timer(
+        _ => RunTypingTick(),
+        null,
+        TimeSpan.FromSeconds(20),
+        TimeSpan.FromSeconds(20));
+}
+
+static void StopTypingAnimation()
+{
+    FigureAnim.Enabled = false;
+    FigureAnim.Timer?.Dispose();
+    FigureAnim.Timer = null;
+}
+
+static void RunTypingTick()
+{
+    if (!FigureAnim.Enabled || FigureAnim.Busy) return;
+    if (FigureAnim.TopRow < 0) return;
+
+    lock (FigureAnim.Lock)
+    {
+        try
+        {
+            int top = FigureAnim.TopRow;
+            int bot = top + FigureAnim.Idle.Length - 1;
+            int winTop = Console.WindowTop;
+            int winBot = winTop + Console.WindowHeight - 1;
+
+            // Skip if the figure has scrolled out of the visible window —
+            // we never want to repaint somewhere the user can't see.
+            if (top < winTop || bot > winBot) return;
+
+            // Save the prompt cursor, animate, restore.
+            Console.Write("\u001b[s");
+            try
+            {
+                for (int i = 0; i < 4; i++)
+                {
+                    if (!FigureAnim.Enabled || FigureAnim.Busy) break;
+                    DrawFigureFrame(FigureAnim.Typing[i % FigureAnim.Typing.Length]);
+                    Thread.Sleep(150);
+                }
+                DrawFigureFrame(FigureAnim.Idle);
+            }
+            finally
+            {
+                Console.Write("\u001b[u");
+            }
+        }
+        catch
+        {
+            // Any console resize / position error → just skip this tick.
+        }
+    }
+}
+
+static void DrawFigureFrame(string[] lines)
+{
+    int top = FigureAnim.TopRow;
+    int left = FigureAnim.LeftCol;
+    for (int i = 0; i < lines.Length; i++)
+    {
+        Console.SetCursorPosition(left, top + i);
+        Console.Write("\u001b[2K");
+        Console.Write(FigureAnim.Cyan);
+        Console.Write(lines[i]);
+        Console.Write(FigureAnim.Reset);
+    }
 }
 
 static List<string> SplitArgs(string commandLine)
@@ -314,4 +410,55 @@ catch (Exception ex)
 {
     Console.Error.WriteLine($"twc launcher error: {ex.Message}");
     Environment.Exit(1);
+}
+
+// Mutable state + ASCII frames for the seated-at-computer figure that types
+// every 20s. Kept in a dedicated static class so the timer callback (which
+// runs on the threadpool) can reach the same fields the main REPL writes.
+static class FigureAnim
+{
+    // Person at desk + monitor + keyboard. All frames MUST share the same
+    // line count and column width so SetCursorPosition + ESC[2K overwrites
+    // cleanly without leaving stray characters from the previous frame.
+    public static readonly string[] Idle = new[]
+    {
+        "    .---.        _________  ",
+        "   ( o o )      |         | ",
+        "    \\   /       |  twc>   | ",
+        "   __| |__      |_________| ",
+        "     | |       _____________",
+        "    /| |\\      [_____________]"
+    };
+
+    public static readonly string[][] Typing = new[]
+    {
+        new[]   // left hand on keys, screen cursor on
+        {
+            "    .---.        _________  ",
+            "   ( o o )      |         | ",
+            "    \\   /       |  twc>_  | ",
+            "   __| |__      |_________| ",
+            "     | |       _____________",
+            "   _/| |\\      [_____________]"
+        },
+        new[]   // right hand on keys, screen cursor off
+        {
+            "    .---.        _________  ",
+            "   ( o o )      |         | ",
+            "    \\   /       |  twc>   | ",
+            "   __| |__      |_________| ",
+            "     | |       _____________",
+            "    /| |\\_     [_____________]"
+        }
+    };
+
+    public static readonly object Lock = new();
+    public static int TopRow = -1;
+    public static int LeftCol = 0;
+    public static bool UseAnsi;
+    public static string Cyan = string.Empty;
+    public static string Reset = string.Empty;
+    public static volatile bool Busy = false;
+    public static volatile bool Enabled = false;
+    public static System.Threading.Timer? Timer;
 }
