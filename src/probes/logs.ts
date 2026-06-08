@@ -51,7 +51,10 @@ function remoteLogRoots(os: RemoteOs): string[] {
   if (os === "macos") {
     return [
       "$HOME/Library/Logs/TeamViewer",
-      "/Library/Logs/TeamViewer"
+      "/Library/Logs/TeamViewer",
+      // Some TeamViewer 15 installs write under Application Support too.
+      "$HOME/Library/Application Support/TeamViewer/Logs",
+      "/Library/Application Support/TeamViewer/Logs"
     ];
   }
   if (os === "linux") {
@@ -178,6 +181,60 @@ export function normalize(line: string): string {
     .trim();
 }
 
+/**
+ * When the regular log discovery returns zero files on a remote host, run a
+ * lightweight diagnostic so the user can see WHY (dir missing, dir present
+ * but empty, permission denied on stat, etc). Pure read-only `ls -1 + test`.
+ * Returns one human-readable line per candidate root.
+ */
+async function diagnoseRemoteLogRoots(ctx: ExecutionContext): Promise<string[]> {
+  if (ctx.kind === "local") return [];
+  const roots = remoteLogRoots(ctx.os);
+  if (roots.length === 0) return [];
+  const out: string[] = [];
+  if (ctx.os === "windows") {
+    for (const r of roots) {
+      try {
+        const resolved = await ctx.runShell(`$ExecutionContext.InvokeCommand.ExpandString('${r.replace(/'/g, "''")}')`, { timeoutMs: 4000 });
+        const path = resolved.stdout.trim();
+        const exists = await ctx.pathExists(path);
+        if (!exists) { out.push(`  ${path} (missing)`); continue; }
+        const ls = await ctx.runShell(`(Get-ChildItem -LiteralPath '${path.replace(/'/g, "''")}' -File -ErrorAction SilentlyContinue | Measure-Object).Count`, { timeoutMs: 4000 });
+        out.push(`  ${path} (exists, ${ls.stdout.trim() || "?"} file(s))`);
+      } catch (e) {
+        out.push(`  ${r} (diagnostic failed: ${(e as Error).message.slice(0, 80)})`);
+      }
+    }
+    return out;
+  }
+  // POSIX: for each root, expand $HOME, test -e, list count + first few names.
+  const dirsExpr = roots.map((r) => `"${r.replace(/"/g, '\\"')}"`).join(" ");
+  const cmd =
+    `for d in ${dirsExpr}; do ` +
+    `  if [ ! -e "$d" ]; then echo "$d|missing"; ` +
+    `  elif [ ! -r "$d" ]; then echo "$d|unreadable"; ` +
+    `  else ` +
+    `    n=$(/usr/bin/find "$d" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' '); ` +
+    `    sample=$(/bin/ls -1 "$d" 2>/dev/null | head -3 | tr '\\n' ',' | sed 's/,$//'); ` +
+    `    echo "$d|exists|files=$n|sample=$sample"; ` +
+    `  fi; ` +
+    `done`;
+  try {
+    const r = await ctx.runShell(cmd, { timeoutMs: 6000 });
+    for (const line of (r.stdout || "").split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t) continue;
+      const [path, state, ...rest] = t.split("|");
+      if (state === "missing") out.push(`  ${path} (missing)`);
+      else if (state === "unreadable") out.push(`  ${path} (exists but unreadable — likely macOS TCC / Full Disk Access)`);
+      else out.push(`  ${path} (${[state, ...rest].join(", ")})`);
+    }
+  } catch (e) {
+    out.push(`  diagnostic failed: ${(e as Error).message.slice(0, 100)}`);
+  }
+  return out;
+}
+
 export async function runLogProbe(
   profile: ProductDiagnosticProfile = getProductProfile("teamviewer-remote"),
   ctx: ExecutionContext = new LocalContext()
@@ -189,6 +246,14 @@ export async function runLogProbe(
 
   if (files.length === 0) {
     diagnostics.push(`No ${profile.name} log files found in standard locations.`);
+    // Surface WHY — dir missing, present-but-empty, unreadable, etc.
+    if (ctx.kind !== "local") {
+      const details = await diagnoseRemoteLogRoots(ctx);
+      if (details.length > 0) {
+        diagnostics.push(`Candidate log directories on ${ctx.description}:`);
+        diagnostics.push(...details);
+      }
+    }
     return {
       filesInspected: [],
       totalLines: 0,

@@ -51,14 +51,33 @@ describe("cleanSummary", () => {
     expect(cleanSummary("")).toBe("");
     expect(cleanSummary("   \n\n  ")).toBe("");
   });
+  it("skips prompt-label echo and returns the first prose line", () => {
+    expect(cleanSummary("Task: troubleshoot\nThe service appears down on the Mac.")).toBe("The service appears down on the Mac.");
+    expect(cleanSummary("Issue: TeamViewer drops\nProduct: teamviewer-remote\nA real prose summary here.")).toBe("A real prose summary here.");
+  });
+  it("returns empty when ALL lines are prompt-label echo", () => {
+    expect(cleanSummary("Task: troubleshoot\nProduct: x\nConfidence: 0.20")).toBe("");
+  });
+  it("strips list bullets before evaluating", () => {
+    expect(cleanSummary("- The session drops after a few minutes.")).toBe("The session drops after a few minutes.");
+  });
 });
 
 describe("filterActionsAgainstEvidence", () => {
   const evidence5938Ok = [
     "Target scope: 192.168.1.153",
+    "DNS resolved 6/6 TeamViewer hosts from 192.168.1.153",
     "TCP 5938 reachability: 3/3 routers OK",
     "HTTPS webapi probe: HTTP 200 in 1395ms",
     "All baseline connectivity probes succeeded."
+  ];
+  const evidenceHttpsFailedTcpOk = [
+    "Target scope: 192.168.1.153",
+    "DNS resolved 6/6 TeamViewer hosts from 192.168.1.153",
+    "TCP 5938 reachability: 3/3 routers OK",
+    "HTTPS webapi probe: failed (curl: (60) SSL certificate problem)",
+    "TeamViewer Remote endpoint TCP reachability: 9/9 OK",
+    "TeamViewer Remote HTTPS checks: 0/3 OK"
   ];
   it("drops firewall actions that mention the already-proven-open port 5938", () => {
     const out = filterActionsAgainstEvidence(
@@ -81,6 +100,17 @@ describe("filterActionsAgainstEvidence", () => {
     );
     expect(out.length).toBe(1);
     expect(out[0].step).toMatch(/launchd/i);
+  });
+  it("drops generic firewall actions even when only DNS+TCP are OK (HTTPS may fail for non-firewall reasons)", () => {
+    const out = filterActionsAgainstEvidence(
+      [
+        { step: "Check system settings for any firewall rules that might be blocking TeamViewer traffic.", risk: "low", rollback: "r" },
+        { step: "Renew the macOS CA bundle", risk: "low", rollback: "r" }
+      ],
+      evidenceHttpsFailedTcpOk
+    );
+    expect(out.length).toBe(1);
+    expect(out[0].step).toMatch(/CA bundle/i);
   });
   it("keeps non-firewall actions untouched", () => {
     const out = filterActionsAgainstEvidence(
