@@ -54,6 +54,10 @@ export interface WorkflowReport {
     reason: string;
   };
   execution: AgentExecution[];
+  /** Human label of where the probes actually ran (e.g. "local", "ssh user@host",
+   *  "azure-vm rg/vm", "k8s ns/pod"). Set by the worker/oneShot wrapper after the
+   *  workflow completes; absent on reports built before the ExecutionContext refactor. */
+  executionTarget?: string;
 }
 
 export interface JobInput {

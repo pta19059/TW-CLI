@@ -32,6 +32,9 @@ export async function runWorkerJob(jobId: string): Promise<void> {
         input: job.input
       })
     );
+    // Stamp the report with WHERE the probes actually ran so consumers
+    // (CLI, REPL, jobs show --markdown) can show "Execution: ssh user@host".
+    report.executionTarget = ctx.description;
 
     updateJob(jobId, {
       status: "completed",

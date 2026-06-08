@@ -41,6 +41,28 @@ function hasFlag(argv: string[], names: string[]): boolean {
   return argv.some((a) => names.includes(a) || names.some((n) => a.startsWith(`${n}=`)));
 }
 
+/**
+ * Read --user/--port/--key from argv and assemble the optional connection
+ * block consumed by runOneShot/createExecutionContext. Returns undefined when
+ * --user is missing so probes default to local execution.
+ */
+function parseConnectionFlags(argv: string[]): { user: string; port?: number; identity?: string } | undefined {
+  const user = parseFlagValue(argv, ["--user"]);
+  if (!user) return undefined;
+  const portRaw = parseFlagValue(argv, ["--port"]);
+  let port: number | undefined;
+  if (portRaw !== undefined) {
+    const n = Number(portRaw);
+    if (!Number.isFinite(n) || n < 1 || n > 65535) {
+      console.error(`Invalid --port: ${portRaw}`);
+      process.exit(2);
+    }
+    port = n;
+  }
+  const identity = parseFlagValue(argv, ["--key"]);
+  return { user, port, identity };
+}
+
 // The set of recognised first tokens is derived from Commander itself so we
 // never have to hand-maintain this list when adding a new command. Anything
 // not registered as a Commander command falls through to the natural-language
@@ -72,11 +94,11 @@ async function main(): Promise<void> {
   // them in a child with a filtered stderr stream so the output stays clean.
   if (await maybeFilterNativeStderr(argv)) return;
 
-  // One-shot mode: `twc -p "issue text" [--product X] [--target Y] [--task T] [--context C] [--markdown]`
+  // One-shot mode: `twc -p "issue text" [--product X] [--target Y] [--task T] [--context C] [--markdown] [--user U [--port N] [--key path]]`
   if (hasFlag(argv, ["-p", "--prompt"])) {
     const issue = parseFlagValue(argv, ["-p", "--prompt"]);
     if (!issue) {
-      console.error("Usage: twc -p \"<issue>\" [--product <key>] [--target <value>] [--task troubleshoot|debug] [--context <text>] [--model <id>] [--markdown]");
+      console.error("Usage: twc -p \"<issue>\" [--product <key>] [--target <value>] [--task troubleshoot|debug] [--context <text>] [--model <id>] [--markdown] [--user <ssh-user> [--port N] [--key <path>]]");
       process.exitCode = 1;
       return;
     }
@@ -87,6 +109,7 @@ async function main(): Promise<void> {
     const taskRaw = (parseFlagValue(argv, ["--task"]) ?? "troubleshoot") as JobType;
     const context = parseFlagValue(argv, ["--context"]);
     const markdown = argv.includes("--markdown");
+    const connection = parseConnectionFlags(argv);
 
     try {
       const product = resolveProductOrThrow(rawProduct);
@@ -95,7 +118,8 @@ async function main(): Promise<void> {
         task: taskRaw === "debug" ? "debug" : "troubleshoot",
         target,
         issue,
-        context
+        context,
+        connection
       });
       console.log("");
       console.log(markdown ? renderReportMarkdown(report) : rendered);
@@ -135,7 +159,8 @@ async function main(): Promise<void> {
       product,
       task: "troubleshoot",
       target: parseFlagValue(argv, ["--target"]) ?? intent.target ?? "local-device",
-      issue
+      issue,
+      connection: parseConnectionFlags(argv)
     });
     console.log("");
     console.log(rendered);

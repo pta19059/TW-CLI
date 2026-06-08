@@ -245,9 +245,12 @@ Open the REPL with `twc` (or `twc chat --product <key>` to preset a product). In
 |---|---|
 | `<free text>` | describe an issue, runs the workflow synchronously |
 | `/product <key>` | set the active TeamViewer product |
-| `/target <value>` | set the target (default `local-device`) |
+| `/target <value>` | set the target (default `local-device`); supports `ssh://`, `azure-vm://`, `k8s://` URLs |
 | `/task <debug\|troubleshoot>` | switch task type |
 | `/context <text>` | attach one-shot extra context |
+| `/user <ssh-user>` | run probes on the current target via SSH (empty to clear) |
+| `/port <number>` | SSH port (default 22; empty to reset) |
+| `/key <path>` | SSH private-key path (empty to reset) |
 | `/products` | list whitelist |
 | `/agents` | list Mastra agent roles |
 | `/jobs [N]` | list recent background jobs |

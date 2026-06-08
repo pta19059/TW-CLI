@@ -4,6 +4,9 @@ export function renderReportText(report: WorkflowReport): string {
   const lines: string[] = [];
 
   lines.push(`Summary: ${report.summary}`);
+  if (report.executionTarget) {
+    lines.push(`Execution: ${report.executionTarget}`);
+  }
   lines.push("");
 
   lines.push("Hypotheses:");
@@ -51,6 +54,9 @@ export function renderReportMarkdown(report: WorkflowReport): string {
   lines.push(`**Summary:** ${report.summary}`);
   lines.push("");
   lines.push(`**Confidence:** ${report.confidence.toFixed(2)} · **Escalation:** ${report.escalation.required ? "yes" : "no"}`);
+  if (report.executionTarget) {
+    lines.push(`**Execution:** ${report.executionTarget}`);
+  }
   lines.push("");
   lines.push(`> ${report.escalation.reason}`);
   lines.push("");

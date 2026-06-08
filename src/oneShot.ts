@@ -53,6 +53,9 @@ export async function runOneShot(req: OneShotRequest): Promise<OneShotResult> {
         }
       })
     );
+    // Stamp the report with WHERE the probes actually ran so the rendered
+    // output (text + markdown) can surface it.
+    report.executionTarget = ctx.description;
     const ms = Date.now() - startedAt;
     spinner.stop(color.green(`✓ Done in ${(ms / 1000).toFixed(1)}s — confidence ${report.confidence.toFixed(2)}`));
     const rendered = renderReportText(report);

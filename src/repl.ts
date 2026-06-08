@@ -26,14 +26,23 @@ interface ReplState {
   target: string;
   task: JobType;
   context?: string;
+  /** Optional SSH connection — when set, probes execute on `target` via SSH. */
+  connection?: {
+    user: string;
+    port?: number;
+    identity?: string;
+  };
 }
 
 const HELP_LINES = [
   `${color.bold("Free text")}            describe an issue → runs the workflow`,
   `${color.bold("/product <key>")}       set the active TeamViewer product`,
-  `${color.bold("/target <value>")}      set the target (default: local-device)`,
+  `${color.bold("/target <value>")}      set the target (default: local-device); supports ssh://, azure-vm://, k8s:// URLs`,
   `${color.bold("/task <debug|troubleshoot>")}  switch task type (default: troubleshoot)`,
   `${color.bold("/context <text>")}      attach extra context to the next prompt`,
+  `${color.bold("/user <ssh-user>")}     run probes on the current target via SSH (empty to clear)`,
+  `${color.bold("/port <number>")}       SSH port (default 22; empty to reset)`,
+  `${color.bold("/key <path>")}          SSH private-key path (empty to reset)`,
   `${color.bold("/products")}            list supported TeamViewer products`,
   `${color.bold("/agents")}              list Mastra agent roles`,
   `${color.bold("/jobs [N]")}            list recent background jobs`,
@@ -59,7 +68,10 @@ function showHelp(): void {
 function statusLine(state: ReplState): string {
   const product = state.product ? productName(state.product) : color.yellow("not set");
   const ctx = state.context ? color.dim(` ctx="${state.context.slice(0, 30)}${state.context.length > 30 ? "…" : ""}"`) : "";
-  return color.dim(`[${state.task} · ${product} · target=${state.target}]${ctx}`);
+  const conn = state.connection
+    ? color.dim(` ssh=${state.connection.user}${state.connection.port ? ":" + state.connection.port : ""}`)
+    : "";
+  return color.dim(`[${state.task} · ${product} · target=${state.target}]${conn}${ctx}`);
 }
 
 function greet(state: ReplState): void {
@@ -318,6 +330,44 @@ async function handleSlash(line: string, state: ReplState, rl: readline.Interfac
       console.log(color.green(arg ? `  Context attached.` : `  Context cleared.`));
       return true;
     }
+    case "user": {
+      if (!arg) {
+        state.connection = undefined;
+        console.log(color.green("  Connection cleared. Probes will run locally."));
+        return true;
+      }
+      state.connection = { ...(state.connection ?? {}), user: arg };
+      console.log(color.green(`  SSH user set to '${arg}'. Probes will run on '${state.target}' via SSH.`));
+      return true;
+    }
+    case "port": {
+      if (!state.connection) {
+        console.log(color.red("  Set /user <ssh-user> first."));
+        return true;
+      }
+      if (!arg) {
+        state.connection = { ...state.connection, port: undefined };
+        console.log(color.green("  SSH port reset to default (22)."));
+        return true;
+      }
+      const n = Number(arg);
+      if (!Number.isFinite(n) || n < 1 || n > 65535) {
+        console.log(color.red(`  Invalid port '${arg}'.`));
+        return true;
+      }
+      state.connection = { ...state.connection, port: n };
+      console.log(color.green(`  SSH port set to ${n}.`));
+      return true;
+    }
+    case "key": {
+      if (!state.connection) {
+        console.log(color.red("  Set /user <ssh-user> first."));
+        return true;
+      }
+      state.connection = { ...state.connection, identity: arg || undefined };
+      console.log(color.green(arg ? `  SSH identity set to '${arg}'.` : "  SSH identity reset."));
+      return true;
+    }
     default:
       console.log(color.red(`  Unknown command '/${cmd}'. Type /help.`));
       return true;
@@ -418,7 +468,8 @@ export async function runRepl(options: ReplOptions = {}): Promise<void> {
         task: state.task,
         target: state.target,
         issue: nlLine,
-        context: state.context
+        context: state.context,
+        connection: state.connection
       });
       console.log("");
       console.log(rendered);
