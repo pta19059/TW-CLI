@@ -362,14 +362,14 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
   if (report.topSignatures.length > 0) {
     evidence.push(
       `Top failure signatures: ` +
-        report.topSignatures.map((c) => `${c.count}\u00d7 "${c.signature.slice(0, 80)}"`).join("; ")
+        report.topSignatures.map((c) => `${c.count}\u00d7 "${c.signature.slice(0, 140)}"`).join("; ")
     );
     const dominant = report.topSignatures[0];
     if (dominant.count >= 3) {
       rootCauses.push({
         title: "Recurring failure signature in TeamViewer logs",
         score: Math.min(0.9, 0.55 + Math.log10(dominant.count) * 0.15),
-        rationale: `Pattern repeats ${dominant.count}\u00d7: ${dominant.exampleLine.slice(0, 160)}`
+        rationale: `Pattern repeats ${dominant.count}\u00d7: ${dominant.exampleLine.slice(0, 220)}`
       });
       actions.push({
         step: "Triage the dominant signature: search TeamViewer KB and correlate with last config/version change",

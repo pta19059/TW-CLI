@@ -414,7 +414,19 @@ const aggregateStep = createStep({
       const knownTitles = new Map(filteredRoots.map((r) => [r.title, r]));
       rerankedRoots = reranked.rootCauses
         .filter((r) => knownTitles.has(r.title))
-        .map((r) => ({ ...knownTitles.get(r.title)!, score: Math.max(0, Math.min(1, Number(r.score) || 0)) }));
+        .map((r) => {
+          const original = knownTitles.get(r.title)!;
+          const rerankScore = Math.max(0, Math.min(1, Number(r.score) || 0));
+          // FLOOR: don't allow the LLM to drop a probe-derived score by more
+          // than 40% — the candidate came from real evidence (e.g. "32× curl
+          // request failed" in the unified log), the LLM should be reranking
+          // among real signals, not dismissing them. Without this floor a
+          // model that has no opinion returns score 0 and silently buries
+          // legitimate findings.
+          const floor = original.score * 0.6;
+          const finalScore = Math.max(floor, rerankScore);
+          return { ...original, score: finalScore };
+        });
       if (rerankedRoots.length === 0) {
         rerankedRoots = filteredRoots;
       }

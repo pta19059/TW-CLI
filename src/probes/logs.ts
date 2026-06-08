@@ -54,7 +54,10 @@ function remoteLogRoots(os: RemoteOs): string[] {
       "/Library/Logs/TeamViewer",
       // Some TeamViewer 15 installs write under Application Support too.
       "$HOME/Library/Application Support/TeamViewer/Logs",
-      "/Library/Application Support/TeamViewer/Logs"
+      "/Library/Application Support/TeamViewer/Logs",
+      // Sandboxed container path (mas / app-store style installs).
+      "$HOME/Library/Containers/com.teamviewer.TeamViewer/Data/Library/Logs/TeamViewer",
+      "$HOME/Library/Containers/com.teamviewer.TeamViewer/Data/Library/Logs"
     ];
   }
   if (os === "linux") {
@@ -235,6 +238,47 @@ async function diagnoseRemoteLogRoots(ctx: ExecutionContext): Promise<string[]> 
   return out;
 }
 
+/**
+ * macOS unified-log fallback for TeamViewer 15+.
+ *
+ * On modern macOS, TeamViewer no longer writes plain-text *.log files in
+ * /Library/Logs/TeamViewer — its agents emit messages through Apple's unified
+ * logging (os_log). We query the last 2h of system log entries whose process
+ * name contains "TeamViewer" (or whose subsystem starts with com.teamviewer),
+ * filter to error/warning-class lines, and return them so the same signature
+ * clustering can be applied.
+ *
+ * The returned `text` is the same shape as `ctx.readFile()` output so callers
+ * can pipe it through the existing scanner unchanged.
+ */
+async function harvestMacUnifiedLog(
+  ctx: ExecutionContext
+): Promise<{ text: string; lineCount: number } | null> {
+  if (ctx.os !== "macos") return null;
+  // `log show` is read-only and ships with macOS — no Full Disk Access needed.
+  // --info gives us TeamViewer's TVLogging entries; without it we only get
+  // default-level messages and lose most of the diagnostic content.
+  // 24h window: TeamViewer drop incidents are sporadic — a 2h window catches
+  // only steady-state activity and misses the actual failure burst the user
+  // is calling about. egrep filters to lines that actually indicate a problem
+  // (NetWatchdog disconnected, Connection timed out, Resolve failed,
+  // handshake failed, KeepAlive timeout, etc).
+  const cmd =
+    `log show --predicate 'process CONTAINS "TeamViewer" OR subsystem CONTAINS[c] "teamviewer"' ` +
+    `--info --last 24h --style compact 2>/dev/null | ` +
+    `egrep -i 'error|warn|fail|drop|disconnect|timeout|reconnect|abort|reject|denied|unable|cannot|refused|handshake' | ` +
+    `tail -800`;
+  try {
+    const r = await ctx.runShell(cmd, { timeoutMs: 30000 });
+    const text = (r.stdout || "").trim();
+    if (!text) return { text: "", lineCount: 0 };
+    const lineCount = text.split(/\r?\n/).filter((l) => l.trim()).length;
+    return { text, lineCount };
+  } catch {
+    return null;
+  }
+}
+
 export async function runLogProbe(
   profile: ProductDiagnosticProfile = getProductProfile("teamviewer-remote"),
   ctx: ExecutionContext = new LocalContext()
@@ -252,6 +296,45 @@ export async function runLogProbe(
       if (details.length > 0) {
         diagnostics.push(`Candidate log directories on ${ctx.description}:`);
         diagnostics.push(...details);
+      }
+    }
+    // macOS-specific fallback: TeamViewer 15+ emits via Apple unified logging,
+    // not plain log files. Query `log show` and run the same clustering on it.
+    if (ctx.os === "macos") {
+      const unified = await harvestMacUnifiedLog(ctx);
+      if (unified && unified.lineCount > 0) {
+        diagnostics.push(
+          `Found ${unified.lineCount} TeamViewer entries in the macOS unified log (last 24h, filtered to error/warn/fail/drop/disconnect/timeout/handshake patterns).`
+        );
+        const scan = scanText(unified.text);
+        if (scan.errorCount + scan.warningCount === 0 && scan.totalLines > 0) {
+          diagnostics.push(
+            `Scanned ${scan.totalLines} unified-log lines; no error/warning-class entries (only steady-state activity).`
+          );
+        } else if (scan.errorCount + scan.warningCount > 0) {
+          diagnostics.push(
+            `Scanned ${scan.totalLines} unified-log lines; ${scan.errorCount} error(s), ${scan.warningCount} warning(s).`
+          );
+        }
+        return {
+          filesInspected: ["<macOS unified log: log show --predicate process CONTAINS TeamViewer>"],
+          totalLines: scan.totalLines,
+          errorCount: scan.errorCount,
+          warningCount: scan.warningCount,
+          topSignatures: scan.topSignatures,
+          diagnostics,
+          product: profile.name,
+          executionTarget: ctx.description
+        };
+      }
+      if (unified) {
+        diagnostics.push(
+          "macOS unified log queried (last 24h, TeamViewer process filter): zero entries returned. The TeamViewer service may not have logged anything recently or os_log retention has aged out the entries."
+        );
+      } else {
+        diagnostics.push(
+          "macOS unified-log fallback failed (log show command errored or timed out)."
+        );
       }
     }
     return {
@@ -274,20 +357,10 @@ export async function runLogProbe(
   for (const file of files) {
     const text = await ctx.readFile(file.path, MAX_BYTES_PER_FILE);
     if (!text) continue;
-    for (const rawLine of text.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      totalLines++;
-      const isErr = /\b(error|err|fatal|fail(?:ed|ure)?|exception)\b/i.test(line);
-      const isWarn = /\b(warn|warning)\b/i.test(line);
-      if (!isErr && !isWarn) continue;
-      if (isErr) errorCount++;
-      if (isWarn) warningCount++;
-      const sig = normalize(line).slice(0, 200);
-      const existing = counts.get(sig);
-      if (existing) existing.count++;
-      else counts.set(sig, { count: 1, example: line.slice(0, 240) });
-    }
+    const scan = scanText(text, counts);
+    totalLines += scan.totalLines;
+    errorCount += scan.errorCount;
+    warningCount += scan.warningCount;
   }
 
   const topSignatures: SignatureCluster[] = [...counts.entries()]
@@ -316,3 +389,37 @@ export async function runLogProbe(
 // Re-export for any external consumer that imports `path` from this module
 // (kept to mirror the old signature; safe to drop in a future cleanup).
 export const _internalPath = path;
+
+/**
+ * Shared scanner used by both the file path and the macOS unified-log path.
+ * Mutates the optional `counts` map in place so callers can accumulate across
+ * multiple inputs; returns lightweight aggregate counts + (when no map was
+ * passed) a freshly-built topSignatures list.
+ */
+function scanText(
+  text: string,
+  counts: Map<string, { count: number; example: string }> = new Map()
+): { totalLines: number; errorCount: number; warningCount: number; topSignatures: SignatureCluster[] } {
+  let totalLines = 0;
+  let errorCount = 0;
+  let warningCount = 0;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    totalLines++;
+    const isErr = /\b(error|err|fatal|fail(?:ed|ure)?|exception|refused|denied|abort)\b/i.test(line);
+    const isWarn = /\b(warn|warning|drop|disconnect|timeout|reconnect|unable|cannot)\b/i.test(line);
+    if (!isErr && !isWarn) continue;
+    if (isErr) errorCount++;
+    if (isWarn) warningCount++;
+    const sig = normalize(line).slice(0, 200);
+    const existing = counts.get(sig);
+    if (existing) existing.count++;
+    else counts.set(sig, { count: 1, example: line.slice(0, 240) });
+  }
+  const topSignatures: SignatureCluster[] = [...counts.entries()]
+    .map(([signature, { count, example }]) => ({ signature, count, exampleLine: example }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, TOP_SIGNATURES);
+  return { totalLines, errorCount, warningCount, topSignatures };
+}
