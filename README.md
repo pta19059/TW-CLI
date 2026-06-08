@@ -54,7 +54,7 @@ The `twc` prefix is optional inside the interactive shell. Run `twc --help` or `
 | `twc debug <product> --target <v> --issue "<text>" [--context <c>] [--wait]` | Run a background **debug** job | `twc debug teamviewer-remote --target endpoint-001 --issue "crash on start" --wait` |
 | `twc troubleshoot <product> --target <v> --issue "<text>" [--context <c>] [--wait]` | Run a background **troubleshoot** job | `twc troubleshoot teamviewer-tensor --target tenant-acme --issue "policy rollout not applied" --wait` |
 | `twc probe <target> [--port N] [--timeout ms] [--no-dns]` | Raw DNS + TCP connect probe (default port 5938 = TeamViewer daemon). No LLM. | `twc probe router1.teamviewer.com --port 5938` |
-| `twc inspect-remote <target> --user <u> [--port 22] [--key <path>] [--json]` | SSH into a remote macOS host and collect TeamViewer diagnostics (version, daemon, logs, cloud reachability). Read-only, no LLM. | `twc inspect-remote 192.168.1.153 --user stefanosguotti` |
+| `twc inspect-remote <target> --user <u> [--port 22] [--key <path>] [--json]` | SSH into a remote macOS host and collect TeamViewer diagnostics (version, daemon, logs, cloud reachability). Read-only, no LLM. | `twc inspect-remote XXX.XXX.XXX.XXX --user <user>` |
 | `twc jobs list [--limit N]` | List recent background jobs | `twc jobs list --limit 10` |
 | `twc jobs show [jobId] [--json\|--markdown]` | Show a job report (no id = last queued job) | `twc jobs show --markdown` |
 | `twc jobs logs [jobId] [--tail N]` | Tail a job's worker log (no id = last queued job) | `twc jobs logs --tail 100` |
