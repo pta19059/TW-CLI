@@ -3,7 +3,8 @@ import {
   calculateConfidence,
   cleanSummary,
   deduplicateActions,
-  filterActionsAgainstEvidence
+  filterActionsAgainstEvidence,
+  filterRootCausesAgainstEvidence
 } from "../src/mastra/workflows/teamviewerTroubleshootWorkflow.js";
 
 describe("deduplicateActions", () => {
@@ -122,6 +123,40 @@ describe("filterActionsAgainstEvidence", () => {
   it("does NOT filter when no connectivity evidence is present", () => {
     const out = filterActionsAgainstEvidence(
       [{ step: "Check firewall for port 5938", risk: "low", rollback: "r" }],
+      ["Target scope: example.com"]
+    );
+    expect(out.length).toBe(1);
+  });
+});
+
+describe("filterRootCausesAgainstEvidence", () => {
+  const evidenceHttpsFailedTcpOk = [
+    "DNS resolved 6/6 TeamViewer hosts from 192.168.1.153",
+    "TCP 5938 reachability: 3/3 routers OK",
+    "HTTPS webapi probe: failed (curl: (60) SSL certificate problem)",
+    "TeamViewer Remote endpoint TCP reachability: 9/9 OK"
+  ];
+  it("drops firewall root causes when DNS+TCP prove connectivity is fine", () => {
+    const out = filterRootCausesAgainstEvidence(
+      [
+        { title: "User's firewall blocking TeamViewer traffic", score: 0.6, rationale: "Firewall rules could be configured to block outgoing connections." },
+        { title: "Expired CA bundle on macOS", score: 0.4, rationale: "Old root store fails to validate TeamViewer cert chain." }
+      ],
+      evidenceHttpsFailedTcpOk
+    );
+    expect(out.length).toBe(1);
+    expect(out[0].title).toMatch(/CA bundle/i);
+  });
+  it("keeps non-firewall root causes untouched", () => {
+    const out = filterRootCausesAgainstEvidence(
+      [{ title: "TeamViewer Service not registered", score: 0.5, rationale: "launchctl shows no daemon" }],
+      evidenceHttpsFailedTcpOk
+    );
+    expect(out.length).toBe(1);
+  });
+  it("does NOT filter when no connectivity evidence is present", () => {
+    const out = filterRootCausesAgainstEvidence(
+      [{ title: "Firewall blocking outgoing", score: 0.5, rationale: "..." }],
       ["Target scope: example.com"]
     );
     expect(out.length).toBe(1);

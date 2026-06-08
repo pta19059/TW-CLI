@@ -314,6 +314,11 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
 
   if (report.filesInspected.length === 0) {
     evidence.push("No TeamViewer log files found on this host.");
+    // Surface why — the probe pushed candidate-path diagnostics into
+    // report.diagnostics (missing | unreadable | exists/empty). Don't drop
+    // them: this is the ONLY signal the user has to debug TCC / Full Disk
+    // Access / path-mismatch issues on macOS hosts reached via SSH.
+    for (const d of report.diagnostics) evidence.push(d);
     return { evidence, rootCauses, actions };
   }
   evidence.push(`Inspected ${report.filesInspected.length} log file(s): ${report.filesInspected.join(" | ")}`);

@@ -340,6 +340,10 @@ const aggregateStep = createStep({
       new Set([...meta.hypotheses, ...branches.flatMap((b) => b.hypotheses)])
     ).slice(0, 8);
     const allRoots = branches.flatMap((b) => b.rootCauses);
+    // Drop root-cause candidates that are directly contradicted by the
+    // collected evidence (same logic as for actions) BEFORE the LLM rerank
+    // — otherwise the LLM keeps re-promoting them.
+    const filteredRoots = filterRootCausesAgainstEvidence(allRoots, evidence);
     const allActions = deduplicateActions(branches.flatMap((b) => b.actions));
 
     // LLM rerank of root causes (narrow JSON contract)
@@ -386,12 +390,16 @@ const aggregateStep = createStep({
     // one-liner so the report stays renderable.
     const issueShort = sanitizePromptInput(meta.issue, 240);
     const topTitle = topRoots[0]?.title ?? "unclassified";
+    // Do NOT include the confidence number in the prompt — small models
+    // misformat it ("high confidence at 0.20%") because they map 0.20
+    // to language-level confidence without understanding the scale. The
+    // numeric confidence is shown separately in the rendered report.
     const buildSummaryPrompt = (strict: boolean) =>
       (strict
-        ? "Output EXACTLY one short English sentence (max 35 words). Do NOT call any tool. Do NOT emit JSON, code fences, markdown, function-call syntax, bullets, or labels like 'Task:' or 'Issue:'. Plain prose only.\n\n"
-        : "Write ONE short English sentence (max 35 words) describing the troubleshooting outcome. Plain prose only. No JSON, no tool calls, no markdown, no labels.\n\n") +
-      `Brief: A ${meta.task} run for ${meta.product} examined the user issue "${issueShort}". ` +
-      `The top candidate root cause is "${topTitle}" with overall confidence ${confidence.toFixed(2)}.\n\n` +
+        ? "Output EXACTLY one short English sentence (max 30 words). Plain prose only. No JSON, no tool calls, no markdown, no labels, no percentages, no numbers, no quotes.\n\n"
+        : "Write ONE short English sentence (max 30 words) describing the troubleshooting outcome. Plain prose only. No JSON, no tool calls, no markdown, no labels, no percentages, no numbers.\n\n") +
+      `Brief: A ${meta.task} run for ${meta.product} examined the user issue "${issueShort}" ` +
+      `and identified the most likely cause as ${topTitle}.\n\n` +
       "Sentence:";
 
     let summary = "";
@@ -485,6 +493,32 @@ export function cleanSummary(raw: string): string {
     return line;
   }
   return "";
+}
+
+/**
+ * Same evidence-vs-recommendation logic as filterActionsAgainstEvidence,
+ * but applied to root-cause candidates BEFORE the LLM rerank step — the
+ * LLM otherwise keeps re-promoting firewall as the top cause even when
+ * DNS + TCP both prove the firewall is fine.
+ */
+export function filterRootCausesAgainstEvidence(
+  roots: RootCauseCandidate[],
+  evidence: string[]
+): RootCauseCandidate[] {
+  const joined = evidence.join(" ");
+  const port5938Open = /tcp\s+5938\s+reachability:\s*\d+\/\d+[^\n]*?\bok\b/i.test(joined);
+  const endpointTcpOk = /endpoint\s+tcp\s+reachability:\s*([1-9]\d*)\/\d+[^\n]*?\bok\b/i.test(joined);
+  const dnsOk = /dns\s+resolved\s+([1-9]\d*)\/\d+\s+teamviewer\s+hosts/i.test(joined);
+  const firewallRuledOut = dnsOk && (port5938Open || endpointTcpOk);
+
+  return roots.filter((r) => {
+    const text = `${r.title} ${r.rationale ?? ""}`.toLowerCase();
+    const mentionsFirewall = /firewall/.test(text);
+    if (!mentionsFirewall) return true;
+    if (port5938Open && /\b5938\b/.test(text)) return false;
+    if (firewallRuledOut && /teamviewer|traffic|blocking|outgoing/.test(text)) return false;
+    return true;
+  });
 }
 
 /**
