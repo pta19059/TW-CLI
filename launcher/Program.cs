@@ -138,10 +138,14 @@ static void RunClickMode(string root)
             trimmed.Equals("clear", StringComparison.OrdinalIgnoreCase))
         {
             // Clear and redraw the full intro screen (logo, figure, header).
-            // The figure animation re-captures the new buffer row inside
-            // DrawSeatedFigure, so the running timer keeps targeting it.
-            DrawAnimatedIntro();
-            PrintShellHeader();
+            // Serialize with the typing-animation timer so a tick that lands
+            // mid-redraw can't paint a ghost figure on the new buffer.
+            lock (FigureAnim.Lock)
+            {
+                FigureAnim.TopRow = -1;   // disable repaints until the new figure is captured
+                DrawAnimatedIntro();
+                PrintShellHeader();
+            }
             continue;
         }
 
@@ -180,6 +184,16 @@ static void RunClickMode(string root)
 }
 
 static void DrawAnimatedIntro()
+{
+    // Suppress the typing animation for the entire intro. The timer is set
+    // up once (in RunClickMode) and keeps firing across cls redraws, so we
+    // need this guard every time the intro re-runs.
+    FigureAnim.Busy = true;
+    try { DrawAnimatedIntroCore(); }
+    finally { FigureAnim.Busy = false; }
+}
+
+static void DrawAnimatedIntroCore()
 {
     const string reset = "\u001b[0m";
     const string cyan = "\u001b[36m";
@@ -243,17 +257,22 @@ static void DrawAnimatedIntro()
 // animation (StartTypingAnimation) repaints the figure in place every 20s.
 static void DrawSeatedFigure(bool useAnsi, string cCyan, string cReset)
 {
-    // Capture the buffer row BEFORE writing the figure so the timer knows
-    // where to repaint. Also recaptured on every `cls` (which re-runs the
-    // intro), so the animation always targets the current copy.
-    int top = Console.CursorTop;
-
+    // The timer must NOT repaint while the intro is still drawing — otherwise
+    // a tick that lands between Console.Clear() and the figure write will
+    // paint the old position into the new (empty) buffer, producing a
+    // ghost / double figure. The caller (DrawAnimatedIntro) already sets
+    // FigureAnim.Busy = true around the whole intro; we just need to make
+    // sure TopRow is captured AFTER the writes so it always reflects the
+    // real buffer position even if the buffer scrolled during the writes.
     foreach (var line in FigureAnim.Idle)
     {
         Console.WriteLine($"{cCyan}{line}{cReset}");
     }
 
-    FigureAnim.TopRow = top;
+    // Cursor is now on the line BELOW the figure's last row. Subtract the
+    // figure height to get the figure's actual top row. This is correct even
+    // if the buffer scrolled mid-draw (CursorTop is capped to BufferHeight-1).
+    FigureAnim.TopRow = Console.CursorTop - FigureAnim.Idle.Length;
     FigureAnim.LeftCol = 0;
     FigureAnim.UseAnsi = useAnsi;
     FigureAnim.Cyan = cCyan;
