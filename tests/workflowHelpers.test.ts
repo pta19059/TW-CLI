@@ -131,6 +131,56 @@ describe("filterActionsAgainstEvidence", () => {
     );
     expect(out.length).toBe(1);
   });
+  it("keeps transport-stability actions that mention NAT/firewall idle-timeout (different failure mode from blocking)", () => {
+    // Real-world regression: our signature-aware "Transport-layer instability"
+    // action mentions "upstream NAT/firewall for idle-timeout < 60s" as a
+    // diagnostic for long-lived TCP being culled mid-session. The DNS+TCP-OK
+    // proof rules out *blocking*, but does NOT rule out idle-timeout culling.
+    // The filter must distinguish "block/allow/open-port/rule" recommendations
+    // from "check idle-timeout / rate-limiting" diagnostics.
+    const out = filterActionsAgainstEvidence(
+      [
+        {
+          step: "Transport-layer instability dominates the log. Measure link quality with ping/tcpdump. Check upstream NAT/firewall for idle-timeout < 60s and any rate-limiting on long-lived TCP sessions; if on Wi-Fi, test on Ethernet.",
+          risk: "low",
+          rollback: "Observation steps only \u2014 no rollback needed."
+        }
+      ],
+      evidence5938Ok
+    );
+    expect(out.length).toBe(1);
+  });
+  it("keeps actions that mention port 5938 in a diagnostic (tcpdump) context even when 5938 is proven open", () => {
+    // Regression: capturing `tcpdump -p 5938` is a DIAGNOSTIC, not a firewall
+    // change. The filter must only drop firewall actions whose recommendation
+    // is to BLOCK/ALLOW/OPEN/RULE on that port.
+    const out = filterActionsAgainstEvidence(
+      [
+        {
+          step: "Capture a 2-min tcpdump on port 5938 during a live drop; check upstream NAT/firewall idle-timeout for long-lived sessions.",
+          risk: "low",
+          rollback: "Observation only."
+        }
+      ],
+      evidence5938Ok
+    );
+    expect(out.length).toBe(1);
+  });
+  it("drops placeholder actions whose step is just '...' or near-empty", () => {
+    // The small CPU model sometimes emits literal "..." as a step. Without
+    // this filter the action survives the union and appears in the report.
+    const out = filterActionsAgainstEvidence(
+      [
+        { step: "...", risk: "low", rollback: "..." },
+        { step: "-", risk: "low", rollback: "no rollback" },
+        { step: "ok", risk: "low", rollback: "no rollback" },
+        { step: "Restart the TeamViewer app", risk: "low", rollback: "no rollback" }
+      ],
+      evidence5938Ok
+    );
+    expect(out.length).toBe(1);
+    expect(out[0].step).toMatch(/restart the teamviewer app/i);
+  });
   it("does NOT filter when no connectivity evidence is present", () => {
     const out = filterActionsAgainstEvidence(
       [{ step: "Check firewall for port 5938", risk: "low", rollback: "r" }],
@@ -240,6 +290,19 @@ describe("filterRootCausesAgainstEvidence", () => {
       [
         { title: "Check the system logs for any errors related to TeamViewer", score: 0.7, rationale: "System log entries can provide clues." },
         { title: "Restart the TeamViewer service to ensure all components are functioning correctly", score: 0.6, rationale: "Restart helps." },
+        { title: "Outdated TeamViewer client", score: 0.5, rationale: "Older clients have known disconnect bugs." }
+      ],
+      []
+    );
+    expect(out.length).toBe(1);
+    expect(out[0].title).toMatch(/Outdated/);
+  });
+  it("drops placeholder root causes whose title is just '...' or near-empty", () => {
+    const out = filterRootCausesAgainstEvidence(
+      [
+        { title: "...", score: 0.42, rationale: "..." },
+        { title: "-", score: 0.3, rationale: "nothing" },
+        { title: "OK", score: 0.5, rationale: "..." },
         { title: "Outdated TeamViewer client", score: 0.5, rationale: "Older clients have known disconnect bugs." }
       ],
       []

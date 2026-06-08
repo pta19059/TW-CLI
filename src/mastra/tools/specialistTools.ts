@@ -362,20 +362,75 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
   if (report.topSignatures.length > 0) {
     evidence.push(
       `Top failure signatures: ` +
-        report.topSignatures.map((c) => `${c.count}\u00d7 "${c.signature.slice(0, 140)}"`).join("; ")
+        report.topSignatures.map((c) => `${c.count}\u00d7 "${c.signature.slice(0, 200)}"`).join("; ")
     );
     const dominant = report.topSignatures[0];
     if (dominant.count >= 3) {
       rootCauses.push({
         title: "Recurring failure signature in TeamViewer logs",
         score: Math.min(0.9, 0.55 + Math.log10(dominant.count) * 0.15),
-        rationale: `Pattern repeats ${dominant.count}\u00d7: ${dominant.exampleLine.slice(0, 220)}`
+        rationale: `Pattern repeats ${dominant.count}\u00d7: ${dominant.exampleLine.slice(0, 260)}`
       });
-      actions.push({
-        step: "Triage the dominant signature: search TeamViewer KB and correlate with last config/version change",
-        risk: "low",
-        rollback: "No rollback required"
-      });
+      // Signature-aware action routing: the dominant signature usually
+      // points at a specific failure mode (DNS, TLS, timeout, auth) and
+      // each one has a different remediation playbook. Emitting "Triage
+      // the dominant signature" was correct but useless — the user already
+      // sees the signature. Pick the right playbook automatically.
+      const sigText = `${dominant.exampleLine} ${dominant.signature}`.toLowerCase();
+      if (/could not resolve|resolve failed|resolvednsname|getaddrinfo|asio\.netdb|name (?:not|or service not) known|nodename nor servname/.test(sigText)) {
+        actions.push({
+          step:
+            "DNS resolution failures detected for TeamViewer router hostnames " +
+            "(curl 'Could not resolve hostname'). Check the DNS resolver chain " +
+            "on this host: macOS — `scutil --dns` (look for slow/dead resolvers, " +
+            "VPN/MDM-pushed overrides), `sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder`. " +
+            "Linux — `resolvectl status`, `systemd-resolve --flush-caches`. " +
+            "Verify direct resolution against a public resolver: `dig router11.teamviewer.com @1.1.1.1`. " +
+            "If the public resolver works but the configured one doesn't, the issue is the local resolver, not TeamViewer.",
+          risk: "low",
+          rollback: "Flushing the DNS cache is reversible (entries repopulate on use). Removing custom resolvers can be reverted by re-adding them."
+        });
+      } else if (/handshake|tls|ssl|certificate|x509|cert verify|self.signed|untrusted/.test(sigText)) {
+        actions.push({
+          step:
+            "TLS / handshake failures dominate the log signature. Verify the system clock " +
+            "(`date` — TLS rejects future/past clocks), refresh the CA bundle (macOS: install " +
+            "OS updates so the root store is current; Linux: refresh ca-certificates), and " +
+            "check for TLS-intercepting proxies/firewalls (corporate inspection, captive portals, " +
+            "MDM CA injection) in the path to *.teamviewer.com:443.",
+          risk: "low",
+          rollback: "Reverting ca-certificates / removing the TLS-inspection bypass restores prior behavior."
+        });
+      } else if (/timed? ?out|timeout|connection reset|broken pipe|aborted|disconnect|retryhandle|::handleretry|resend to|retry(?:ing)?\b|rcommand|retransmit|netwatchdog/.test(sigText)) {
+        actions.push({
+          step:
+            "Transport-layer instability dominates the log (timeouts / disconnects / TeamViewer " +
+            "internal RetryHandle / RCommand retries — TeamViewer is repeatedly resending " +
+            "commands because replies don't arrive in time). This is a network-path symptom, " +
+            "not a TeamViewer bug. Measure link quality to the routers: " +
+            "`ping -c 50 router11.teamviewer.com` (loss & jitter), MTR/`traceroute -T -p 5938`. " +
+            "If intermittent, capture a 2-min `tcpdump`/`pktmon` on port 5938. Check upstream " +
+            "NAT/firewall for idle-timeout < 60s and any rate-limiting on long-lived TCP sessions; " +
+            "if on Wi-Fi, test on Ethernet to isolate radio packet loss.",
+          risk: "low",
+          rollback: "Observation steps only — no rollback needed."
+        });
+      } else if (/auth|unauthor|forbidden|401|403|token|credential/.test(sigText)) {
+        actions.push({
+          step:
+            "Authentication-class failures dominate. Re-verify the account token / device " +
+            "assignment status, check token scope and expiry, and confirm the device is still " +
+            "enrolled in the expected account.",
+          risk: "low",
+          rollback: "No rollback required for read-only checks."
+        });
+      } else {
+        actions.push({
+          step: "Triage the dominant signature: search TeamViewer KB and correlate with last config/version change",
+          risk: "low",
+          rollback: "No rollback required"
+        });
+      }
     }
   } else if (report.errorCount === 0) {
     evidence.push("No errors or warnings detected in log tail window.");

@@ -412,6 +412,7 @@ const aggregateStep = createStep({
         retries: 1
       });
       const knownTitles = new Map(filteredRoots.map((r) => [r.title, r]));
+      const seenTitles = new Set<string>();
       rerankedRoots = reranked.rootCauses
         .filter((r) => knownTitles.has(r.title))
         .map((r) => {
@@ -425,8 +426,19 @@ const aggregateStep = createStep({
           // legitimate findings.
           const floor = original.score * 0.6;
           const finalScore = Math.max(floor, rerankScore);
+          seenTitles.add(r.title);
           return { ...original, score: finalScore };
         });
+      // UNION: any candidate the LLM forgot to mention is re-added with the
+      // same 0.6×original floor. Small CPU models routinely return only a
+      // subset of the candidates we asked them to rerank — without this
+      // union, evidence-grounded findings disappear from the report just
+      // because the model truncated its reply.
+      for (const original of filteredRoots) {
+        if (!seenTitles.has(original.title)) {
+          rerankedRoots.push({ ...original, score: original.score * 0.6 });
+        }
+      }
       if (rerankedRoots.length === 0) {
         rerankedRoots = filteredRoots;
       }
@@ -619,6 +631,12 @@ export function filterRootCausesAgainstEvidence(
   return roots.filter((r) => {
     const text = `${r.title} ${r.rationale ?? ""}`.toLowerCase();
     const rationale = (r.rationale ?? "").toLowerCase();
+    // Drop placeholder garbage the small LLM emits in place of a real
+    // candidate (e.g. title="..." rationale="..."). A real root cause has a
+    // noun-phrase title with at least a few letters of actual content.
+    const titleClean = (r.title ?? "").trim();
+    if (titleClean.length < 6) return false;
+    if (!/[a-z]{4,}/i.test(titleClean)) return false;
     const mentionsFirewall = /firewall/.test(text);
     if (mentionsFirewall) {
       if (port5938Open && /\b5938\b/.test(text)) return false;
@@ -767,16 +785,31 @@ export function filterActionsAgainstEvidence(
 
   return actions.filter((a) => {
     const text = `${a.step} ${a.rollback ?? ""} ${a.command ?? ""}`.toLowerCase();
+    // Drop placeholder garbage the small LLM emits (".", "...", "-", empty
+    // step content). Anything < 10 chars OR composed solely of punctuation
+    // is not a real recommendation.
+    const stepClean = (a.step ?? "").trim();
+    if (stepClean.length < 10) return false;
+    if (!/[a-z]{4,}/i.test(stepClean)) return false;
     const mentionsFirewall = /firewall/.test(text);
     if (mentionsFirewall) {
-      // Action explicitly about port 5938 and we just proved it open → drop.
-      if (port5938Open && /\b5938\b/.test(text)) return false;
-      // Generic "firewall blocking TeamViewer traffic" / "firewall rules" —
-      // if DNS + TCP work, firewall is not the cause: drop. EXCLUSION: don't
-      // drop our own probe-hygiene action which mentions firewall only to say
-      // "do NOT change the host firewall".
+      // Two carve-outs that prevent legitimate actions from being dropped:
+      //  (a) probe-hygiene CA ("do not change the host firewall")
+      //  (b) diagnostic context \u2014 if the action recommends running a
+      //      packet-capture / ping / traceroute / DNS-resolver tool, any
+      //      firewall mention is a parenthetical aside (e.g. "check NAT/
+      //      firewall idle-timeout") rather than a blocking-style change.
       const isProbeHygieneCarveOut = /do not change the host firewall/.test(text) || /probe hygiene/.test(text);
-      if (!isProbeHygieneCarveOut && firewallRuledOut && /teamviewer|traffic|blocking|rules/.test(text)) return false;
+      const isDiagnosticContext = /\b(tcpdump|pktmon|wireshark|ping\b|traceroute|mtr\b|dig\b|nslookup|scutil|netstat|ss\s+-|capture\s+a?\s*\d*\s*(min|sec)|packet\s+capture)\b/.test(text);
+      const isBlockingRecommendation = /\b(block|blocking|blocked|allow|allow-?list|whitelist|open\s+(?:the\s+)?port|firewall\s+(?:rule|setting|configuration|config)|deny|denies|inbound\s+rule|outbound\s+rule)\b/.test(text);
+      if (!isProbeHygieneCarveOut && !isDiagnosticContext) {
+        // Action explicitly inspects the firewall for a port we just proved open.
+        if (port5938Open && /\b5938\b/.test(text)) return false;
+        // Generic "firewall blocking TeamViewer traffic" / "firewall rules" \u2014
+        // if DNS + TCP work, blocking-class firewall recommendations are
+        // contradicted by the evidence.
+        if (firewallRuledOut && isBlockingRecommendation) return false;
+      }
     }
     // "sudo launchctl load -w .../com.teamviewer.teamviewerd.plist" or any
     // "start the background service teamviewerd" recommendation — only valid

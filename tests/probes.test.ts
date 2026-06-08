@@ -174,6 +174,77 @@ describe("fromLogs", () => {
     expect(out.rootCauses).toHaveLength(0);
     expect(out.evidence[0]).toContain("No TeamViewer log files found");
   });
+
+  it("emits a DNS-specific action when the dominant signature is a resolve failure", () => {
+    const report: LogProbeReport = {
+      filesInspected: ["<macOS unified log>"],
+      totalLines: 666,
+      errorCount: 613,
+      warningCount: 26,
+      topSignatures: [
+        {
+          signature: "HttpRequestImplCurl[<hex>]::CurlFinished(): curl request failed: Could not resolve hostname (6), Could not resolve host: router11.teamviewer.com",
+          count: 102,
+          exampleLine: "E TeamViewer_Service ... CurlFinished(): curl request failed: Could not resolve hostname (6), Could not resolve host: router11.teamviewer.com"
+        }
+      ],
+      diagnostics: []
+    };
+    const out = fromLogs(report);
+    const action = out.actions.map((a) => a.step).join("\n").toLowerCase();
+    expect(action).toContain("dns");
+    expect(action).toMatch(/scutil|dscacheutil|resolvectl|dig/);
+    expect(action).not.toContain("triage the dominant signature");
+  });
+
+  it("emits a TLS-specific action when the dominant signature is a handshake failure", () => {
+    const report: LogProbeReport = {
+      filesInspected: ["<macOS unified log>"],
+      totalLines: 100, errorCount: 80, warningCount: 5,
+      topSignatures: [
+        { signature: "SSL handshake failed: certificate verify failed", count: 12, exampleLine: "TLS handshake failed: certificate verify failed (self-signed)" }
+      ],
+      diagnostics: []
+    };
+    const out = fromLogs(report);
+    const action = out.actions.map((a) => a.step).join("\n").toLowerCase();
+    expect(action).toMatch(/tls|handshake|ca bundle|certificate/);
+    expect(action).toContain("clock");
+  });
+
+  it("emits a timeout-specific action when the dominant signature is a connection drop", () => {
+    const report: LogProbeReport = {
+      filesInspected: ["<macOS unified log>"],
+      totalLines: 200, errorCount: 150, warningCount: 20,
+      topSignatures: [
+        { signature: "NetWatchdog: Completely disconnected, connection timed out after 55 seconds", count: 22, exampleLine: "NetWatchdog: Completely disconnected, connection timed out after 55 seconds" }
+      ],
+      diagnostics: []
+    };
+    const out = fromLogs(report);
+    const action = out.actions.map((a) => a.step).join("\n").toLowerCase();
+    expect(action).toMatch(/ping|tcpdump|traceroute|mtr/);
+  });
+
+  it("routes TeamViewer RetryHandle/RCommand resend storms to the transport-instability action", () => {
+    const report: LogProbeReport = {
+      filesInspected: ["<macOS unified log>"],
+      totalLines: 96, errorCount: 58, warningCount: 16,
+      topSignatures: [
+        {
+          signature: "RetryHandle::HandleRetry(): Trying resend to 13 failed with error RCommand:1, retrying (2 retries remaining) BCmd: CC=0 CT=0",
+          count: 8,
+          exampleLine: "Df TeamViewer_Service ... RetryHandle::HandleRetry(): Trying resend to 13 failed with error RCommand:1, retrying (2 retries remaining) BCmd: CC=0 CT=0"
+        }
+      ],
+      diagnostics: []
+    };
+    const out = fromLogs(report);
+    const action = out.actions.map((a) => a.step).join("\n").toLowerCase();
+    expect(action).toContain("transport");
+    expect(action).toMatch(/ping|tcpdump|traceroute|mtr/);
+    expect(action).not.toContain("triage the dominant signature");
+  });
 });
 
 describe("fromAuth", () => {
@@ -250,5 +321,36 @@ describe("log normalize()", () => {
     expect(sig).toContain("ERROR handshake timeout");
     expect(sig).toContain("<date>");
     expect(sig).toContain("<time>");
+  });
+
+  it("collapses macOS unified-log lines that differ only by [pid:tid] thread-id", () => {
+    // Real-shape lines from TeamViewer 15 on macOS Monterey. These four lines
+    // describe identical DNS resolution failures but use four different
+    // thread ids — the old normalize() leaked "99:158b" → "<time>8b" so they
+    // clustered as four signatures instead of one.
+    const lines = [
+      `2026-06-07 15:47:54.426 E  TeamViewer_Service[99:158b] [com.teamviewer.TeamViewer:-S0-5] HttpRequestImplCurl[0x7f9f6b04d800]::CurlFinished(): curl request failed: Could not resolve hostname (6), Could not resolve host: router11.teamviewer.com`,
+      `2026-06-07 15:48:12.811 E  TeamViewer_Service[99:158a] [com.teamviewer.TeamViewer:-S0-5] HttpRequestImplCurl[0x7f9f6b04d900]::CurlFinished(): curl request failed: Could not resolve hostname (6), Could not resolve host: router11.teamviewer.com`,
+      `2026-06-07 15:49:01.118 E  TeamViewer_Service[99:1589] [com.teamviewer.TeamViewer:-S0-5] HttpRequestImplCurl[0x7f9f6b04da00]::CurlFinished(): curl request failed: Could not resolve hostname (6), Could not resolve host: router11.teamviewer.com`,
+      `2026-06-07 15:50:33.005 E  TeamViewer_Service[99:158c] [com.teamviewer.TeamViewer:-S0-5] HttpRequestImplCurl[0x7f9f6b04db00]::CurlFinished(): curl request failed: Could not resolve hostname (6), Could not resolve host: router11.teamviewer.com`
+    ];
+    const sigs = new Set(lines.map(normalize));
+    expect(sigs.size).toBe(1);
+    const sig = [...sigs][0];
+    expect(sig).toContain("CurlFinished");
+    expect(sig).toContain("Could not resolve hostname");
+    // The os_log boilerplate must be stripped, not present as "<time>8b".
+    expect(sig).not.toMatch(/<time>[0-9a-f]/);
+    expect(sig).not.toContain("TeamViewer_Service[");
+    expect(sig).not.toContain("[com.teamviewer.TeamViewer");
+  });
+
+  it("does NOT mistake a bare hex/colon thread-id token for a clock time", () => {
+    // Without leading whitespace the time regex must NOT collapse "99:158b".
+    // (The macOS prefix stripper covers the real shape; this guards the
+    //  fallback time regex against eating thread ids inside payload text.)
+    const sig = normalize("payload contains tag(99:158b) somewhere");
+    expect(sig).toContain("(99:158b)");
+    expect(sig).not.toMatch(/<time>[0-9a-f]/);
   });
 });

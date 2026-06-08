@@ -173,10 +173,29 @@ function parseSizePathPairs(text: string): FoundFile[] {
 // Normalize a log line into a "signature" by stripping timestamps, hex/numeric
 // ids and quoted strings. Two lines with the same signature describe the same
 // failure class even if their timestamps and instance ids differ.
+//
+// Special-cases the macOS unified-log compact format
+//   "YYYY-MM-DD HH:MM:SS.fff  L   Process[pid:tid] [subsystem:category] payload"
+// because (a) the time regex below would otherwise eat "99:158b" from the
+// "[pid:tid]" thread-id and leave gibberish, and (b) the [pid:tid] +
+// [subsystem:category] boilerplate splits identical payloads across multiple
+// thread-id variants (so 102 "Could not resolve" lines look like 4 clusters
+// of 32/27/24/19 instead of one cluster of 102).
 export function normalize(line: string): string {
   return line
+    // Strip macOS unified-log compact prefix wholesale, including the
+    // optional [subsystem:category] tag that some lines carry. Process name
+    // allows dots/dashes (e.g. TeamViewer-Helper, com.teamviewer.Service).
+    .replace(
+      /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s+[A-Za-z]{1,3}\s+[A-Za-z_][\w.\-]*\[\d+:[0-9a-f]+\]\s+(?:\[[^\]]+\]\s+)?/,
+      ""
+    )
+    // Defensive: any "Process[pid:hex_tid]" tag that still leaks through.
+    .replace(/\b[A-Za-z_][\w.\-]*\[\d+:[0-9a-f]+\]\s+/g, "")
     .replace(/\d{2,4}[-\/]\d{1,2}[-\/]\d{1,4}/g, "<date>")
-    .replace(/\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?/g, "<time>")
+    // Times are only collapsed when preceded by whitespace or start of string
+    // so we never accidentally match the "99:15" inside a "[99:158b]" tag.
+    .replace(/(^|\s)\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?\b/g, "$1<time>")
     .replace(/0x[0-9a-fA-F]+/g, "<hex>")
     .replace(/\b\d{4,}\b/g, "<num>")
     .replace(/"[^"]*"/g, '"<str>"')
