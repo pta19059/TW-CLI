@@ -128,12 +128,17 @@ async function findLogFilesRemote(profile: ProductDiagnosticProfile, ctx: Execut
   const dirsExpr = roots.map((r) => `"${r.replace(/"/g, '\\"')}"`).join(" ");
   // Convert the JS regex (which often uses \. and (?:...)) into something ERE-compatible
   // enough for `awk`. We keep it simple: escape sequences pass through.
-  const awkPat = patternSrc.replace(/'/g, "'\\''");
+  // CRITICAL: profile.logFilePattern carries the /i flag, but `.source` strips
+  // it. macOS files are named "TeamViewer15_Logfile.log" (capital T) so a
+  // bare `name ~ pat` against `teamviewer.*\.log$` would NOT match. We
+  // lowercase BOTH the candidate filename AND the pattern in awk so the
+  // match is effectively case-insensitive (POSIX awk has no //i flag).
+  const awkPat = patternSrc.toLowerCase().replace(/'/g, "'\\''");
   const cmd =
     `for d in ${dirsExpr}; do ` +
     `  if [ -d "$d" ]; then ` +
     `    /usr/bin/find "$d" -maxdepth 1 -type f 2>/dev/null | ` +
-    `    awk -v pat='${awkPat}' 'match($0, "[^/]+$"){ name=substr($0,RSTART,RLENGTH); if (name ~ pat) print $0 }' | ` +
+    `    awk -v pat='${awkPat}' 'match($0, "[^/]+$"){ name=tolower(substr($0,RSTART,RLENGTH)); if (name ~ pat) print $0 }' | ` +
     `    while IFS= read -r f; do ` +
     `      sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo -1); ` +
     `      printf "%s\\t%s\\n" "$sz" "$f"; ` +

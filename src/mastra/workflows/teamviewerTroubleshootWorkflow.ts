@@ -369,19 +369,39 @@ const aggregateStep = createStep({
     const confidence = calculateConfidence(topRoots, evidence.length, meta.task as JobType);
     const escalationRequired = confidence < 0.6 || (topRoots[0]?.score ?? 0) < 0.65;
 
+    // Drop actions whose recommendation is already disproven by the evidence
+    // (e.g. "check firewall for port 5938" when the connectivity probe just
+    // proved 5938 is reachable). Prevents the synthesized report from
+    // contradicting its own evidence section.
+    const filteredActions = filterActionsAgainstEvidence(allActions, evidence);
+
     // LLM-generated executive summary (plain text, single line). Mandatory —
-    // Foundry Local must produce it; an empty/failed generation throws.
-    const summaryPrompt =
-      "Write ONE short sentence (max 35 words) summarizing the troubleshooting outcome. No prose around it, no JSON, no markdown.\n" +
+    // Foundry Local must produce it; if the small local model emits garbage
+    // (tool-call JSON, code fences, the literal NOT_IN_CONTEXT marker) we
+    // retry once with a stricter prompt and finally fall back to a
+    // deterministic one-liner built from the top root cause + confidence.
+    const buildSummaryPrompt = (strict: boolean) =>
+      (strict
+        ? "Output EXACTLY one short English sentence (max 35 words). Do NOT call any tool. Do NOT emit JSON, code fences, markdown, or function-call syntax. Plain prose only.\n"
+        : "Write ONE short sentence (max 35 words) summarizing the troubleshooting outcome. No prose around it, no JSON, no markdown.\n") +
       `Task: ${meta.task}\n` +
       `Product: ${meta.product}\n` +
       `Top root cause: ${topRoots[0]?.title ?? "unclassified"}\n` +
       `Confidence: ${confidence.toFixed(2)}\n` +
       `Issue: ${sanitizePromptInput(meta.issue, 400)}`;
-    const summaryOut = await gatewayAgent.generate(summaryPrompt);
-    const summary = (summaryOut.text ?? "").trim().split(/\r?\n/)[0].trim();
+
+    let summary = "";
+    for (const strict of [false, true]) {
+      const out = await gatewayAgent.generate(buildSummaryPrompt(strict));
+      summary = cleanSummary(out.text ?? "");
+      if (summary) break;
+    }
     if (!summary) {
-      throw new Error("Foundry Local returned an empty summary; aborting (no fallback).");
+      // Deterministic last-resort summary — keeps the report renderable when
+      // the local model wedges or insists on tool-calling. NOT a confidence
+      // boost: escalation/confidence numbers are unchanged.
+      const topTitle = topRoots[0]?.title ?? "unclassified";
+      summary = `${meta.task === "debug" ? "Debug" : "Troubleshoot"} run completed for ${meta.product}; top candidate root cause: ${topTitle} (confidence ${confidence.toFixed(2)}).`;
     }
 
     const selected = selectAgents(meta.task as JobType, meta.buckets);
@@ -399,7 +419,7 @@ const aggregateStep = createStep({
       hypotheses: allHypotheses,
       evidence,
       rootCauses: topRoots,
-      actions: allActions,
+      actions: filteredActions,
       confidence,
       escalation: {
         required: escalationRequired,
@@ -439,4 +459,66 @@ export function deduplicateActions(actions: ActionItem[]): ActionItem[] {
     unique.set(action.step, action);
   }
   return Array.from(unique.values());
+}
+
+/**
+ * Strips garbage shapes that the small local model sometimes emits in place
+ * of a plain-text summary: tool-call JSON, code fences, the NOT_IN_CONTEXT
+ * marker (used by docsComposerAgent), or a stray empty JSON object. Returns
+ * the first non-empty line, or "" if nothing usable remains.
+ */
+export function cleanSummary(raw: string): string {
+  let s = (raw ?? "").trim();
+  if (!s) return "";
+  // Strip markdown code fences (``` or ```json) and surrounding whitespace.
+  s = s.replace(/^```[a-zA-Z]*\n?/, "").replace(/\n?```$/, "").trim();
+  // Keep only the first non-empty line.
+  s = s.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+  if (!s) return "";
+  // Reject obvious garbage shapes.
+  if (/^NOT_IN_CONTEXT$/i.test(s)) return "";
+  // Tool-call JSON: {"name":"someTool", "arguments": {...}} — the gateway
+  // agent has tools bound, and small models sometimes serialize a tool call
+  // as text instead of executing it.
+  if (/^\s*\{/.test(s) && /"(name|tool|function|arguments|parameters)"\s*:/i.test(s)) return "";
+  // Mentions of internal tool ids — also leaked tool-call text.
+  if (/teamviewerDocsTool|connectivityTool|authPolicyTool|endpointHealthTool|logIntelligenceTool/i.test(s)) return "";
+  return s;
+}
+
+/**
+ * Drops actions whose recommendation is directly contradicted by probe
+ * evidence we already collected. Currently focused on the most common case:
+ * "check firewall for port 5938 / TeamViewer traffic" when the connectivity
+ * probe just proved 5938 is reachable. Conservative — only drops when an
+ * action mentions BOTH a firewall keyword AND the proven-open port.
+ */
+export function filterActionsAgainstEvidence(
+  actions: ActionItem[],
+  evidence: string[]
+): ActionItem[] {
+  const joined = evidence.join(" ");
+  const lower = joined.toLowerCase();
+  // "TCP 5938 reachability: 3/3 routers OK" — routers reachable on 5938.
+  // The probe formats it as "<n>/<m> routers OK" so allow intermediate words
+  // between the ratio and the OK marker.
+  const port5938Open = /tcp\s+5938\s+reachability:\s*\d+\/\d+[^\n]*?\bok\b/i.test(joined);
+  // "HTTPS webapi probe: HTTP 200" — outbound HTTPS works.
+  const httpsOk = /https\s+webapi\s+probe:\s*http\s*2\d{2}/i.test(joined);
+  // Overall connectivity verdict from runConnectivityAnalysis.
+  const allConnOk = /all baseline connectivity probes succeeded/i.test(lower);
+
+  return actions.filter((a) => {
+    const text = `${a.step} ${a.rollback ?? ""} ${a.command ?? ""}`.toLowerCase();
+    const mentionsFirewall = /firewall/.test(text);
+    if (!mentionsFirewall) return true;
+    // Action explicitly about port 5938 and we just proved it open → drop.
+    if (port5938Open && /\b5938\b/.test(text)) return false;
+    // Generic "firewall blocking TeamViewer traffic" with no port specified,
+    // and all baseline connectivity probes succeeded → drop.
+    if (allConnOk && /teamviewer/.test(text) && !/\b\d{2,5}\b/.test(text)) return false;
+    // Generic firewall action while HTTPS works AND 5938 works → still drop.
+    if (httpsOk && port5938Open && /(teamviewer traffic|blocking teamviewer)/.test(text)) return false;
+    return true;
+  });
 }
