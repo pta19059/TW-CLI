@@ -52,7 +52,7 @@ The `twc` prefix is optional inside the interactive shell. Run `twc --help` or `
 | `twc agents list` | List the Mastra agent roles | `twc agents list` |
 | `twc agents plan --task <t> --issue "<text>"` | Show which agents would be selected (dry run) | `twc agents plan --task troubleshoot --issue "policy not applied"` |
 | `twc debug <product> --target <v> --issue "<text>" [--context <c>] [--wait] [--user <u> [--port N] [--key <path>]]` | Run a background **debug** job. With `--user`, all probes execute on `<target>` via SSH instead of locally. | `twc debug teamviewer-remote --target endpoint-001 --issue "crash on start" --wait` |
-| `twc troubleshoot <product> --target <v> --issue "<text>" [--context <c>] [--wait] [--user <u> [--port N] [--key <path>]]` | Run a background **troubleshoot** job. With `--user`, all probes execute on `<target>` via SSH instead of locally. | `twc troubleshoot teamviewer-remote --target XXX.XXX.XXX.XXX --user <user> --issue "daemon not connecting" --wait` |
+| `twc troubleshoot <product> --target <v> --issue "<text>" [--context <c>] [--wait] [--user <u> [--port N] [--key <path>]]` | Run a background **troubleshoot** job. Supports four target backends: local, SSH (Linux/macOS/Windows), Azure RunCommand (`azure-vm://rg/name`, no inbound port required), Kubernetes (`k8s://ns/pod[?container=X]`). | `twc troubleshoot teamviewer-remote --target azure-vm://my-rg/my-vm --issue "daemon not connecting" --wait` |
 | `twc probe <target> [--port N] [--timeout ms] [--no-dns]` | Raw DNS + TCP connect probe (default port 5938 = TeamViewer daemon). No LLM. | `twc probe router1.teamviewer.com --port 5938` |
 | `twc inspect-remote <target> --user <u> [--port 22] [--key <path>] [--json]` | SSH into a remote macOS host and collect TeamViewer diagnostics (version, daemon, logs, cloud reachability). Read-only, no LLM. | `twc inspect-remote XXX.XXX.XXX.XXX --user <user>` |
 | `twc jobs list [--limit N]` | List recent background jobs | `twc jobs list --limit 10` |
@@ -87,6 +87,17 @@ twc troubleshoot teamviewer-tensor --target tenant-acme --issue "Policy rollout 
 # Requires passwordless SSH (key already in ~/.ssh/authorized_keys on the target).
 twc troubleshoot teamviewer-remote --target XXX.XXX.XXX.XXX --user <user> --issue "daemon not connecting" --wait
 
+# Remote troubleshoot on a WINDOWS host via OpenSSH Server (built-in on Windows 10+/Server 2019+).
+# On the target: Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0; Start-Service sshd.
+twc troubleshoot teamviewer-remote --target win-host.contoso.com --user Administrator --issue "service not starting" --wait
+
+# Azure VM via ARM RunCommand (no inbound port, no SSH, auth via `az login`).
+# Works for both Linux and Windows Azure VMs; the OS is auto-detected from the VM record.
+twc troubleshoot teamviewer-remote --target azure-vm://my-rg/my-vm --issue "client cannot reach router" --wait
+
+# Kubernetes pod (Linux containers only; requires kubectl on PATH).
+twc troubleshoot teamviewer-remote --target k8s://default/teamviewer-host-7c8?container=host --issue "agent crashloop" --wait
+
 # Inspect the last job without remembering its id:
 twc jobs show               # last job
 twc jobs show --markdown    # last job as Markdown
@@ -96,6 +107,22 @@ twc jobs logs --tail 100    # tail the last job's worker log
 twc docs ask "which ports does teamviewer use"
 twc explain <jobId>
 ```
+
+## Target backends
+
+The same `debug` / `troubleshoot` workflow can run on four different backends.
+The backend is picked from the `--target` value (and `--user` for plain SSH):
+
+| Target syntax | Backend | OS support | Prerequisites |
+|---|---|---|---|
+| `--target local-device` (default) | Local Node child_process | Windows / Linux / macOS | none |
+| `--target <host-or-ip> --user <u> [--port N] [--key path]` *or* `--target ssh://<user>@<host>[:port]` | OpenSSH client (`ssh`) | Linux, macOS, Windows (OpenSSH Server + PowerShell) | passwordless key in target's `~/.ssh/authorized_keys` (or `%PROGRAMDATA%\ssh\administrators_authorized_keys` on Windows) |
+| `--target azure-vm://<resource-group>/<vm-name>` | Azure ARM `az vm run-command invoke` | Linux + Windows Azure VMs | `az` CLI on PATH + active `az login`; no inbound port required on the VM |
+| `--target k8s://<namespace>/<pod>[?container=<c>]` | `kubectl exec` | Linux containers | `kubectl` on PATH + a kubeconfig with `exec` permission on the pod |
+
+All four backends implement the same `ExecutionContext` interface
+(`src/runtime/execContext.ts`) so every probe behaves identically — only the
+shell-transport differs.
 
 ## Supported TeamViewer products
 
