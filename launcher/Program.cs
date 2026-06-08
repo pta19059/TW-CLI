@@ -284,16 +284,40 @@ static void DrawSeatedFigure(bool useAnsi, string cCyan, string cReset)
         return;
     }
 
-    // One intro blink (preserves the original launcher beat).
+    // One intro blink. Use absolute SetCursorPosition (NOT relative ESC[N A/B)
+    // because conhost clamps relative moves when the buffer has scrolled,
+    // which previously made the blink paint the eyes line onto an unrelated
+    // row above the figure — producing a "phantom head" duplicate.
     const int eyeIndex = 1;
     string eyesOpen = FigureAnim.Idle[eyeIndex];
     string eyesClosed = eyesOpen.Replace("o o", "- -");
-    int up = FigureAnim.Idle.Length - eyeIndex;
+
+    void PaintEyes(string text)
+    {
+        if (FigureAnim.TopRow < 0) return;
+        int saveTop = Console.CursorTop;
+        int saveLeft = Console.CursorLeft;
+        try
+        {
+            int row = FigureAnim.TopRow + eyeIndex;
+            int winTop = Console.WindowTop;
+            int winBot = winTop + Console.WindowHeight - 1;
+            if (row < winTop || row > winBot) return;   // off-screen → skip
+            Console.SetCursorPosition(FigureAnim.LeftCol, row);
+            Console.Write("\u001b[2K");
+            Console.Write($"{cCyan}{text}{cReset}");
+        }
+        catch { /* resize race → just skip the blink */ }
+        finally
+        {
+            try { Console.SetCursorPosition(saveLeft, saveTop); } catch { }
+        }
+    }
 
     Thread.Sleep(650);
-    Console.Write($"\u001b[{up}A\r\u001b[2K{cCyan}{eyesClosed}{cReset}\u001b[{up}B\r");
+    PaintEyes(eyesClosed);
     Thread.Sleep(150);
-    Console.Write($"\u001b[{up}A\r\u001b[2K{cCyan}{eyesOpen}{cReset}\u001b[{up}B\r");
+    PaintEyes(eyesOpen);
 }
 
 // Start a background timer that, every 20 seconds, briefly animates the
