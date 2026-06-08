@@ -97,24 +97,24 @@ export function fromConnectivity(report: ConnectivityReport, target: string): Sp
       report.https.ok
         ? `HTTP ${report.https.status} in ${report.https.ms}ms`
         : report.https.tlsValidationFailed
-          ? `reachable but TLS validation failed (${report.https.error})`
+          ? `reachable but TLS validation failed locally (${report.https.error})`
           : `failed (${report.https.error})`
     }`
   );
   if (!report.https.ok) {
     if (report.https.tlsValidationFailed) {
-      // Server IS reachable — NOT a connectivity / firewall issue. Distinct
-      // root cause + actionable remediation. Score lower than a true
-      // unreachable since traffic still flows.
-      rootCauses.push({
-        title: "TeamViewer Web API reachable but TLS certificate validation failed",
-        score: 0.55,
-        rationale: report.https.error ?? "TLS handshake failed during certificate verification"
-      });
+      // TLS validation failure is a PROBE-LOCAL hygiene issue (stale CA bundle
+      // on the host running curl, NOT a TeamViewer connectivity problem).
+      // The server WAS reachable. Do NOT add a root cause — it would mislead
+      // the synthesiser into blaming TLS for whatever symptom the user reported.
+      // Surface as an explicit caveat in evidence and offer a low-risk hygiene
+      // action so a future run gets a clean HTTPS probe.
+      evidence.push(
+        "Note: the HTTPS failure above is a LOCAL certificate-validation issue on the probe host (likely outdated CA bundle, e.g. macOS Monterey). The TeamViewer Web API itself answered HTTP 200 when validation was bypassed — it is NOT a candidate root cause for the user's symptom."
+      );
       actions.push({
         step:
-          "Update the host CA bundle / system trust store (macOS: install latest macOS updates; " +
-          "Linux: refresh ca-certificates; verify system clock). Do NOT change firewall rules — connectivity is fine.",
+          "(Probe hygiene, not a fix) Refresh the host CA bundle / system trust store: macOS — install latest macOS updates; Linux — refresh ca-certificates; verify system clock. Do NOT change firewall rules — connectivity is fine.",
         risk: "low",
         rollback: "Revert to the previous ca-certificates package if the new bundle breaks an internal CA"
       });
@@ -154,10 +154,21 @@ export function fromConnectivity(report: ConnectivityReport, target: string): Sp
     }
   }
   if (report.httpsExtra && report.httpsExtra.length > 0) {
+    // Distinguish "reachable but local TLS validation failed" from real
+    // network failures. The former is a probe-host hygiene issue (stale CA
+    // bundle, e.g. macOS Monterey) and must NOT add a root cause — the
+    // headline webapi probe already covers the hygiene action.
     const okHttps = report.httpsExtra.filter((h) => h.ok).length;
-    evidence.push(`${report.product ?? "Product"} HTTPS checks: ${okHttps}/${report.httpsExtra.length} OK`);
+    const tlsOnlyCount = report.httpsExtra.filter((h) => !h.ok && h.tlsValidationFailed).length;
+    const summaryParts = [`${okHttps}/${report.httpsExtra.length} OK`];
+    if (tlsOnlyCount > 0) summaryParts.push(`${tlsOnlyCount} reachable but local TLS validation failed`);
+    evidence.push(`${report.product ?? "Product"} HTTPS checks: ${summaryParts.join(", ")}`);
     const httpsFail = report.httpsExtra.filter(
-      (h) => !h.ok && !h.bestEffort && !h.url.includes("webapi.teamviewer.com")
+      (h) =>
+        !h.ok &&
+        !h.tlsValidationFailed &&
+        !h.bestEffort &&
+        !h.url.includes("webapi.teamviewer.com")
     );
     for (const h of httpsFail) {
       rootCauses.push({

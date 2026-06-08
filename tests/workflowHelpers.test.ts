@@ -127,6 +127,27 @@ describe("filterActionsAgainstEvidence", () => {
     );
     expect(out.length).toBe(1);
   });
+  it("drops launchctl-load-teamviewerd action when TeamViewer_Service is in process list", () => {
+    const out = filterActionsAgainstEvidence(
+      [
+        { step: "Register/start the background service: sudo launchctl load -w /Library/LaunchDaemons/com.teamviewer.teamviewerd.plist", risk: "low", rollback: "r" },
+        { step: "Restart the TeamViewer app", risk: "low", rollback: "r" }
+      ],
+      [
+        "Processes running: TeamViewer, TeamViewer_Service, bash, com.teamviewer.KeychainService",
+        "No TeamViewer Remote launch agents/daemons registered with launchctl."
+      ]
+    );
+    expect(out.length).toBe(1);
+    expect(out[0].step).toMatch(/restart the teamviewer app/i);
+  });
+  it("keeps launchctl-load action when TeamViewer_Service is NOT in process list", () => {
+    const out = filterActionsAgainstEvidence(
+      [{ step: "sudo launchctl load -w com.teamviewer.teamviewerd.plist", risk: "low", rollback: "r" }],
+      ["Processes running: bash, ssh"]
+    );
+    expect(out.length).toBe(1);
+  });
 });
 
 describe("filterRootCausesAgainstEvidence", () => {

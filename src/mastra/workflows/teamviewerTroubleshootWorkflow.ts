@@ -413,6 +413,7 @@ const aggregateStep = createStep({
     // one-liner so the report stays renderable.
     const issueShort = sanitizePromptInput(meta.issue, 240);
     const topTitle = topRoots[0]?.title ?? "unclassified";
+    const hasPlausibleCause = topRoots.length > 0 && (topRoots[0]?.score ?? 0) >= 0.5;
     // Do NOT include the confidence number in the prompt — small models
     // misformat it ("high confidence at 0.20%") because they map 0.20
     // to language-level confidence without understanding the scale. The
@@ -421,18 +422,31 @@ const aggregateStep = createStep({
       (strict
         ? "Output EXACTLY one short English sentence (max 30 words). Plain prose only. No JSON, no tool calls, no markdown, no labels, no percentages, no numbers, no quotes.\n\n"
         : "Write ONE short English sentence (max 30 words) describing the troubleshooting outcome. Plain prose only. No JSON, no tool calls, no markdown, no labels, no percentages, no numbers.\n\n") +
-      `Brief: A ${meta.task} run for ${meta.product} examined the user issue "${issueShort}" ` +
-      `and identified the most likely cause as ${topTitle}.\n\n` +
+      (hasPlausibleCause
+        ? `Brief: A ${meta.task} run for ${meta.product} examined the user issue "${issueShort}" ` +
+          `and identified the most likely cause as ${topTitle}.\n\n`
+        : `Brief: A ${meta.task} run for ${meta.product} examined the user issue "${issueShort}" ` +
+          `and found that all baseline network and service checks succeeded, so no definitive cause was identified; deeper logs or a live reproduction are needed.\n\n`) +
       "Sentence:";
 
     let summary = "";
-    for (const strict of [false, true]) {
-      const out = await gatewayAgent.generate(buildSummaryPrompt(strict));
-      summary = cleanSummary(out.text ?? "");
-      if (summary) break;
-    }
-    if (!summary) {
-      summary = `${meta.task === "debug" ? "Debug" : "Troubleshoot"} run completed for ${meta.product}; top candidate root cause: ${topTitle} (confidence ${confidence.toFixed(2)}).`;
+    // When we have NO plausible root cause, the LLM tends to hallucinate one
+    // (it grabs the only candidate from evidence and invents causality). Use
+    // a deterministic neutral summary instead — never let the model invent.
+    if (!hasPlausibleCause) {
+      summary =
+        `${meta.task === "debug" ? "Debug" : "Troubleshoot"} run completed for ${meta.product}: ` +
+        "baseline network and service checks all succeeded, so probes did not identify a definitive root cause; " +
+        "capture TeamViewer client logs during a live drop and re-run to narrow further.";
+    } else {
+      for (const strict of [false, true]) {
+        const out = await gatewayAgent.generate(buildSummaryPrompt(strict));
+        summary = cleanSummary(out.text ?? "");
+        if (summary) break;
+      }
+      if (!summary) {
+        summary = `${meta.task === "debug" ? "Debug" : "Troubleshoot"} run completed for ${meta.product}; top candidate root cause: ${topTitle} (confidence ${confidence.toFixed(2)}).`;
+      }
     }
 
     const selected = selectAgents(meta.task as JobType, meta.buckets);
@@ -565,16 +579,35 @@ export function filterActionsAgainstEvidence(
   // Firewall is definitively NOT the problem when DNS + TCP both work.
   // (HTTPS may still fail for cert / proxy / TLS reasons — not firewall.)
   const firewallRuledOut = dnsOk && (port5938Open || endpointTcpOk);
+  // TeamViewer service/daemon is RUNNING when we see its process in the
+  // process list. The endpoint-health specialist sometimes recommends
+  // `launchctl load teamviewerd` purely because no launchd job was registered
+  // — but on modern macOS TeamViewer 15 runs as a regular app and the daemon
+  // job is optional; the service IS running.
+  const teamviewerServiceRunning =
+    /processes\s+running:[^\n]*\bteamviewer_service\b/i.test(joined) ||
+    /processes\s+running:[^\n]*\bteamviewerd\b/i.test(joined);
 
   return actions.filter((a) => {
     const text = `${a.step} ${a.rollback ?? ""} ${a.command ?? ""}`.toLowerCase();
     const mentionsFirewall = /firewall/.test(text);
-    if (!mentionsFirewall) return true;
-    // Action explicitly about port 5938 and we just proved it open → drop.
-    if (port5938Open && /\b5938\b/.test(text)) return false;
-    // Generic "firewall blocking TeamViewer traffic" / "firewall rules" —
-    // if DNS + TCP work, firewall is not the cause: drop.
-    if (firewallRuledOut && /teamviewer|traffic|blocking|rules/.test(text)) return false;
+    if (mentionsFirewall) {
+      // Action explicitly about port 5938 and we just proved it open → drop.
+      if (port5938Open && /\b5938\b/.test(text)) return false;
+      // Generic "firewall blocking TeamViewer traffic" / "firewall rules" —
+      // if DNS + TCP work, firewall is not the cause: drop.
+      if (firewallRuledOut && /teamviewer|traffic|blocking|rules/.test(text)) return false;
+    }
+    // "sudo launchctl load -w .../com.teamviewer.teamviewerd.plist" or any
+    // "start the background service teamviewerd" recommendation — only valid
+    // when the service is NOT already running.
+    if (
+      teamviewerServiceRunning &&
+      /\b(launchctl|launchd|background\s+service|start\s+service|service\s+is\s+not\s+running)\b/.test(text) &&
+      /teamviewer/.test(text)
+    ) {
+      return false;
+    }
     return true;
   });
 }
