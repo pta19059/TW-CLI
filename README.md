@@ -51,8 +51,8 @@ The `twc` prefix is optional inside the interactive shell. Run `twc --help` or `
 | `twc products list` | List the whitelisted TeamViewer products | `twc products list` |
 | `twc agents list` | List the Mastra agent roles | `twc agents list` |
 | `twc agents plan --task <t> --issue "<text>"` | Show which agents would be selected (dry run) | `twc agents plan --task troubleshoot --issue "policy not applied"` |
-| `twc debug <product> --target <v> --issue "<text>" [--context <c>] [--wait]` | Run a background **debug** job | `twc debug teamviewer-remote --target endpoint-001 --issue "crash on start" --wait` |
-| `twc troubleshoot <product> --target <v> --issue "<text>" [--context <c>] [--wait]` | Run a background **troubleshoot** job | `twc troubleshoot teamviewer-tensor --target tenant-acme --issue "policy rollout not applied" --wait` |
+| `twc debug <product> --target <v> --issue "<text>" [--context <c>] [--wait] [--user <u> [--port N] [--key <path>]]` | Run a background **debug** job. With `--user`, all probes execute on `<target>` via SSH instead of locally. | `twc debug teamviewer-remote --target endpoint-001 --issue "crash on start" --wait` |
+| `twc troubleshoot <product> --target <v> --issue "<text>" [--context <c>] [--wait] [--user <u> [--port N] [--key <path>]]` | Run a background **troubleshoot** job. With `--user`, all probes execute on `<target>` via SSH instead of locally. | `twc troubleshoot teamviewer-remote --target XXX.XXX.XXX.XXX --user <user> --issue "daemon not connecting" --wait` |
 | `twc probe <target> [--port N] [--timeout ms] [--no-dns]` | Raw DNS + TCP connect probe (default port 5938 = TeamViewer daemon). No LLM. | `twc probe router1.teamviewer.com --port 5938` |
 | `twc inspect-remote <target> --user <u> [--port 22] [--key <path>] [--json]` | SSH into a remote macOS host and collect TeamViewer diagnostics (version, daemon, logs, cloud reachability). Read-only, no LLM. | `twc inspect-remote XXX.XXX.XXX.XXX --user <user>` |
 | `twc jobs list [--limit N]` | List recent background jobs | `twc jobs list --limit 10` |
@@ -82,6 +82,10 @@ twc -p "Session drops after 5 minutes" --product teamviewer-remote --target endp
 
 # Background troubleshoot job, wait and print the result inline:
 twc troubleshoot teamviewer-tensor --target tenant-acme --issue "Policy rollout not applied" --wait
+
+# Remote troubleshoot: run every probe on a Mac/Linux host via SSH instead of locally.
+# Requires passwordless SSH (key already in ~/.ssh/authorized_keys on the target).
+twc troubleshoot teamviewer-remote --target XXX.XXX.XXX.XXX --user <user> --issue "daemon not connecting" --wait
 
 # Inspect the last job without remembering its id:
 twc jobs show               # last job

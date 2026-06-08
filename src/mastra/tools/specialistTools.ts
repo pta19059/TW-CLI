@@ -6,6 +6,7 @@ import { runConnectivityProbe, type ConnectivityReport } from "../../probes/conn
 import { runEndpointHealthProbe, type EndpointHealthReport } from "../../probes/endpointHealth.js";
 import { runLogProbe, type LogProbeReport } from "../../probes/logs.js";
 import { runAuthPolicyProbe, type AuthProbeReport } from "../../probes/authPolicy.js";
+import { getCurrentContext } from "../../runtime/runContext.js";
 
 function resolveProfile(product?: string) {
   return getProductProfile((product as ProductKey) ?? "teamviewer-remote");
@@ -152,7 +153,7 @@ export function fromConnectivity(report: ConnectivityReport, target: string): Sp
 export async function runConnectivityAnalysis(
   input: z.infer<typeof specialistInputSchema>
 ): Promise<SpecialistOutput> {
-  const report = await runConnectivityProbe(resolveProfile(input.product));
+  const report = await runConnectivityProbe(resolveProfile(input.product), getCurrentContext());
   return fromConnectivity(report, input.target);
 }
 
@@ -298,7 +299,7 @@ export function fromEndpointHealth(report: EndpointHealthReport, target: string)
 export async function runEndpointHealthAnalysis(
   input: z.infer<typeof specialistInputSchema>
 ): Promise<SpecialistOutput> {
-  const report = await runEndpointHealthProbe(resolveProfile(input.product));
+  const report = await runEndpointHealthProbe(resolveProfile(input.product), getCurrentContext());
   return fromEndpointHealth(report, input.target);
 }
 
@@ -347,7 +348,7 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
 export async function runLogIntelligenceAnalysis(
   input: z.infer<typeof specialistInputSchema>
 ): Promise<SpecialistOutput> {
-  const report = runLogProbe(resolveProfile(input.product));
+  const report = await runLogProbe(resolveProfile(input.product), getCurrentContext());
   return fromLogs(report);
 }
 

@@ -3,16 +3,22 @@
 // profile, so Remote/Tensor look for the core client, Remote Management looks
 // for the monitoring agent, DEX looks for the 1E Client, etc. Cloud-/mobile-only
 // products report "no local agent" as context rather than a fault.
+//
+// Execution model: every host-touching call goes through an ExecutionContext,
+// so the same probe works locally (LocalContext) or against a remote host over
+// SSH (SshContext). The branch picked (windows/linux/macos commands) is driven
+// by ctx.os — the *target* OS — not by process.platform.
 
-import { execFile } from "node:child_process";
 import os from "node:os";
-import { promisify } from "node:util";
 import { getProductProfile, type DeliveryModel, type ProductDiagnosticProfile } from "../catalog/productProfiles.js";
-
-const pExecFile = promisify(execFile);
+import { LocalContext, type ExecutionContext, type RemoteOs } from "../runtime/execContext.js";
 
 function psList(names: string[]): string {
   return names.map((n) => `'${n.replace(/'/g, "''")}'`).join(",");
+}
+
+function regexEscape(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 export interface ServiceInfo {
@@ -22,6 +28,10 @@ export interface ServiceInfo {
 }
 
 export interface EndpointHealthReport {
+  /** Kept as NodeJS.Platform for backward compatibility with the existing
+   *  specialistTools / report renderers. Mapped from ctx.os, NOT from
+   *  process.platform, so a remote SSH probe to a Mac always reports "darwin"
+   *  even when the CLI runs on Windows. */
   platform: NodeJS.Platform;
   osRelease: string;
   hostname: string;
@@ -36,68 +46,61 @@ export interface EndpointHealthReport {
   // ── product-aware additions (optional, backward compatible) ──
   product?: string;
   deliveryModel?: DeliveryModel;
+  /** Description of where the probe ran ("local" or "ssh user@host"). */
+  executionTarget?: string;
 }
 
-async function getWindowsServices(names: string[]): Promise<ServiceInfo[]> {
+function osToPlatform(o: RemoteOs): NodeJS.Platform {
+  if (o === "windows") return "win32";
+  if (o === "linux") return "linux";
+  if (o === "macos") return "darwin";
+  // Treat "unknown" as linux so POSIX commands still get a chance — better
+  // than failing loudly when uname is unavailable on a slim SSH image.
+  return "linux";
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Windows probes (ctx-driven — runs via PowerShell on the *target*)
+// ──────────────────────────────────────────────────────────────────────────
+
+async function getWindowsServices(ctx: ExecutionContext, names: string[]): Promise<ServiceInfo[]> {
   if (names.length === 0) return [];
+  const cmd =
+    `Get-Service -Name ${psList(names)} -ErrorAction SilentlyContinue | ` +
+    `Select-Object Name,Status,StartType | ConvertTo-Json -Compress`;
+  const r = await ctx.runShell(cmd, { timeoutMs: 6000 });
+  if (r.exitCode !== 0 || !r.stdout.trim()) return [];
   try {
-    const { stdout } = await pExecFile(
-      "powershell.exe",
-      [
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        `Get-Service -Name ${psList(names)} -ErrorAction SilentlyContinue | Select-Object Name,Status,StartType | ConvertTo-Json -Compress`
-      ],
-      { timeout: 5000, windowsHide: true }
-    );
-    if (!stdout.trim()) return [];
-    const parsed: unknown = JSON.parse(stdout);
+    const parsed: unknown = JSON.parse(r.stdout);
     const arr = Array.isArray(parsed) ? parsed : [parsed];
-    return arr.map((r: any) => ({
-      name: String(r?.Name ?? ""),
-      status: r?.Status !== undefined ? String(r.Status) : undefined,
-      startType: r?.StartType !== undefined ? String(r.StartType) : undefined
+    return arr.map((s: any) => ({
+      name: String(s?.Name ?? ""),
+      status: s?.Status !== undefined ? String(s.Status) : undefined,
+      startType: s?.StartType !== undefined ? String(s.StartType) : undefined
     }));
   } catch {
     return [];
   }
 }
 
-async function getWindowsProcesses(patterns: string[]): Promise<string[]> {
+async function getWindowsProcesses(ctx: ExecutionContext, patterns: string[]): Promise<string[]> {
   if (patterns.length === 0) return [];
-  try {
-    const { stdout } = await pExecFile(
-      "powershell.exe",
-      [
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        `Get-Process -Name ${psList(patterns.map((p) => `${p}*`))} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ProcessName | Sort-Object -Unique`
-      ],
-      { timeout: 5000, windowsHide: true }
-    );
-    return stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-  } catch {
-    return [];
-  }
+  const cmd =
+    `Get-Process -Name ${psList(patterns.map((p) => `${p}*`))} -ErrorAction SilentlyContinue | ` +
+    `Select-Object -ExpandProperty ProcessName | Sort-Object -Unique`;
+  const r = await ctx.runShell(cmd, { timeoutMs: 6000 });
+  if (r.exitCode !== 0) return [];
+  return r.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
 }
 
-async function getWindowsRegistry(): Promise<{ version?: string; clientId?: string }> {
+async function getWindowsRegistry(ctx: ExecutionContext): Promise<{ version?: string; clientId?: string }> {
+  const cmd =
+    `$paths=@('HKLM:\\SOFTWARE\\TeamViewer','HKLM:\\SOFTWARE\\WOW6432Node\\TeamViewer');` +
+    `foreach($p in $paths){ if(Test-Path $p){ Get-ItemProperty $p | Select-Object Version,ClientID | ConvertTo-Json -Compress; break } }`;
+  const r = await ctx.runShell(cmd, { timeoutMs: 6000 });
+  if (r.exitCode !== 0 || !r.stdout.trim()) return {};
   try {
-    const { stdout } = await pExecFile(
-      "powershell.exe",
-      [
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "$paths=@('HKLM:\\SOFTWARE\\TeamViewer','HKLM:\\SOFTWARE\\WOW6432Node\\TeamViewer');" +
-          "foreach($p in $paths){ if(Test-Path $p){ Get-ItemProperty $p | Select-Object Version,ClientID | ConvertTo-Json -Compress; break } }"
-      ],
-      { timeout: 5000, windowsHide: true }
-    );
-    if (!stdout.trim()) return {};
-    const parsed: any = JSON.parse(stdout);
+    const parsed: any = JSON.parse(r.stdout);
     return {
       version: parsed?.Version ? String(parsed.Version) : undefined,
       clientId: parsed?.ClientID ? String(parsed.ClientID) : undefined
@@ -107,116 +110,188 @@ async function getWindowsRegistry(): Promise<{ version?: string; clientId?: stri
   }
 }
 
-async function getLinuxServices(units: string[]): Promise<ServiceInfo[]> {
+// ──────────────────────────────────────────────────────────────────────────
+// Linux probes
+// ──────────────────────────────────────────────────────────────────────────
+
+async function getLinuxServices(ctx: ExecutionContext, units: string[]): Promise<ServiceInfo[]> {
   const unitNames = units.length > 0 ? units : ["teamviewerd"];
-  // `systemctl show` never exits non-zero for a known-but-inactive unit, so we
-  // get ActiveState/SubState/UnitFileState in one shot without throwing.
   const out: ServiceInfo[] = [];
   for (const unit of unitNames) {
-    try {
-      const { stdout } = await pExecFile(
-        "systemctl",
-        ["show", unit, "--no-page", "--property=ActiveState,SubState,UnitFileState,LoadState"],
-        { timeout: 4000 }
-      );
-      const kv = new Map<string, string>();
-      for (const line of stdout.split(/\r?\n/)) {
-        const idx = line.indexOf("=");
-        if (idx > 0) kv.set(line.slice(0, idx), line.slice(idx + 1).trim());
+    // systemctl show never exits non-zero for a known-but-inactive unit,
+    // so we get ActiveState/SubState/UnitFileState in one shot.
+    const r = await ctx.runShell(
+      `systemctl show ${unit} --no-page --property=ActiveState,SubState,UnitFileState,LoadState 2>/dev/null`,
+      { timeoutMs: 5000 }
+    );
+    const text = r.stdout || "";
+    if (!text.trim()) {
+      // systemd absent (containers, minimal images) — try the legacy `service` wrapper.
+      const fb = await ctx.runShell(`service ${unit} status 2>/dev/null`, { timeoutMs: 4000 });
+      if (fb.stdout && /running|active/i.test(fb.stdout)) {
+        out.push({ name: unit, status: "Running" });
       }
-      if (kv.get("LoadState") === "not-found") continue;
-      const active = kv.get("ActiveState"); // active | inactive | failed
-      const sub = kv.get("SubState"); // running | dead | ...
-      out.push({
-        name: unit,
-        status: active === "active" ? "Running" : `${active ?? "unknown"}${sub ? ` (${sub})` : ""}`,
-        startType: kv.get("UnitFileState") // enabled | disabled | static
-      });
-    } catch {
-      // systemd absent (containers, minimal images) — fall back to a liveness probe.
-      try {
-        const { stdout } = await pExecFile("service", [unit, "status"], { timeout: 4000 });
-        out.push({ name: unit, status: /running|active/i.test(stdout) ? "Running" : "Stopped" });
-      } catch {
-        /* unit not present via this manager */
-      }
+      continue;
     }
+    const kv = new Map<string, string>();
+    for (const line of text.split(/\r?\n/)) {
+      const idx = line.indexOf("=");
+      if (idx > 0) kv.set(line.slice(0, idx), line.slice(idx + 1).trim());
+    }
+    if (kv.get("LoadState") === "not-found") continue;
+    const active = kv.get("ActiveState");
+    const sub = kv.get("SubState");
+    out.push({
+      name: unit,
+      status: active === "active" ? "Running" : `${active ?? "unknown"}${sub ? ` (${sub})` : ""}`,
+      startType: kv.get("UnitFileState")
+    });
   }
   return out;
 }
 
-async function getMacServices(names: string[]): Promise<ServiceInfo[]> {
-  const matcher = names.length > 0
-    ? new RegExp(names.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "i")
-    : /teamviewer/i;
-  try {
-    const { stdout } = await pExecFile("launchctl", ["list"], { timeout: 4000 });
-    return stdout
-      .split(/\r?\n/)
-      .filter((line) => matcher.test(line))
-      .map((line) => {
-        const parts = line.trim().split(/\s+/);
-        return { name: parts[2] ?? "teamviewer", status: parts[1] === "0" ? "Running" : `exit ${parts[1]}` };
-      });
-  } catch {
-    return [];
-  }
-}
-
-async function getPosixProcesses(patterns: string[]): Promise<string[]> {
-  const pattern = patterns.length > 0
-    ? patterns.map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")
-    : "teamviewer";
-  // `pgrep -l` prints "<pid> <name>"; available on both Linux and macOS.
-  try {
-    const { stdout } = await pExecFile("pgrep", ["-l", "-i", pattern], { timeout: 4000 });
-    const names = new Set<string>();
-    for (const line of stdout.split(/\r?\n/)) {
-      const name = line.trim().split(/\s+/)[1];
-      if (name) names.add(name);
-    }
-    return [...names].sort();
-  } catch {
-    return [];
-  }
-}
-
-async function getLinuxInfo(): Promise<{ version?: string; clientId?: string }> {
-  // `teamviewer --info` (or `info`) reports the version and the TeamViewer ID.
-  for (const args of [["--info"], ["info"]]) {
-    try {
-      const { stdout } = await pExecFile("teamviewer", args, { timeout: 5000 });
-      const idMatch = stdout.match(/TeamViewer ID:\s*([0-9 ]+)/i);
-      const verMatch = stdout.match(/TeamViewer\s+v?(\d+\.\d+[\d.]*)/i) ?? stdout.match(/version:?\s*v?(\d+\.\d+[\d.]*)/i);
+async function getLinuxInfo(ctx: ExecutionContext): Promise<{ version?: string; clientId?: string }> {
+  for (const args of ["--info", "info"]) {
+    const r = await ctx.runShell(`teamviewer ${args} 2>/dev/null`, { timeoutMs: 6000 });
+    if (r.exitCode === 0 && r.stdout) {
+      const idMatch = r.stdout.match(/TeamViewer ID:\s*([0-9 ]+)/i);
+      const verMatch = r.stdout.match(/TeamViewer\s+v?(\d+\.\d+[\d.]*)/i) ?? r.stdout.match(/version:?\s*v?(\d+\.\d+[\d.]*)/i);
       if (idMatch || verMatch) {
         return {
           version: verMatch?.[1],
           clientId: idMatch?.[1]?.replace(/\s+/g, "") || undefined
         };
       }
-    } catch {
-      /* try next form */
     }
   }
   return {};
 }
 
-async function getMacInfo(): Promise<{ version?: string; clientId?: string }> {
-  try {
-    const { stdout } = await pExecFile(
-      "defaults",
-      ["read", "/Applications/TeamViewer.app/Contents/Info", "CFBundleShortVersionString"],
-      { timeout: 4000 }
-    );
-    const version = stdout.trim();
-    return version ? { version } : {};
-  } catch {
-    return {};
-  }
+// ──────────────────────────────────────────────────────────────────────────
+// macOS probes
+// ──────────────────────────────────────────────────────────────────────────
+
+async function getMacServices(ctx: ExecutionContext, names: string[]): Promise<ServiceInfo[]> {
+  const r = await ctx.runShell("launchctl list 2>/dev/null", { timeoutMs: 5000 });
+  if (r.exitCode !== 0 || !r.stdout) return [];
+  const matcher = names.length > 0
+    ? new RegExp(names.map(regexEscape).join("|"), "i")
+    : /teamviewer/i;
+  return r.stdout
+    .split(/\r?\n/)
+    .filter((line) => matcher.test(line))
+    .map((line) => {
+      const parts = line.trim().split(/\s+/);
+      return { name: parts[2] ?? "teamviewer", status: parts[1] === "0" ? "Running" : `exit ${parts[1]}` };
+    });
 }
 
+async function getMacInfo(ctx: ExecutionContext): Promise<{ version?: string; clientId?: string }> {
+  const r = await ctx.runShell(
+    `defaults read /Applications/TeamViewer.app/Contents/Info CFBundleShortVersionString 2>/dev/null`,
+    { timeoutMs: 4000 }
+  );
+  const version = r.stdout.trim();
+  return version ? { version } : {};
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// POSIX shared probes
+// ──────────────────────────────────────────────────────────────────────────
+
+async function getPosixProcesses(ctx: ExecutionContext, patterns: string[]): Promise<string[]> {
+  const pattern = patterns.length > 0
+    ? patterns.map(regexEscape).join("|")
+    : "teamviewer";
+  // pgrep -l prints "<pid> <name>"; -i case-insensitive; -f matches full cmdline.
+  const r = await ctx.runShell(`pgrep -l -f -i '${pattern.replace(/'/g, "'\\''")}' 2>/dev/null`, { timeoutMs: 5000 });
+  if (r.exitCode !== 0 || !r.stdout) return [];
+  const names = new Set<string>();
+  for (const line of r.stdout.split(/\r?\n/)) {
+    const parts = line.trim().split(/\s+/);
+    // pgrep -lf prints "<pid> <cmd> <args...>" — keep the basename of the cmd.
+    const cmd = parts[1];
+    if (!cmd) continue;
+    const base = cmd.split(/[\\/]/).pop() ?? cmd;
+    names.add(base);
+  }
+  return [...names].sort();
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Host info (hostname / uptime / memory)
+// ──────────────────────────────────────────────────────────────────────────
+
+interface HostInfo {
+  hostname: string;
+  osRelease: string;
+  uptimeSec: number;
+  freeMemMb: number;
+  totalMemMb: number;
+}
+
+async function gatherHostInfoLocal(): Promise<HostInfo> {
+  return {
+    hostname: os.hostname(),
+    osRelease: os.release(),
+    uptimeSec: Math.round(os.uptime()),
+    freeMemMb: Math.round(os.freemem() / 1024 / 1024),
+    totalMemMb: Math.round(os.totalmem() / 1024 / 1024)
+  };
+}
+
+async function gatherHostInfoRemote(ctx: ExecutionContext): Promise<HostInfo> {
+  // Best-effort remote host metrics. Failures are tolerated — missing values
+  // surface as 0 so the report renderer can still summarize the run.
+  let hostname = "remote";
+  let osRelease = "";
+  let uptimeSec = 0;
+  let freeMemMb = 0;
+  let totalMemMb = 0;
+
+  const hn = await ctx.runShell("hostname 2>/dev/null", { timeoutMs: 4000 });
+  if (hn.exitCode === 0 && hn.stdout) hostname = hn.stdout.trim().split(/\s+/)[0] ?? "remote";
+
+  const rel = await ctx.runShell("uname -r 2>/dev/null", { timeoutMs: 4000 });
+  if (rel.exitCode === 0 && rel.stdout) osRelease = rel.stdout.trim();
+
+  if (ctx.os === "macos") {
+    const up = await ctx.runShell(`sysctl -n kern.boottime 2>/dev/null | awk -F'[= ,]' '{print $6}'`, { timeoutMs: 4000 });
+    const boot = parseInt((up.stdout || "").trim(), 10);
+    if (!isNaN(boot) && boot > 0) {
+      uptimeSec = Math.max(0, Math.round(Date.now() / 1000 - boot));
+    }
+    const mem = await ctx.runShell(
+      `sysctl -n hw.memsize 2>/dev/null; pagesize=$(/usr/bin/pagesize 2>/dev/null || echo 4096); ` +
+        `vm_stat 2>/dev/null | awk -v ps=$pagesize '/Pages free/ {gsub(/\\./,"",$3); print $3*ps}'`,
+      { timeoutMs: 5000 }
+    );
+    const lines = (mem.stdout || "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    if (lines[0]) totalMemMb = Math.round(parseInt(lines[0], 10) / 1024 / 1024) || 0;
+    if (lines[1]) freeMemMb = Math.round(parseInt(lines[1], 10) / 1024 / 1024) || 0;
+  } else {
+    const up = await ctx.runShell(`awk '{print int($1)}' /proc/uptime 2>/dev/null`, { timeoutMs: 4000 });
+    const s = parseInt((up.stdout || "").trim(), 10);
+    if (!isNaN(s)) uptimeSec = s;
+    const mem = await ctx.runShell(
+      `awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {print t" "a}' /proc/meminfo 2>/dev/null`,
+      { timeoutMs: 4000 }
+    );
+    const [tot, avail] = (mem.stdout || "").trim().split(/\s+/).map((n) => parseInt(n, 10));
+    if (!isNaN(tot)) totalMemMb = Math.round(tot / 1024);
+    if (!isNaN(avail)) freeMemMb = Math.round(avail / 1024);
+  }
+
+  return { hostname, osRelease, uptimeSec, freeMemMb, totalMemMb };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Public entrypoint
+// ──────────────────────────────────────────────────────────────────────────
+
 export async function runEndpointHealthProbe(
-  profile: ProductDiagnosticProfile = getProductProfile("teamviewer-remote")
+  profile: ProductDiagnosticProfile = getProductProfile("teamviewer-remote"),
+  ctx: ExecutionContext = new LocalContext()
 ): Promise<EndpointHealthReport> {
   const diagnostics: string[] = [];
   let services: ServiceInfo[] = [];
@@ -225,11 +300,11 @@ export async function runEndpointHealthProbe(
   const label = profile.name;
   const cloudOnly = profile.deliveryModel === "cloud-or-mobile";
 
-  if (process.platform === "win32") {
+  if (ctx.os === "windows") {
     [services, processes, reg] = await Promise.all([
-      getWindowsServices(profile.services.win32),
-      getWindowsProcesses(profile.processes.win32),
-      getWindowsRegistry()
+      getWindowsServices(ctx, profile.services.win32),
+      getWindowsProcesses(ctx, profile.processes.win32),
+      getWindowsRegistry(ctx)
     ]);
     if (services.length === 0) diagnostics.push(`No ${label} services found (Get-Service returned empty).`);
     else {
@@ -238,11 +313,11 @@ export async function runEndpointHealthProbe(
     }
     if (processes.length === 0) diagnostics.push(`No ${label} processes running.`);
     if (!reg.version) diagnostics.push("TeamViewer not detected in HKLM registry (uninstalled or non-standard path).");
-  } else if (process.platform === "linux") {
+  } else if (ctx.os === "linux") {
     [services, processes, reg] = await Promise.all([
-      getLinuxServices(profile.services.linux),
-      getPosixProcesses(profile.processes.linux),
-      getLinuxInfo()
+      getLinuxServices(ctx, profile.services.linux),
+      getPosixProcesses(ctx, profile.processes.linux),
+      getLinuxInfo(ctx)
     ]);
     if (services.length === 0) diagnostics.push(`${label} service unit not found (uninstalled or not managed by systemd).`);
     else {
@@ -251,18 +326,18 @@ export async function runEndpointHealthProbe(
     }
     if (processes.length === 0) diagnostics.push(`No ${label} processes running (pgrep found none).`);
     if (!reg.version && !reg.clientId) diagnostics.push("`teamviewer --info` unavailable (CLI not on PATH or daemon down).");
-  } else if (process.platform === "darwin") {
+  } else if (ctx.os === "macos") {
     [services, processes, reg] = await Promise.all([
-      getMacServices(profile.services.darwin),
-      getPosixProcesses(profile.processes.darwin),
-      getMacInfo()
+      getMacServices(ctx, profile.services.darwin),
+      getPosixProcesses(ctx, profile.processes.darwin),
+      getMacInfo(ctx)
     ]);
     if (services.length === 0) diagnostics.push(`No ${label} launch agents/daemons registered with launchctl.`);
     if (processes.length === 0) diagnostics.push(`No ${label} processes running (pgrep found none).`);
     if (!reg.version) diagnostics.push("TeamViewer.app not found under /Applications (non-standard install path).");
   } else {
     services = [];
-    diagnostics.push(`Endpoint probing is not implemented for platform '${process.platform}'.`);
+    diagnostics.push(`Endpoint probing is not implemented for OS '${ctx.os}'.`);
   }
 
   // For cloud-/mobile-first products, the absence of a host agent is EXPECTED.
@@ -272,19 +347,18 @@ export async function runEndpointHealthProbe(
     );
   }
 
+  const hostInfo = ctx.kind === "local" ? await gatherHostInfoLocal() : await gatherHostInfoRemote(ctx);
+
   return {
-    platform: process.platform,
-    osRelease: os.release(),
-    hostname: os.hostname(),
-    freeMemMb: Math.round(os.freemem() / 1024 / 1024),
-    totalMemMb: Math.round(os.totalmem() / 1024 / 1024),
-    uptimeSec: Math.round(os.uptime()),
+    platform: osToPlatform(ctx.os),
+    ...hostInfo,
     services,
     processes,
     installedVersion: reg.version,
     clientId: reg.clientId,
     diagnostics,
     product: profile.name,
-    deliveryModel: profile.deliveryModel
+    deliveryModel: profile.deliveryModel,
+    executionTarget: ctx.description
   };
 }

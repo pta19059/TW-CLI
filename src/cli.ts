@@ -93,10 +93,35 @@ function resolveJobId(jobId?: string): string | undefined {
 function enqueue(
   type: JobType,
   rawProduct: string,
-  options: { target: string; issue: string; context?: string; wait?: boolean }
+  options: {
+    target: string;
+    issue: string;
+    context?: string;
+    wait?: boolean;
+    user?: string;
+    port?: string;
+    key?: string;
+  }
 ): void {
   const product = resolveProduct(rawProduct);
   const now = new Date().toISOString();
+
+  // Build the SSH connection block when the user passed a remote-target flag.
+  // We treat the explicit presence of --user as the opt-in signal: without it,
+  // probes run locally exactly as before.
+  let connection: AgentJob["input"]["connection"];
+  if (options.user) {
+    const port = options.port ? Number(options.port) : undefined;
+    if (port !== undefined && (!Number.isFinite(port) || port < 1 || port > 65535)) {
+      console.error(`Invalid --port: ${options.port}`);
+      process.exit(2);
+    }
+    connection = {
+      user: options.user,
+      port,
+      identity: options.key
+    };
+  }
 
   const job: AgentJob = {
     id: nanoid(10),
@@ -108,7 +133,8 @@ function enqueue(
     input: {
       target: options.target,
       issue: options.issue,
-      context: options.context
+      context: options.context,
+      connection
     }
   };
 
@@ -183,10 +209,26 @@ export function buildCli(): Command {
     .requiredOption("--issue <issue>", "Debug issue summary")
     .option("--context <context>", "Extra context for the agent")
     .option("--wait", "Wait for the job to finish and print the output directly")
+    .option("--user <user>", "SSH user — when set, all probes run on <target> via SSH instead of locally")
+    .option("--port <port>", "SSH port (default 22)")
+    .option("--key <path>", "Path to an SSH private key (otherwise the ssh-agent / default key is used)")
     .description("Start a background debugging task with Mastra agents")
-    .action((product, options: { target: string; issue: string; context?: string; wait?: boolean }) => {
-      enqueue("debug", product, options);
-    });
+    .action(
+      (
+        product,
+        options: {
+          target: string;
+          issue: string;
+          context?: string;
+          wait?: boolean;
+          user?: string;
+          port?: string;
+          key?: string;
+        }
+      ) => {
+        enqueue("debug", product, options);
+      }
+    );
 
   program
     .command("troubleshoot <product>")
@@ -194,10 +236,26 @@ export function buildCli(): Command {
     .requiredOption("--issue <issue>", "Troubleshooting issue summary")
     .option("--context <context>", "Extra context for the agent")
     .option("--wait", "Wait for the job to finish and print the output directly")
+    .option("--user <user>", "SSH user — when set, all probes run on <target> via SSH instead of locally")
+    .option("--port <port>", "SSH port (default 22)")
+    .option("--key <path>", "Path to an SSH private key (otherwise the ssh-agent / default key is used)")
     .description("Start a background troubleshooting task with Mastra agents")
-    .action((product, options: { target: string; issue: string; context?: string; wait?: boolean }) => {
-      enqueue("troubleshoot", product, options);
-    });
+    .action(
+      (
+        product,
+        options: {
+          target: string;
+          issue: string;
+          context?: string;
+          wait?: boolean;
+          user?: string;
+          port?: string;
+          key?: string;
+        }
+      ) => {
+        enqueue("troubleshoot", product, options);
+      }
+    );
 
   program
     .command("probe <target>")

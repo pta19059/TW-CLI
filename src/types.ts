@@ -60,6 +60,14 @@ export interface JobInput {
   target: string;
   issue: string;
   context?: string;
+  /** Optional SSH connection details. When present, all probes execute on
+   *  the remote host via SSH instead of locally. */
+  connection?: {
+    user: string;
+    port?: number;
+    /** Path to a private key file (otherwise the SSH agent / default key is used). */
+    identity?: string;
+  };
 }
 
 export interface AgentJob {

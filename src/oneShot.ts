@@ -6,6 +6,8 @@ import { renderReportText } from "./agents/formatReport.js";
 import { normalizeProduct, productName } from "./catalog/teamviewerProducts.js";
 import { JobType, ProductKey, WorkflowReport } from "./types.js";
 import { color, startSpinner } from "./ui.js";
+import { createExecutionContext, LocalContext } from "./runtime/execContext.js";
+import { withRunContext } from "./runtime/runContext.js";
 
 export interface OneShotRequest {
   product: ProductKey;
@@ -13,6 +15,12 @@ export interface OneShotRequest {
   target: string;
   issue: string;
   context?: string;
+  /** Optional SSH connection — when present, probes run on the remote host. */
+  connection?: {
+    user: string;
+    port?: number;
+    identity?: string;
+  };
 }
 
 export interface OneShotResult {
@@ -24,11 +32,27 @@ export async function runOneShot(req: OneShotRequest): Promise<OneShotResult> {
   const spinner = startSpinner(`Running ${req.task} workflow for ${productName(req.product)}…`);
   const startedAt = Date.now();
   try {
-    const report = await runMastraAgent({
-      product: req.product,
-      task: req.task,
-      input: { target: req.target, issue: req.issue, context: req.context }
-    });
+    const ctx = req.connection
+      ? await createExecutionContext({
+          target: req.target,
+          user: req.connection.user,
+          port: req.connection.port,
+          identity: req.connection.identity
+        })
+      : new LocalContext();
+
+    const report = await withRunContext(ctx, () =>
+      runMastraAgent({
+        product: req.product,
+        task: req.task,
+        input: {
+          target: req.target,
+          issue: req.issue,
+          context: req.context,
+          connection: req.connection
+        }
+      })
+    );
     const ms = Date.now() - startedAt;
     spinner.stop(color.green(`✓ Done in ${(ms / 1000).toFixed(1)}s — confidence ${report.confidence.toFixed(2)}`));
     const rendered = renderReportText(report);

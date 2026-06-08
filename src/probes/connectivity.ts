@@ -2,10 +2,18 @@
 // timeout-bounded. Driven by a per-product profile so each TeamViewer product
 // is checked against the endpoints IT actually depends on (the shared router
 // backbone plus product-specific SaaS hosts).
+//
+// Execution model: every probe goes through an ExecutionContext.
+//   • LocalContext → uses Node's `dns.resolve4` + `net.Socket` + `fetch` (fast,
+//     no external tools required).
+//   • SshContext   → emits POSIX commands (`dig`, `nc`, `curl`) so reachability
+//     is measured from the *target's* point of view — exactly what you want
+//     when diagnosing "why can't my Mac reach the TeamViewer cloud?".
 
 import dns from "node:dns/promises";
 import net from "node:net";
 import { getProductProfile, type ProbeEndpoint, type ProductDiagnosticProfile } from "../catalog/productProfiles.js";
+import { LocalContext, type ExecutionContext } from "../runtime/execContext.js";
 
 const TV_PORT_PRIMARY = 5938;
 const PROBE_TIMEOUT_MS = 3000;
@@ -41,16 +49,16 @@ export interface ConnectivityReport {
   dns: DnsResult[];
   tcp5938: TcpResult[];
   https: HttpResult;
-  // ── product-aware additions (optional, backward compatible) ──
-  /** Product the probe targeted (display name). */
   product?: string;
-  /** TCP reachability for non-5938 product ports (e.g. 443 to SaaS hosts). */
   tcpExtra?: TcpResult[];
-  /** Application-layer HTTPS checks for product-specific endpoints. */
   httpsExtra?: HttpResult[];
+  /** Description of where the probe ran ("local" or "ssh user@host"). */
+  executionTarget?: string;
 }
 
-async function resolveHost(host: string): Promise<DnsResult> {
+// ───────────────────────── Local probes (Node primitives) ─────────────────────────
+
+async function localDnsResolve(host: string): Promise<DnsResult> {
   const t0 = Date.now();
   try {
     const addrs = await dns.resolve4(host);
@@ -60,17 +68,7 @@ async function resolveHost(host: string): Promise<DnsResult> {
   }
 }
 
-/** Public DNS A-record probe (used by `twc probe` CLI). */
-export async function probeDnsHost(host: string): Promise<DnsResult> {
-  return resolveHost(host);
-}
-
-/** Public TCP connect probe (used by `twc probe` CLI). */
-export async function probeTcpHost(host: string, port: number, timeoutMs?: number): Promise<TcpResult> {
-  return tcpProbe(host, port, timeoutMs);
-}
-
-function tcpProbe(host: string, port: number, timeoutMs = PROBE_TIMEOUT_MS): Promise<TcpResult> {
+function localTcpProbe(host: string, port: number, timeoutMs = PROBE_TIMEOUT_MS): Promise<TcpResult> {
   return new Promise((resolve) => {
     const t0 = Date.now();
     const sock = new net.Socket();
@@ -93,7 +91,7 @@ function tcpProbe(host: string, port: number, timeoutMs = PROBE_TIMEOUT_MS): Pro
   });
 }
 
-async function httpsProbe(url: string, timeoutMs = PROBE_TIMEOUT_MS): Promise<HttpResult> {
+async function localHttpsProbe(url: string, timeoutMs = PROBE_TIMEOUT_MS): Promise<HttpResult> {
   const t0 = Date.now();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -107,18 +105,89 @@ async function httpsProbe(url: string, timeoutMs = PROBE_TIMEOUT_MS): Promise<Ht
   }
 }
 
-/**
- * Run connectivity probes for a product. When no profile is given the legacy
- * core-client backbone is used, preserving prior behaviour.
- */
+// ───────────────────────── Remote probes (shell commands over ctx) ─────────────────────────
+
+async function remoteDnsResolve(ctx: ExecutionContext, host: string): Promise<DnsResult> {
+  const t0 = Date.now();
+  // Prefer `getent hosts` (linux) / `dig` / `host` / Apple `dscacheutil` —
+  // fall back through them so the probe works on bare images without dig.
+  const safeHost = host.replace(/[^A-Za-z0-9._-]/g, "");
+  const cmd =
+    ctx.os === "macos"
+      ? `dscacheutil -q host -a name '${safeHost}' 2>/dev/null | awk '/^ip_address:/ {print $2}'`
+      : `getent hosts '${safeHost}' 2>/dev/null | awk '{print $1}' || dig +short '${safeHost}' A 2>/dev/null`;
+  const r = await ctx.runShell(cmd, { timeoutMs: 5000 });
+  const addrs = (r.stdout || "")
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter((s) => /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(s));
+  if (addrs.length === 0) {
+    return { host, ok: false, error: (r.stderr || "no A record").trim().slice(0, 200), ms: Date.now() - t0 };
+  }
+  return { host, ok: true, addresses: addrs, ms: Date.now() - t0 };
+}
+
+async function remoteTcpProbe(ctx: ExecutionContext, host: string, port: number, timeoutMs = PROBE_TIMEOUT_MS): Promise<TcpResult> {
+  const t0 = Date.now();
+  const safeHost = host.replace(/[^A-Za-z0-9._-]/g, "");
+  // On macOS `nc -G N` sets connect timeout. On Linux netcat-openbsd uses `-w N`.
+  // Try both, pick whichever the host has. `2>&1` so the error message is captured.
+  const ncCmd =
+    ctx.os === "macos"
+      ? `/usr/bin/nc -z -G 3 '${safeHost}' ${port}`
+      : `nc -z -w 3 '${safeHost}' ${port}`;
+  const r = await ctx.runShell(`${ncCmd} 2>&1 && echo __ok__ || echo __fail__`, { timeoutMs: timeoutMs + 1500 });
+  const out = (r.stdout || "").trim();
+  if (out.endsWith("__ok__")) {
+    return { host, port, ok: true, ms: Date.now() - t0 };
+  }
+  return {
+    host,
+    port,
+    ok: false,
+    error: out.replace(/__fail__$/, "").trim().split("\n").pop()?.slice(0, 160) || "tcp probe failed",
+    ms: Date.now() - t0
+  };
+}
+
+async function remoteHttpsProbe(ctx: ExecutionContext, url: string, timeoutMs = PROBE_TIMEOUT_MS): Promise<HttpResult> {
+  const t0 = Date.now();
+  const safe = url.replace(/['"`$\\]/g, "");
+  // `-o /dev/null` suppresses body, `-w "%{http_code}"` prints just the status.
+  const cmd = `curl -sS -o /dev/null -w "%{http_code}" --max-time ${Math.ceil(timeoutMs / 1000)} '${safe}' 2>&1 || echo 000`;
+  const r = await ctx.runShell(cmd, { timeoutMs: timeoutMs + 1500 });
+  const code = parseInt((r.stdout || "").trim().slice(-3), 10);
+  if (!isNaN(code) && code > 0) {
+    return { url, ok: code > 0 && code < 600, status: code, ms: Date.now() - t0 };
+  }
+  return { url, ok: false, error: (r.stdout || r.stderr || "curl failed").trim().slice(0, 160), ms: Date.now() - t0 };
+}
+
+// ───────────────────────── Public single-shot probes (used by `twc probe`) ─────────────────────────
+
+export async function probeDnsHost(host: string, ctx: ExecutionContext = new LocalContext()): Promise<DnsResult> {
+  return ctx.kind === "local" ? localDnsResolve(host) : remoteDnsResolve(ctx, host);
+}
+
+export async function probeTcpHost(host: string, port: number, timeoutMs?: number, ctx: ExecutionContext = new LocalContext()): Promise<TcpResult> {
+  return ctx.kind === "local" ? localTcpProbe(host, port, timeoutMs) : remoteTcpProbe(ctx, host, port, timeoutMs);
+}
+
+// ───────────────────────── Full product-aware probe ─────────────────────────
+
 export async function runConnectivityProbe(
-  profile: ProductDiagnosticProfile = getProductProfile("teamviewer-remote")
+  profile: ProductDiagnosticProfile = getProductProfile("teamviewer-remote"),
+  ctx: ExecutionContext = new LocalContext()
 ): Promise<ConnectivityReport> {
   const endpoints: ProbeEndpoint[] = profile.endpoints;
   const uniqueHosts = [...new Set(endpoints.map((e) => e.host))];
 
+  const dnsResolve = (h: string) => (ctx.kind === "local" ? localDnsResolve(h) : remoteDnsResolve(ctx, h));
+  const tcpProbe = (h: string, p: number) => (ctx.kind === "local" ? localTcpProbe(h, p) : remoteTcpProbe(ctx, h, p));
+  const httpsProbe = (u: string) => (ctx.kind === "local" ? localHttpsProbe(u, 6000) : remoteHttpsProbe(ctx, u, 6000));
+
   // 1) DNS for every host this product touches.
-  const dnsResults = await Promise.all(uniqueHosts.map(resolveHost));
+  const dnsResults = await Promise.all(uniqueHosts.map(dnsResolve));
   const resolved = new Set(dnsResults.filter((r) => r.ok).map((r) => r.host));
 
   // 2) TCP for each endpoint/port that resolved (avoid amplifying DNS failures).
@@ -142,12 +211,9 @@ export async function runConnectivityProbe(
   // 3) Application-layer HTTPS checks for endpoints that expose one.
   const httpsTargets = endpoints.filter((e) => e.https);
   const httpsResults = await Promise.all(
-    httpsTargets.map((e) =>
-      httpsProbe(e.https as string, 6000).then((r) => ({ ...r, bestEffort: e.bestEffort }))
-    )
+    httpsTargets.map((e) => httpsProbe(e.https as string).then((r) => ({ ...r, bestEffort: e.bestEffort })))
   );
 
-  // Keep `https` pointing at the Web API ping for backward-compatible evidence.
   const primary =
     httpsResults.find((r) => r.url.includes("webapi.teamviewer.com")) ??
     httpsResults[0] ?? {
@@ -162,6 +228,7 @@ export async function runConnectivityProbe(
     https: primary,
     product: profile.name,
     tcpExtra,
-    httpsExtra: httpsResults
+    httpsExtra: httpsResults,
+    executionTarget: ctx.description
   };
 }

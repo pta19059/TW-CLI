@@ -1,6 +1,8 @@
 import { getJob, updateJob } from "./jobs/jobStore.js";
 import { runMastraAgent } from "./agents/mastraAdapter.js";
 import { renderReportText } from "./agents/formatReport.js";
+import { createExecutionContext, LocalContext } from "./runtime/execContext.js";
+import { withRunContext } from "./runtime/runContext.js";
 
 export async function runWorkerJob(jobId: string): Promise<void> {
   const job = getJob(jobId);
@@ -11,11 +13,25 @@ export async function runWorkerJob(jobId: string): Promise<void> {
   updateJob(jobId, { status: "running", startedAt: new Date().toISOString() });
 
   try {
-    const report = await runMastraAgent({
-      product: job.product,
-      task: job.type,
-      input: job.input
-    });
+    // Build the execution context once per job. If --user (and a network-looking
+    // target) was supplied, this opens an SSH connection and detects the
+    // remote OS via `uname -s`. Otherwise the job runs against the local host.
+    const ctx = job.input.connection
+      ? await createExecutionContext({
+          target: job.input.target,
+          user: job.input.connection.user,
+          port: job.input.connection.port,
+          identity: job.input.connection.identity
+        })
+      : new LocalContext();
+
+    const report = await withRunContext(ctx, () =>
+      runMastraAgent({
+        product: job.product,
+        task: job.type,
+        input: job.input
+      })
+    );
 
     updateJob(jobId, {
       status: "completed",
