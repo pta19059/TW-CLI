@@ -21,3 +21,6 @@ launcher/obj/
 .DS_Store
 Thumbs.db
 *.log
+
+# Scratch files used by the assistant for multi-line git commit messages
+.git-commit-msg.txt
