@@ -420,35 +420,42 @@ static class FigureAnim
     // Person at desk + monitor + keyboard. All frames MUST share the same
     // line count and column width so SetCursorPosition + ESC[2K overwrites
     // cleanly without leaving stray characters from the previous frame.
+    // Width = 36 cols, height = 8 rows.
     public static readonly string[] Idle = new[]
     {
-        "    .---.        _________  ",
-        "   ( o o )      |         | ",
-        "    \\   /       |  twc>   | ",
-        "   __| |__      |_________| ",
-        "     | |       _____________",
-        "    /| |\\      [_____________]"
+        "    .---.       .-----------.      ",
+        "   ( o o )      |  _______  |      ",
+        "    \\   /       | |       | |      ",
+        "   __| |__      | | twc>  | |      ",
+        "     | |        | |_______| |      ",
+        "    /| |\\       '-----+-----'      ",
+        "     | |          .---'---.        ",
+        "    /   \\       [_=_=_=_=_=_]      "
     };
 
     public static readonly string[][] Typing = new[]
     {
         new[]   // left hand on keys, screen cursor on
         {
-            "    .---.        _________  ",
-            "   ( o o )      |         | ",
-            "    \\   /       |  twc>_  | ",
-            "   __| |__      |_________| ",
-            "     | |       _____________",
-            "   _/| |\\      [_____________]"
+            "    .---.       .-----------.      ",
+            "   ( o o )      |  _______  |      ",
+            "    \\   /       | |       | |      ",
+            "   __| |__      | | twc>_ | |      ",
+            "     | |        | |_______| |      ",
+            "   _/| |\\       '-----+-----'      ",
+            "     | |          .---'---.        ",
+            "    /   \\       [#_=_=_=_=_]      "
         },
         new[]   // right hand on keys, screen cursor off
         {
-            "    .---.        _________  ",
-            "   ( o o )      |         | ",
-            "    \\   /       |  twc>   | ",
-            "   __| |__      |_________| ",
-            "     | |       _____________",
-            "    /| |\\_     [_____________]"
+            "    .---.       .-----------.      ",
+            "   ( o o )      |  _______  |      ",
+            "    \\   /       | |       | |      ",
+            "   __| |__      | | twc>  | |      ",
+            "     | |        | |_______| |      ",
+            "    /| |\\_      '-----+-----'      ",
+            "     | |          .---'---.        ",
+            "    /   \\       [_=_=_=_=_#]      "
         }
     };
 
