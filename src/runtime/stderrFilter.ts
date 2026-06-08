@@ -15,9 +15,29 @@ import { spawn } from "node:child_process";
 const NOISE =
   /cpuinfo|Windows on Arm SoC|arm[\\/]windows[\\/]init\.c|dtype not specified for|Please add new Windows/i;
 
-/** Commands that load the local ONNX embedder and therefore emit native noise. */
+/**
+ * Commands that load the local ONNX embedder and therefore emit native
+ * stderr noise. Includes:
+ * - `docs ask|reindex|index` (direct embedder use)
+ * - one-shot prompt mode (`twc -p "..."` / `twc --prompt "..."`) — the
+ *   troubleshoot workflow calls retrieveKnowledgeHits() per specialist
+ * - `troubleshoot` / `debug` subcommands (same workflow)
+ * - the "unknown first token = free-text issue" path, which also routes
+ *   into runOneShot
+ *
+ * NOT included: `--worker` (worker child, must not re-wrap), the bare REPL
+ * (`twc` / `twc chat`, interactive stdin doesn't survive the pipe wrap
+ * cleanly), and pure-metadata commands (`products list`, `jobs list`).
+ */
 function loadsEmbedder(argv: string[]): boolean {
-  return argv[0] === "docs" && ["ask", "reindex", "index"].includes(argv[1]);
+  if (argv.includes("--worker")) return false;
+  // One-shot mode: any -p / --prompt invocation.
+  if (argv.some((a) => a === "-p" || a === "--prompt")) return true;
+  // Explicit docs subcommands that load the embedder.
+  if (argv[0] === "docs" && ["ask", "reindex", "index"].includes(argv[1])) return true;
+  // troubleshoot / debug subcommands run the full workflow.
+  if (argv[0] === "troubleshoot" || argv[0] === "debug") return true;
+  return false;
 }
 
 /**
