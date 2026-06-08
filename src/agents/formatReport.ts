@@ -10,8 +10,12 @@ export function renderReportText(report: WorkflowReport): string {
   lines.push("");
 
   lines.push("Hypotheses:");
-  for (const item of report.hypotheses) {
-    lines.push(`- ${item}`);
+  if (report.hypotheses.length === 0) {
+    lines.push("- (none survived evidence filtering — candidates were either disproven by probes or imperative recommendations rather than causes)");
+  } else {
+    for (const item of report.hypotheses) {
+      lines.push(`- ${item}`);
+    }
   }
   lines.push("");
 
@@ -22,8 +26,12 @@ export function renderReportText(report: WorkflowReport): string {
   lines.push("");
 
   lines.push("Root Causes:");
-  for (const cause of report.rootCauses) {
-    lines.push(`- ${cause.title} (score ${cause.score.toFixed(2)}): ${cause.rationale}`);
+  if (report.rootCauses.length === 0) {
+    lines.push("- (none identified — probes did not find a definitive cause; see Actions for next steps)");
+  } else {
+    for (const cause of report.rootCauses) {
+      lines.push(`- ${cause.title} (score ${cause.score.toFixed(2)}): ${cause.rationale}`);
+    }
   }
   lines.push("");
 
@@ -71,7 +79,11 @@ export function renderReportMarkdown(report: WorkflowReport): string {
   lines.push("");
 
   lines.push(`## Hypotheses`);
-  for (const item of report.hypotheses) lines.push(`- ${item}`);
+  if (report.hypotheses.length === 0) {
+    lines.push(`_None survived evidence filtering — candidates were either disproven by probes or imperative recommendations rather than causes._`);
+  } else {
+    for (const item of report.hypotheses) lines.push(`- ${item}`);
+  }
   lines.push("");
 
   lines.push(`## Evidence`);
@@ -80,11 +92,15 @@ export function renderReportMarkdown(report: WorkflowReport): string {
 
   lines.push(`## Root Causes`);
   lines.push("");
-  lines.push(`| # | Cause | Score | Rationale |`);
-  lines.push(`|---|-------|------:|-----------|`);
-  report.rootCauses.forEach((c, i) => {
-    lines.push(`| ${i + 1} | ${escapePipe(c.title)} | ${c.score.toFixed(2)} | ${escapePipe(c.rationale)} |`);
-  });
+  if (report.rootCauses.length === 0) {
+    lines.push(`_None identified — probes did not find a definitive cause; see Actions for next steps._`);
+  } else {
+    lines.push(`| # | Cause | Score | Rationale |`);
+    lines.push(`|---|-------|------:|-----------|`);
+    report.rootCauses.forEach((c, i) => {
+      lines.push(`| ${i + 1} | ${escapePipe(c.title)} | ${c.score.toFixed(2)} | ${escapePipe(c.rationale)} |`);
+    });
+  }
   lines.push("");
 
   lines.push(`## Actions`);

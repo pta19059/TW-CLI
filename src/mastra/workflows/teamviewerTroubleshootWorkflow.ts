@@ -521,6 +521,13 @@ export const teamviewerTroubleshootWorkflow = createWorkflow({
 // ---------------------------------------------------------------------------
 
 export function calculateConfidence(rootCauses: RootCauseCandidate[], evidenceCount: number, task: JobType): number {
+  // Honest floor: when no root cause survives filtering, the previous
+  // formula gave 0.5 + 0.15 + 0.05 = 0.70 which looked confidently empty.
+  // Cap at 0.55 in that state so the escalation gate (< 0.6) fires.
+  if (rootCauses.length === 0) {
+    const evidenceBoost = Math.min(0.10, evidenceCount * 0.01);
+    return Math.min(0.55, 0.45 + evidenceBoost);
+  }
   const top = rootCauses[0]?.score ?? 0.5;
   const evidenceBoost = Math.min(0.15, evidenceCount * 0.02);
   const taskBoost = task === "troubleshoot" ? 0.05 : 0;
@@ -549,10 +556,16 @@ export function cleanSummary(raw: string): string {
   s = s.replace(/^```[a-zA-Z]*\n?/, "").replace(/\n?```$/, "").trim();
   // Walk lines and pick the FIRST one that isn't a prompt-label echo or junk.
   const PROMPT_LABEL_RE = /^(task|product|top root cause|confidence|issue|brief|sentence|summary|context|target|note|input|output|answer)\s*[:\-]/i;
+  // Meta-talk: the small model often paraphrases its own job instead of
+  // answering it ("A brief summary of the troubleshooting outcome is that
+  // the system logs were checked"). Reject these so the deterministic
+  // fallback fires.
+  const META_TALK_RE = /^(a\s+(brief|short|quick|concise)\s+(summary|description|overview|recap|outline)|the\s+(brief|short)?\s*(summary|description|overview)\s+(is|of)|here(?:'s| is)\s+(a\s+)?(brief\s+)?(summary|description|overview)|summary\s+of\s+(the\s+)?troubleshooting|the\s+(troubleshooting|debug)\s+(outcome|run)\s+is|in\s+summary)/i;
   for (const rawLine of s.split(/\r?\n/)) {
     const line = rawLine.trim().replace(/^[\-*•\s]+/, "").trim();
     if (!line) continue;
     if (PROMPT_LABEL_RE.test(line)) continue;
+    if (META_TALK_RE.test(line)) continue;
     if (/^NOT_IN_CONTEXT$/i.test(line)) continue;
     if (/^\s*\{/.test(line) && /"(name|tool|function|arguments|parameters)"\s*:/i.test(line)) continue;
     if (/teamviewerDocsTool|connectivityTool|authPolicyTool|endpointHealthTool|logIntelligenceTool/i.test(line)) continue;
@@ -610,8 +623,10 @@ export function filterRootCausesAgainstEvidence(
       return false;
     }
     // "TeamViewer (background )?service not (registered|running)" / "daemon
-    // (not )?registered" — falsified by the process list.
-    if (teamviewerServiceRunning && /(service|daemon|background)\s+(not\s+)?(registered|running|started|active|configured)/.test(text) && /teamviewer/.test(text)) {
+    // (not )?registered" / generic "TeamViewer Service issue|problem|fault"
+    // — falsified by the process list. Match generously: any title that
+    // says TeamViewer + service|daemon|background + a negative-state word.
+    if (teamviewerServiceRunning && /teamviewer/.test(text) && /\b(service|daemon|background)\b/.test(text) && /(not\s+(registered|running|started|active|configured)|issue|problem|fault|trouble|malfunction|error|broken|stopped|crashed|crash|fail|fails|down|misconfigured|disabled|missing|absent|removed|uninstalled)/.test(text)) {
       return false;
     }
     // Absence-of-evidence is NOT a root cause. The small LLM happily writes
@@ -629,6 +644,17 @@ export function filterRootCausesAgainstEvidence(
     // to say. None of our probes can measure UI state, so we never have
     // grounded evidence for them.
     if (/\b(user\s+interface|ui\s+(issue|problem|setting|configuration)|interface\s+(issue|problem|setting|configuration|hindering))\b/.test(text)) {
+      return false;
+    }
+    // Imperative / action-shaped "root causes" — the LLM rerank loves to
+    // promote remediation steps ("Check the system logs for any errors",
+    // "Restart the TeamViewer service", "Verify network settings") into the
+    // root-cause list. Those are ACTIONS, not causes. A real root-cause
+    // title is a noun phrase ("Outdated TeamViewer client", "Corporate DNS
+    // hijack"), not a verb phrase. Drop titles that start with an
+    // imperative verb.
+    const titleHead = r.title.trim().toLowerCase();
+    if (/^(check|verify|inspect|restart|reinstall|update|upgrade|enable|disable|configure|reconfigure|investigate|review|monitor|ensure|run|execute|examine|test|confirm|validate|collect|gather|capture|contact|escalate|reboot|reset|clear|flush|remove|delete|install|apply|change|modify|adjust)\b/.test(titleHead)) {
       return false;
     }
     return true;
@@ -678,7 +704,14 @@ export function filterHypothesesAgainstEvidence(
     // teamviewer_service / teamviewerd. Match generously: "TeamViewer
     // service might be misconfigured" / "preventing the TeamViewer Service
     // from starting" / "TeamViewer daemon may be down".
-    if (teamviewerServiceRunning && /teamviewer/.test(text) && /\b(service|daemon|background)\b/.test(text) && /(misconfigured|broken|not\s+running|crash|down|disabled|prevent|fail\s+to\s+start|cannot\s+start)/.test(text)) continue;
+    if (teamviewerServiceRunning && /teamviewer/.test(text) && /\b(service|daemon|background)\b/.test(text) && /(misconfigured|broken|not\s+running|crash|down|disabled|prevent|fail\s+to\s+start|cannot\s+start|missing|absent|removed|uninstalled|deleted|gone|issue|problem|fault|trouble|malfunction|error|stopped|crashed|fails)/.test(text)) continue;
+    // UI hypotheses are out-of-scope (no UI probe) — always drop them.
+    if (/\b(user\s+interface|ui\s+(issue|problem|setting|configuration)|interface\s+(issue|problem|setting|configuration|hindering))\b/.test(text)) continue;
+    // Imperative-form "hypotheses" are actually action recommendations
+    // ("Check network connection between the Mac and the target IP.",
+    // "Inspect for any recent changes…", "Verify firewall settings").
+    // Drop them so the Hypotheses block stays a list of *causes*.
+    if (/^(check|verify|inspect|restart|reinstall|update|upgrade|enable|disable|configure|reconfigure|investigate|review|monitor|ensure|run|execute|examine|test|confirm|validate|collect|gather|capture|contact|escalate|reboot|reset|clear|flush|remove|delete|install|apply|change|modify|adjust|look\s+(into|for|at)|make\s+sure)\b/.test(text.trim())) continue;
     const key = norm(raw);
     if (!key) continue;
     if (seen.has(key)) continue;

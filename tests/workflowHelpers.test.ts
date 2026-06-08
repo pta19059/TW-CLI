@@ -30,6 +30,11 @@ describe("calculateConfidence", () => {
     const score = calculateConfidence([{ title: "x", score: 0.99, rationale: "r" }], 50, "troubleshoot");
     expect(score).toBe(0.95);
   });
+  it("caps at 0.55 when no root cause survives (honest escalation)", () => {
+    const score = calculateConfidence([], 20, "troubleshoot");
+    expect(score).toBeLessThanOrEqual(0.55);
+    expect(score).toBeLessThan(0.6); // escalation gate must trip
+  });
 });
 
 describe("cleanSummary", () => {
@@ -62,6 +67,11 @@ describe("cleanSummary", () => {
   });
   it("strips list bullets before evaluating", () => {
     expect(cleanSummary("- The session drops after a few minutes.")).toBe("The session drops after a few minutes.");
+  });
+  it("rejects meta-talk paraphrases of the prompt", () => {
+    expect(cleanSummary("A brief summary of the troubleshooting outcome is that the system logs were checked.")).toBe("");
+    expect(cleanSummary("The summary is that everything looks fine.")).toBe("");
+    expect(cleanSummary("Summary of the troubleshooting outcome: nothing found.")).toBe("");
   });
 });
 
@@ -225,6 +235,18 @@ describe("filterRootCausesAgainstEvidence", () => {
     );
     expect(out.length).toBe(0);
   });
+  it("drops imperative-form root causes (those are actions, not causes)", () => {
+    const out = filterRootCausesAgainstEvidence(
+      [
+        { title: "Check the system logs for any errors related to TeamViewer", score: 0.7, rationale: "System log entries can provide clues." },
+        { title: "Restart the TeamViewer service to ensure all components are functioning correctly", score: 0.6, rationale: "Restart helps." },
+        { title: "Outdated TeamViewer client", score: 0.5, rationale: "Older clients have known disconnect bugs." }
+      ],
+      []
+    );
+    expect(out.length).toBe(1);
+    expect(out[0].title).toMatch(/Outdated/);
+  });
 });
 
 describe("filterHypothesesAgainstEvidence", () => {
@@ -257,5 +279,30 @@ describe("filterHypothesesAgainstEvidence", () => {
       []
     );
     expect(out.length).toBeLessThanOrEqual(2);
+  });
+  it("drops 'background service might be missing' hypothesis when service is running", () => {
+    const out = filterHypothesesAgainstEvidence(
+      [
+        "TeamViewer's background service might be missing due to recent changes in system configuration",
+        "Outdated TeamViewer client could cause drops"
+      ],
+      [
+        ...evidenceAllGreen,
+        "Processes running: TeamViewer, TeamViewer_Service, bash"
+      ]
+    );
+    expect(out.length).toBe(1);
+    expect(out[0]).toMatch(/Outdated/);
+  });
+  it("always drops UI / user-interface hypotheses (no UI probe exists)", () => {
+    const out = filterHypothesesAgainstEvidence(
+      [
+        "User interface issues could prevent proper interaction",
+        "Outdated TeamViewer client could cause drops"
+      ],
+      []
+    );
+    expect(out.length).toBe(1);
+    expect(out[0]).toMatch(/Outdated/);
   });
 });
