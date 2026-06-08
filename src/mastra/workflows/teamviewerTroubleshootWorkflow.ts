@@ -52,6 +52,12 @@ const actionSchema = z.object({
   rollback: z.string()
 });
 
+const referenceSchema = z.object({
+  title: z.string().optional(),
+  source: z.string(),
+  topic: z.string()
+});
+
 const reportSchema = z.object({
   summary: z.string(),
   hypotheses: z.array(z.string()),
@@ -66,7 +72,8 @@ const reportSchema = z.object({
       status: z.enum(["completed", "failed", "skipped"]),
       note: z.string()
     })
-  )
+  ),
+  references: z.array(referenceSchema).default([])
 });
 
 const metaSchema = inputSchema.extend({
@@ -82,7 +89,8 @@ const specialistResultSchema = z.object({
   evidence: z.array(z.string()),
   rootCauses: z.array(rootCauseSchema),
   actions: z.array(actionSchema),
-  hypotheses: z.array(z.string())
+  hypotheses: z.array(z.string()),
+  references: z.array(referenceSchema).default([])
 });
 type SpecialistResult = z.infer<typeof specialistResultSchema>;
 
@@ -217,7 +225,8 @@ function buildSpecialistStep(def: SpecialistDef) {
           evidence: [],
           rootCauses: [],
           actions: [],
-          hypotheses: []
+          hypotheses: [],
+          references: []
         };
       }
 
@@ -248,12 +257,18 @@ function buildSpecialistStep(def: SpecialistDef) {
       // prompt. Failure here is non-fatal — retrieval may be offline or empty
       // (no index yet) and the specialist still has groundingFacts + baseline.
       let kbAnchors = "";
+      const kbReferences: Array<{ title?: string; source: string; topic: string }> = [];
       try {
         const kbQuery = `${def.topic} ${issue}`.slice(0, 240);
         const { hits } = await retrieveKnowledgeHits(kbQuery);
         const top = hits.slice(0, 3).map((h: KnowledgeHit) => {
           const snippet = h.text.replace(/\s+/g, " ").trim().slice(0, 220);
           const label = h.title ? `${h.title}` : h.source;
+          // Track the source so the aggregate step can surface it as a
+          // verifiable reference in the rendered report.
+          if (h.source) {
+            kbReferences.push({ title: h.title, source: h.source, topic: def.topic });
+          }
           return `- [${label}] ${snippet}`;
         });
         if (top.length > 0) {
@@ -319,7 +334,8 @@ function buildSpecialistStep(def: SpecialistDef) {
         evidence: baseline.evidence,
         rootCauses: mergedRoots,
         actions: mergedActions,
-        hypotheses: enrichmentHypotheses.map((h) => h.trim()).filter(Boolean).slice(0, 3)
+        hypotheses: enrichmentHypotheses.map((h) => h.trim()).filter(Boolean).slice(0, 3),
+        references: kbReferences
       };
     }
   });
@@ -368,27 +384,39 @@ const aggregateStep = createStep({
     // — otherwise the LLM keeps re-promoting them.
     const filteredRoots = filterRootCausesAgainstEvidence(allRoots, evidence);
     const allActions = deduplicateActions(branches.flatMap((b) => b.actions));
+    // Filter hypotheses the SAME way (they share the same evidence). The
+    // hypotheses block in the report had been showing "firewall might block"
+    // even when DNS+TCP probes proved the firewall is fine.
+    const filteredHypotheses = filterHypothesesAgainstEvidence(allHypotheses, evidence);
+    // Aggregate KB references across specialists, deduped by source URL.
+    const dedupRefMap = new Map<string, { title?: string; source: string; topic: string }>();
+    for (const b of branches) {
+      for (const ref of (b.references ?? [])) {
+        if (!dedupRefMap.has(ref.source)) dedupRefMap.set(ref.source, ref);
+      }
+    }
+    const references = Array.from(dedupRefMap.values()).slice(0, 10);
 
     // LLM rerank of root causes (narrow JSON contract)
-    let rerankedRoots: RootCauseCandidate[] = allRoots;
-    if (allRoots.length > 1) {
+    let rerankedRoots: RootCauseCandidate[] = filteredRoots;
+    if (filteredRoots.length > 1) {
       const rerankPrompt =
         "Rerank the candidate root causes for this TeamViewer issue. Keep titles and rationales unchanged, " +
         "only adjust scores (0.0-1.0) to reflect likelihood given the issue text. Return all candidates.\n" +
         `Issue: ${sanitizePromptInput(meta.issue)}\n` +
         `Context: ${sanitizePromptInput(meta.context, 1500) || "none"}\n` +
-        `Candidates: ${JSON.stringify(allRoots)}\n\n` +
+        `Candidates: ${JSON.stringify(filteredRoots)}\n\n` +
         'Reply ONLY with JSON: {"rootCauses":[{"title":"...","score":0.0,"rationale":"..."}]}';
       const reranked = await generateStructured(gatewayAgent, rerankPrompt, {
         schema: z.object({ rootCauses: z.array(rootCauseSchema) }),
         retries: 1
       });
-      const knownTitles = new Map(allRoots.map((r) => [r.title, r]));
+      const knownTitles = new Map(filteredRoots.map((r) => [r.title, r]));
       rerankedRoots = reranked.rootCauses
         .filter((r) => knownTitles.has(r.title))
         .map((r) => ({ ...knownTitles.get(r.title)!, score: Math.max(0, Math.min(1, Number(r.score) || 0)) }));
       if (rerankedRoots.length === 0) {
-        rerankedRoots = allRoots;
+        rerankedRoots = filteredRoots;
       }
     }
 
@@ -461,7 +489,7 @@ const aggregateStep = createStep({
 
     return {
       summary,
-      hypotheses: allHypotheses,
+      hypotheses: filteredHypotheses,
       evidence,
       rootCauses: topRoots,
       actions: filteredActions,
@@ -472,7 +500,8 @@ const aggregateStep = createStep({
           ? "Low confidence or ambiguous root cause, escalate to L3 TeamViewer specialist"
           : "Root cause confidence acceptable, proceed with guided remediation"
       },
-      execution
+      execution,
+      references
     };
   }
 });
@@ -537,6 +566,11 @@ export function cleanSummary(raw: string): string {
  * but applied to root-cause candidates BEFORE the LLM rerank step — the
  * LLM otherwise keeps re-promoting firewall as the top cause even when
  * DNS + TCP both prove the firewall is fine.
+ *
+ * Drops also catch root causes the LLM RE-INVENTS from our own evidence
+ * caveats (e.g. it reads "NOT a candidate root cause for the user's symptom"
+ * and helpfully synthesises "Outdated CA bundle" anyway), and bogus
+ * "service not registered/running" claims contradicted by the process list.
  */
 export function filterRootCausesAgainstEvidence(
   roots: RootCauseCandidate[],
@@ -547,15 +581,113 @@ export function filterRootCausesAgainstEvidence(
   const endpointTcpOk = /endpoint\s+tcp\s+reachability:\s*([1-9]\d*)\/\d+[^\n]*?\bok\b/i.test(joined);
   const dnsOk = /dns\s+resolved\s+([1-9]\d*)\/\d+\s+teamviewer\s+hosts/i.test(joined);
   const firewallRuledOut = dnsOk && (port5938Open || endpointTcpOk);
+  // We injected a CAVEAT line for stale-CA-bundle probe issues. If it's
+  // present, the TLS validation failure is a probe-host hygiene issue, NOT a
+  // user-symptom cause — drop any rootCause the LLM synthesised about it.
+  const tlsCaveatPresent = /local\s+certificate-validation\s+issue\s+on\s+the\s+probe\s+host/i.test(joined);
+  // "Processes running: TeamViewer, TeamViewer_Service, ..." — the daemon IS
+  // running, regardless of whether a launchd plist is registered.
+  const teamviewerServiceRunning =
+    /processes\s+running:[^\n]*\bteamviewer_service\b/i.test(joined) ||
+    /processes\s+running:[^\n]*\bteamviewerd\b/i.test(joined);
 
   return roots.filter((r) => {
     const text = `${r.title} ${r.rationale ?? ""}`.toLowerCase();
+    const rationale = (r.rationale ?? "").toLowerCase();
     const mentionsFirewall = /firewall/.test(text);
-    if (!mentionsFirewall) return true;
-    if (port5938Open && /\b5938\b/.test(text)) return false;
-    if (firewallRuledOut && /teamviewer|traffic|blocking|outgoing/.test(text)) return false;
+    if (mentionsFirewall) {
+      if (port5938Open && /\b5938\b/.test(text)) return false;
+      if (firewallRuledOut && /teamviewer|traffic|blocking|outgoing|inbound|connectivity|network/.test(text)) return false;
+    }
+    // Generic "unstable network / connectivity issue" titled cause whose
+    // rationale just blames the firewall — same trap, no "firewall" in title.
+    if (firewallRuledOut && /\b(unstable\s+network|network\s+connectivity|connection\s+drop)/.test(text) && /firewall|blocking|inbound|outbound/.test(text)) {
+      return false;
+    }
+    // CA bundle / TLS validation as a CAUSE of the user's symptom — already
+    // explained as a probe-host hygiene issue by the evidence caveat.
+    if (tlsCaveatPresent && /(ca\s+bundle|certificate\s+authority|tls\s+validation|cert\s+(chain|validation)|outdated\s+root\s+store)/.test(text)) {
+      return false;
+    }
+    // "TeamViewer (background )?service not (registered|running)" / "daemon
+    // (not )?registered" — falsified by the process list.
+    if (teamviewerServiceRunning && /(service|daemon|background)\s+(not\s+)?(registered|running|started|active|configured)/.test(text) && /teamviewer/.test(text)) {
+      return false;
+    }
+    // Absence-of-evidence is NOT a root cause. The small LLM happily writes
+    // rationales like "Based on the lack of TeamViewer-related log files and
+    // the absence of any TeamViewer-specific events in the event log" — that's
+    // a reason we COULDN'T conclude, not a reason the user's symptom exists.
+    if (/^(based on the )?(lack|absence|missing|no\s+(log|trace|record|event)|did not (find|see|detect)|cannot (find|see|determine))/i.test(rationale.trim())) {
+      return false;
+    }
+    if (/\b(lack of|absence of|no .*(found|present)|missing .* (log|trace|record))\b/i.test(rationale) && rationale.length < 200) {
+      return false;
+    }
+    // UI / interface causes are out-of-scope for connectivity / endpoint /
+    // log specialists — the small model invents them when it has nothing else
+    // to say. None of our probes can measure UI state, so we never have
+    // grounded evidence for them.
+    if (/\b(user\s+interface|ui\s+(issue|problem|setting|configuration)|interface\s+(issue|problem|setting|configuration|hindering))\b/.test(text)) {
+      return false;
+    }
     return true;
   });
+}
+
+/**
+ * Hypotheses share the SAME evidence as root causes — if a hypothesis is
+ * already disproven ("firewall might block" when DNS+TCP just passed), drop
+ * it. Also dedupes near-identical hypotheses (the LLM emits multiple
+ * paraphrases of "firewall blocks TeamViewer" per run).
+ */
+export function filterHypothesesAgainstEvidence(
+  hypotheses: string[],
+  evidence: string[]
+): string[] {
+  const joined = evidence.join(" ");
+  const port5938Open = /tcp\s+5938\s+reachability:\s*\d+\/\d+[^\n]*?\bok\b/i.test(joined);
+  const endpointTcpOk = /endpoint\s+tcp\s+reachability:\s*([1-9]\d*)\/\d+[^\n]*?\bok\b/i.test(joined);
+  const dnsOk = /dns\s+resolved\s+([1-9]\d*)\/\d+\s+teamviewer\s+hosts/i.test(joined);
+  const firewallRuledOut = dnsOk && (port5938Open || endpointTcpOk);
+  const tlsCaveatPresent = /local\s+certificate-validation\s+issue\s+on\s+the\s+probe\s+host/i.test(joined);
+  const teamviewerServiceRunning =
+    /processes\s+running:[^\n]*\bteamviewer_service\b/i.test(joined) ||
+    /processes\s+running:[^\n]*\bteamviewerd\b/i.test(joined);
+
+  // Normalise for dedup: strip filler words + punctuation + lowercase.
+  const norm = (s: string): string =>
+    s
+      .toLowerCase()
+      .replace(/[\p{P}\p{S}]+/gu, " ")
+      .replace(/\b(the|a|an|might|could|may|be|is|are|of|to|in|on|that|this|some|any|there|might|will|would|should)\b/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  const seen = new Set<string>();
+
+  const kept: string[] = [];
+  for (const raw of hypotheses) {
+    const text = raw.toLowerCase();
+    // When DNS+TCP both pass, ANY firewall hypothesis is noise \u2014 the probes
+    // already proved the firewall is not in the path. Be aggressive: there's
+    // no useful firewall hypothesis to keep in this state.
+    if (firewallRuledOut && /firewall/.test(text)) continue;
+    if (firewallRuledOut && /\b(dns)\b/.test(text) && /resolution|issue|problem|fail/.test(text)) continue;
+    if (tlsCaveatPresent && /(ca\s+bundle|certificate\s+authority|tls\s+validation|outdated\s+root\s+store)/.test(text)) continue;
+    // Service-running hypotheses are noise when the process list shows
+    // teamviewer_service / teamviewerd. Match generously: "TeamViewer
+    // service might be misconfigured" / "preventing the TeamViewer Service
+    // from starting" / "TeamViewer daemon may be down".
+    if (teamviewerServiceRunning && /teamviewer/.test(text) && /\b(service|daemon|background)\b/.test(text) && /(misconfigured|broken|not\s+running|crash|down|disabled|prevent|fail\s+to\s+start|cannot\s+start)/.test(text)) continue;
+    const key = norm(raw);
+    if (!key) continue;
+    if (seen.has(key)) continue;
+    // Also drop substring duplicates (one normalised key is contained in another).
+    if (Array.from(seen).some((k) => k.includes(key) || key.includes(k))) continue;
+    seen.add(key);
+    kept.push(raw);
+  }
+  return kept.slice(0, 8);
 }
 
 /**
@@ -595,8 +727,11 @@ export function filterActionsAgainstEvidence(
       // Action explicitly about port 5938 and we just proved it open → drop.
       if (port5938Open && /\b5938\b/.test(text)) return false;
       // Generic "firewall blocking TeamViewer traffic" / "firewall rules" —
-      // if DNS + TCP work, firewall is not the cause: drop.
-      if (firewallRuledOut && /teamviewer|traffic|blocking|rules/.test(text)) return false;
+      // if DNS + TCP work, firewall is not the cause: drop. EXCLUSION: don't
+      // drop our own probe-hygiene action which mentions firewall only to say
+      // "do NOT change the host firewall".
+      const isProbeHygieneCarveOut = /do not change the host firewall/.test(text) || /probe hygiene/.test(text);
+      if (!isProbeHygieneCarveOut && firewallRuledOut && /teamviewer|traffic|blocking|rules/.test(text)) return false;
     }
     // "sudo launchctl load -w .../com.teamviewer.teamviewerd.plist" or any
     // "start the background service teamviewerd" recommendation — only valid
@@ -606,6 +741,18 @@ export function filterActionsAgainstEvidence(
       /\b(launchctl|launchd|background\s+service|start\s+service|service\s+is\s+not\s+running)\b/.test(text) &&
       /teamviewer/.test(text)
     ) {
+      return false;
+    }
+    // Drop "verify UI settings" / "check user interface" actions — we have
+    // no UI probe, so any UI recommendation is an LLM guess paired with a
+    // hallucinated UI root cause (which we also drop above).
+    if (/\b(user\s+interface|ui\s+(settings|configuration|compatibility|issue))\b/.test(text)) {
+      return false;
+    }
+    // Dedupe LLM-generated bare-CA-bundle actions when the canonical
+    // probe-hygiene action is already in the list (deduplicateActions only
+    // catches exact step matches; the LLM rewords).
+    if (/update\s+(the\s+)?(system'?s?\s+)?ca\s+bundle/.test(text) && !/\(probe\s+hygiene/.test(text)) {
       return false;
     }
     return true;

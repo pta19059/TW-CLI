@@ -58,6 +58,10 @@ export interface WorkflowReport {
    *  "azure-vm rg/vm", "k8s ns/pod"). Set by the worker/oneShot wrapper after the
    *  workflow completes; absent on reports built before the ExecutionContext refactor. */
   executionTarget?: string;
+  /** Knowledge-base passages retrieved (LanceDB hybrid) and injected into the
+   *  specialist prompts. Surfaced in the rendered report as a References section
+   *  so the user can verify which KB pages grounded each specialist's reasoning. */
+  references?: Array<{ title?: string; source: string; topic: string }>;
 }
 
 export interface JobInput {

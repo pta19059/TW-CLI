@@ -4,6 +4,7 @@ import {
   cleanSummary,
   deduplicateActions,
   filterActionsAgainstEvidence,
+  filterHypothesesAgainstEvidence,
   filterRootCausesAgainstEvidence
 } from "../src/mastra/workflows/teamviewerTroubleshootWorkflow.js";
 
@@ -181,5 +182,80 @@ describe("filterRootCausesAgainstEvidence", () => {
       ["Target scope: example.com"]
     );
     expect(out.length).toBe(1);
+  });
+  it("drops LLM-invented CA-bundle root cause when the probe-host TLS caveat is in evidence", () => {
+    const out = filterRootCausesAgainstEvidence(
+      [
+        { title: "Outdated CA bundle on the client", score: 0.7, rationale: "Local certificate validation issues likely indicate an outdated CA bundle." },
+        { title: "Real product issue", score: 0.5, rationale: "..." }
+      ],
+      [
+        "DNS resolved 6/6 TeamViewer hosts",
+        "TCP 5938 reachability: 3/3 routers OK",
+        "Note: the HTTPS failure above is a LOCAL certificate-validation issue on the probe host (likely outdated CA bundle, e.g. macOS Monterey)."
+      ]
+    );
+    expect(out.length).toBe(1);
+    expect(out[0].title).toMatch(/Real product issue/);
+  });
+  it("drops LLM-invented 'service not registered' when TeamViewer_Service is in process list", () => {
+    const out = filterRootCausesAgainstEvidence(
+      [
+        { title: "TeamViewer background service not registered", score: 0.7, rationale: "launchctl listed no TeamViewer daemon" },
+        { title: "Network jitter", score: 0.4, rationale: "..." }
+      ],
+      [
+        "DNS resolved 6/6 TeamViewer hosts",
+        "TCP 5938 reachability: 3/3 routers OK",
+        "Processes running: TeamViewer, TeamViewer_Service, bash"
+      ]
+    );
+    expect(out.length).toBe(1);
+    expect(out[0].title).toMatch(/Network jitter/);
+  });
+  it("drops 'Unstable network connectivity' whose rationale just blames firewall when DNS+TCP OK", () => {
+    const out = filterRootCausesAgainstEvidence(
+      [
+        { title: "Unstable network connectivity", score: 0.7, rationale: "Firewall rules preventing inbound/outbound traffic to/from TeamViewer ports" }
+      ],
+      [
+        "DNS resolved 6/6 TeamViewer hosts",
+        "TCP 5938 reachability: 3/3 routers OK"
+      ]
+    );
+    expect(out.length).toBe(0);
+  });
+});
+
+describe("filterHypothesesAgainstEvidence", () => {
+  const evidenceAllGreen = [
+    "DNS resolved 6/6 TeamViewer hosts",
+    "TCP 5938 reachability: 3/3 routers OK",
+    "TeamViewer Remote endpoint TCP reachability: 9/9 OK"
+  ];
+  it("drops near-duplicate firewall hypotheses when connectivity is healthy", () => {
+    const out = filterHypothesesAgainstEvidence(
+      [
+        "Firewall rules might block TeamViewer traffic.",
+        "There might be a firewall blocking TeamViewer traffic.",
+        "Verify firewall settings on both the source and destination machines.",
+        "TeamViewer service might be misconfigured"
+      ],
+      evidenceAllGreen
+    );
+    // All firewall paraphrases dropped; non-firewall hypothesis kept.
+    expect(out.length).toBe(1);
+    expect(out[0]).toMatch(/misconfigured/i);
+  });
+  it("dedupes paraphrases by normalised text even without evidence", () => {
+    const out = filterHypothesesAgainstEvidence(
+      [
+        "The DNS resolution could be slow.",
+        "DNS resolution might be slow.",
+        "Slow DNS resolution"
+      ],
+      []
+    );
+    expect(out.length).toBeLessThanOrEqual(2);
   });
 });

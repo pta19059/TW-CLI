@@ -114,7 +114,7 @@ export function fromConnectivity(report: ConnectivityReport, target: string): Sp
       );
       actions.push({
         step:
-          "(Probe hygiene, not a fix) Refresh the host CA bundle / system trust store: macOS — install latest macOS updates; Linux — refresh ca-certificates; verify system clock. Do NOT change firewall rules — connectivity is fine.",
+          "(Probe hygiene, not a fix) Refresh the host CA bundle / system trust store: macOS — install latest macOS updates; Linux — refresh ca-certificates; verify system clock. Do NOT change the host firewall — connectivity is fine.",
         risk: "low",
         rollback: "Revert to the previous ca-certificates package if the new bundle breaks an internal CA"
       });

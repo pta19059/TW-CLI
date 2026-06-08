@@ -33,6 +33,15 @@ export function renderReportText(report: WorkflowReport): string {
   }
   lines.push("");
 
+  if (report.references && report.references.length > 0) {
+    lines.push("References (KB pages grounded into the specialists):");
+    for (const ref of report.references) {
+      const label = ref.title ? `${ref.title}` : ref.source;
+      lines.push(`- [${ref.topic}] ${label} — ${ref.source}`);
+    }
+    lines.push("");
+  }
+
   const commands = report.actions.map((a) => a.command).filter((c): c is string => !!c);
   if (commands.length > 0) {
     lines.push(`Suggested commands (copy-paste, ${process.platform}):`);
@@ -86,6 +95,17 @@ export function renderReportMarkdown(report: WorkflowReport): string {
     lines.push(`| ${escapePipe(a.step)} | ${a.risk} | ${escapePipe(a.rollback)} |`);
   }
   lines.push("");
+
+  if (report.references && report.references.length > 0) {
+    lines.push(`## References`);
+    lines.push("");
+    lines.push(`| Topic | Title | Source |`);
+    lines.push(`|-------|-------|--------|`);
+    for (const ref of report.references) {
+      lines.push(`| ${escapePipe(ref.topic)} | ${escapePipe(ref.title ?? ref.source)} | ${ref.source} |`);
+    }
+    lines.push("");
+  }
 
   const mdCommands = report.actions.map((a) => a.command).filter((c): c is string => !!c);
   if (mdCommands.length > 0) {
