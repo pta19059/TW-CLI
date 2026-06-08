@@ -257,21 +257,21 @@ static void DrawAnimatedIntroCore()
 // animation (StartTypingAnimation) repaints the figure in place every 20s.
 static void DrawSeatedFigure(bool useAnsi, string cCyan, string cReset)
 {
-    // The timer must NOT repaint while the intro is still drawing — otherwise
-    // a tick that lands between Console.Clear() and the figure write will
-    // paint the old position into the new (empty) buffer, producing a
-    // ghost / double figure. The caller (DrawAnimatedIntro) already sets
-    // FigureAnim.Busy = true around the whole intro; we just need to make
-    // sure TopRow is captured AFTER the writes so it always reflects the
-    // real buffer position even if the buffer scrolled during the writes.
-    foreach (var line in FigureAnim.Idle)
+    // Reserve the figure's vertical space FIRST with N blank lines. This
+    // forces any buffer scrolling to happen NOW (while we're not painting),
+    // so by the time we compute TopRow the figure region is settled and
+    // every subsequent absolute SetCursorPosition lands on the right row.
+    //
+    // Then we paint the figure line-by-line using ABSOLUTE positions instead
+    // of streaming WriteLine. This guarantees the figure cannot be split
+    // visually by a mid-write scroll (which was producing a "top half above,
+    // full body below" duplicate when launched from the desktop icon into a
+    // small console window).
+    for (int i = 0; i < FigureAnim.Idle.Length; i++)
     {
-        Console.WriteLine($"{cCyan}{line}{cReset}");
+        Console.WriteLine();
     }
 
-    // Cursor is now on the line BELOW the figure's last row. Subtract the
-    // figure height to get the figure's actual top row. This is correct even
-    // if the buffer scrolled mid-draw (CursorTop is capped to BufferHeight-1).
     FigureAnim.TopRow = Console.CursorTop - FigureAnim.Idle.Length;
     FigureAnim.LeftCol = 0;
     FigureAnim.UseAnsi = useAnsi;
@@ -280,44 +280,82 @@ static void DrawSeatedFigure(bool useAnsi, string cCyan, string cReset)
 
     if (!useAnsi)
     {
-        // No real terminal — skip the intro blink and any later repainting.
+        // No real terminal — fall back to plain streaming writes (no
+        // cursor positioning available), and skip the blink/animation.
+        int saveTop = Console.CursorTop;
+        try { Console.SetCursorPosition(0, FigureAnim.TopRow); } catch { }
+        foreach (var line in FigureAnim.Idle)
+        {
+            Console.WriteLine($"{cCyan}{line}{cReset}");
+        }
+        try { Console.SetCursorPosition(0, saveTop); } catch { }
         return;
     }
 
-    // One intro blink. Use absolute SetCursorPosition (NOT relative ESC[N A/B)
-    // because conhost clamps relative moves when the buffer has scrolled,
-    // which previously made the blink paint the eyes line onto an unrelated
-    // row above the figure — producing a "phantom head" duplicate.
+    // Paint the idle figure at absolute positions.
+    PaintFigureAbsolute(FigureAnim.Idle);
+
+    // One intro blink. Re-uses the same absolute-paint helper so the eyes
+    // line lands on exactly the same row the rest of the figure occupies.
     const int eyeIndex = 1;
     string eyesOpen = FigureAnim.Idle[eyeIndex];
     string eyesClosed = eyesOpen.Replace("o o", "- -");
 
-    void PaintEyes(string text)
+    Thread.Sleep(650);
+    PaintFigureLine(eyeIndex, eyesClosed);
+    Thread.Sleep(150);
+    PaintFigureLine(eyeIndex, eyesOpen);
+}
+
+// Paint every row of the given frame at the figure's absolute top row.
+// Saves + restores the caller's cursor so the rest of the intro continues
+// from the right buffer position. Used by both the intro idle draw and the
+// typing-animation timer.
+static void PaintFigureAbsolute(string[] frame)
+{
+    if (FigureAnim.TopRow < 0) return;
+    int saveTop = Console.CursorTop;
+    int saveLeft = Console.CursorLeft;
+    try
     {
-        if (FigureAnim.TopRow < 0) return;
-        int saveTop = Console.CursorTop;
-        int saveLeft = Console.CursorLeft;
-        try
+        int winTop = Console.WindowTop;
+        int winBot = winTop + Console.WindowHeight - 1;
+        for (int i = 0; i < frame.Length; i++)
         {
-            int row = FigureAnim.TopRow + eyeIndex;
-            int winTop = Console.WindowTop;
-            int winBot = winTop + Console.WindowHeight - 1;
-            if (row < winTop || row > winBot) return;   // off-screen → skip
+            int row = FigureAnim.TopRow + i;
+            if (row < winTop || row > winBot) continue;
             Console.SetCursorPosition(FigureAnim.LeftCol, row);
             Console.Write("\u001b[2K");
-            Console.Write($"{cCyan}{text}{cReset}");
-        }
-        catch { /* resize race → just skip the blink */ }
-        finally
-        {
-            try { Console.SetCursorPosition(saveLeft, saveTop); } catch { }
+            Console.Write($"{FigureAnim.Cyan}{frame[i]}{FigureAnim.Reset}");
         }
     }
+    catch { /* resize / out-of-range → skip */ }
+    finally
+    {
+        try { Console.SetCursorPosition(saveLeft, saveTop); } catch { }
+    }
+}
 
-    Thread.Sleep(650);
-    PaintEyes(eyesClosed);
-    Thread.Sleep(150);
-    PaintEyes(eyesOpen);
+static void PaintFigureLine(int rowIndex, string text)
+{
+    if (FigureAnim.TopRow < 0) return;
+    int saveTop = Console.CursorTop;
+    int saveLeft = Console.CursorLeft;
+    try
+    {
+        int row = FigureAnim.TopRow + rowIndex;
+        int winTop = Console.WindowTop;
+        int winBot = winTop + Console.WindowHeight - 1;
+        if (row < winTop || row > winBot) return;
+        Console.SetCursorPosition(FigureAnim.LeftCol, row);
+        Console.Write("\u001b[2K");
+        Console.Write($"{FigureAnim.Cyan}{text}{FigureAnim.Reset}");
+    }
+    catch { }
+    finally
+    {
+        try { Console.SetCursorPosition(saveLeft, saveTop); } catch { }
+    }
 }
 
 // Start a background timer that, every 20 seconds, briefly animates the
@@ -350,52 +388,27 @@ static void RunTypingTick()
 
     lock (FigureAnim.Lock)
     {
+        if (!FigureAnim.Enabled || FigureAnim.Busy) return;
         try
         {
             int top = FigureAnim.TopRow;
             int bot = top + FigureAnim.Idle.Length - 1;
             int winTop = Console.WindowTop;
             int winBot = winTop + Console.WindowHeight - 1;
-
-            // Skip if the figure has scrolled out of the visible window —
-            // we never want to repaint somewhere the user can't see.
             if (top < winTop || bot > winBot) return;
 
-            // Save the prompt cursor, animate, restore.
-            Console.Write("\u001b[s");
-            try
+            for (int i = 0; i < 4; i++)
             {
-                for (int i = 0; i < 4; i++)
-                {
-                    if (!FigureAnim.Enabled || FigureAnim.Busy) break;
-                    DrawFigureFrame(FigureAnim.Typing[i % FigureAnim.Typing.Length]);
-                    Thread.Sleep(150);
-                }
-                DrawFigureFrame(FigureAnim.Idle);
+                if (!FigureAnim.Enabled || FigureAnim.Busy) break;
+                PaintFigureAbsolute(FigureAnim.Typing[i % FigureAnim.Typing.Length]);
+                Thread.Sleep(150);
             }
-            finally
-            {
-                Console.Write("\u001b[u");
-            }
+            PaintFigureAbsolute(FigureAnim.Idle);
         }
         catch
         {
             // Any console resize / position error → just skip this tick.
         }
-    }
-}
-
-static void DrawFigureFrame(string[] lines)
-{
-    int top = FigureAnim.TopRow;
-    int left = FigureAnim.LeftCol;
-    for (int i = 0; i < lines.Length; i++)
-    {
-        Console.SetCursorPosition(left, top + i);
-        Console.Write("\u001b[2K");
-        Console.Write(FigureAnim.Cyan);
-        Console.Write(lines[i]);
-        Console.Write(FigureAnim.Reset);
     }
 }
 
