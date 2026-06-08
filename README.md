@@ -42,34 +42,34 @@ twc doctor                                         # verify Foundry Local is rea
 
 The `twc` prefix is optional inside the interactive shell. Run `twc --help` or `twc <command> --help` for full option details.
 
-| Command | What it does |
-|---|---|
-| `twc` | Open the interactive REPL (banner + slash commands) |
-| `twc chat [--product <key>]` | Open the REPL with a preset product |
-| `twc "<free text>"` | Troubleshoot from a natural-language sentence (auto-detects product/target) |
-| `twc -p "<issue>" [--product <key>] [--target <v>] [--task <t>] [--context <c>] [--model <id>] [--markdown]` | One-shot synchronous run |
-| `twc products list` | List the whitelisted TeamViewer products |
-| `twc agents list` | List the Mastra agent roles |
-| `twc agents plan --task <t> --issue "<text>"` | Show which agents would be selected (dry run) |
-| `twc debug <product> --target <v> --issue "<text>" [--context <c>] [--wait]` | Run a background **debug** job |
-| `twc troubleshoot <product> --target <v> --issue "<text>" [--context <c>] [--wait]` | Run a background **troubleshoot** job |
-| `twc probe <target> [--port N] [--timeout ms] [--no-dns]` | Raw DNS + TCP connect probe (default port 5938 = TeamViewer daemon). No LLM. |
-| `twc inspect-remote <target> --user <u> [--port 22] [--key <path>] [--json]` | SSH into a remote macOS host and collect TeamViewer diagnostics (version, daemon, logs, cloud reachability). Read-only, no LLM. |
-| `twc jobs list [--limit N]` | List recent background jobs |
-| `twc jobs show [jobId] [--json\|--markdown]` | Show a job report (no id = last queued job) |
-| `twc jobs logs [jobId] [--tail N]` | Tail a job's worker log (no id = last queued job) |
-| `twc jobs cancel <jobId>` | Kill a running or queued job |
-| `twc explain <jobId>` | Turn a job report into a plain-language narrative |
-| `twc docs ask "<question>"` | Answer a TeamViewer question from official docs |
-| `twc docs reindex` | Crawl the entire TeamViewer KB and rebuild the local index |
-| `twc docs refresh` | Incrementally add only KB pages not already indexed |
-| `twc docs index` | Show local index status (chunks, embeddings, model) |
-| `twc docs map [--rebuild]` | Build/show the KB URL map used for live lookups |
-| `twc docs sources` | List the official documentation sources |
-| `twc docs sync` | Pre-fetch & cache all official docs for offline use |
-| `twc models list\|use <id>\|current\|unset` | Manage the active Foundry Local model |
-| `twc doctor` | Diagnose Foundry Local runtime, env vars and data dirs |
-| `twc config` | Print the resolved configuration |
+| Command | What it does | Example |
+|---|---|---|
+| `twc` | Open the interactive REPL (banner + slash commands) | `twc` |
+| `twc chat [--product <key>]` | Open the REPL with a preset product | `twc chat --product teamviewer-tensor` |
+| `twc "<free text>"` | Troubleshoot from a natural-language sentence (auto-detects product/target) | `twc "tensor session drops on vm-twc-demo"` |
+| `twc -p "<issue>" [--product <key>] [--target <v>] [--task <t>] [--context <c>] [--model <id>] [--markdown]` | One-shot synchronous run | `twc -p "Session drops" --product teamviewer-remote --target endpoint-001 --markdown` |
+| `twc products list` | List the whitelisted TeamViewer products | `twc products list` |
+| `twc agents list` | List the Mastra agent roles | `twc agents list` |
+| `twc agents plan --task <t> --issue "<text>"` | Show which agents would be selected (dry run) | `twc agents plan --task troubleshoot --issue "policy not applied"` |
+| `twc debug <product> --target <v> --issue "<text>" [--context <c>] [--wait]` | Run a background **debug** job | `twc debug teamviewer-remote --target endpoint-001 --issue "crash on start" --wait` |
+| `twc troubleshoot <product> --target <v> --issue "<text>" [--context <c>] [--wait]` | Run a background **troubleshoot** job | `twc troubleshoot teamviewer-tensor --target tenant-acme --issue "policy rollout not applied" --wait` |
+| `twc probe <target> [--port N] [--timeout ms] [--no-dns]` | Raw DNS + TCP connect probe (default port 5938 = TeamViewer daemon). No LLM. | `twc probe router1.teamviewer.com --port 5938` |
+| `twc inspect-remote <target> --user <u> [--port 22] [--key <path>] [--json]` | SSH into a remote macOS host and collect TeamViewer diagnostics (version, daemon, logs, cloud reachability). Read-only, no LLM. | `twc inspect-remote 192.168.1.153 --user stefanosguotti` |
+| `twc jobs list [--limit N]` | List recent background jobs | `twc jobs list --limit 10` |
+| `twc jobs show [jobId] [--json\|--markdown]` | Show a job report (no id = last queued job) | `twc jobs show --markdown` |
+| `twc jobs logs [jobId] [--tail N]` | Tail a job's worker log (no id = last queued job) | `twc jobs logs --tail 100` |
+| `twc jobs cancel <jobId>` | Kill a running or queued job | `twc jobs cancel 7f3a2b` |
+| `twc explain <jobId>` | Turn a job report into a plain-language narrative | `twc explain 7f3a2b` |
+| `twc docs ask "<question>"` | Answer a TeamViewer question from official docs | `twc docs ask "which ports does teamviewer use"` |
+| `twc docs reindex` | Crawl the entire TeamViewer KB and rebuild the local index | `twc docs reindex` |
+| `twc docs refresh` | Incrementally add only KB pages not already indexed | `twc docs refresh` |
+| `twc docs index` | Show local index status (chunks, embeddings, model) | `twc docs index` |
+| `twc docs map [--rebuild]` | Build/show the KB URL map used for live lookups | `twc docs map --rebuild` |
+| `twc docs sources` | List the official documentation sources | `twc docs sources` |
+| `twc docs sync` | Pre-fetch & cache all official docs for offline use | `twc docs sync` |
+| `twc models list\|use <id>\|current\|unset` | Manage the active Foundry Local model | `twc models use qwen2.5-1.5b-cpu` |
+| `twc doctor` | Diagnose Foundry Local runtime, env vars and data dirs | `twc doctor` |
+| `twc config` | Print the resolved configuration | `twc config` |
 
 ### Worked examples
 
