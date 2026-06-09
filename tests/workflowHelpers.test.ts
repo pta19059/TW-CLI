@@ -4,6 +4,7 @@ import {
   calculateConfidence,
   cleanSummary,
   deduplicateActions,
+  prioritizeActions,
   filterActionsAgainstEvidence,
   filterHypothesesAgainstEvidence,
   filterRootCausesAgainstEvidence,
@@ -185,6 +186,23 @@ describe("filterActionsAgainstEvidence", () => {
       evidence5938Ok
     );
     expect(out.length).toBe(1);
+  });
+  it("drops a generic 'Check the firewall settings' action (plural settings/blocks dodged the old blocking regex)", () => {
+    // Exact live-run regression: this leaked into the report at #4 because the
+    // word-boundary blocking regex didn't match plural "settings"/"blocks".
+    const out = filterActionsAgainstEvidence(
+      [
+        {
+          step: "Check the firewall settings on the system.",
+          risk: "low",
+          rollback: "If the firewall blocks the service, temporarily disable the firewall to test the connectivity."
+        },
+        { step: "Restart the TeamViewer app", risk: "low", rollback: "r" }
+      ],
+      evidence5938Ok
+    );
+    expect(out.length).toBe(1);
+    expect(out[0].step).toMatch(/restart the teamviewer app/i);
   });
   it("keeps transport-stability actions that mention NAT/firewall idle-timeout (different failure mode from blocking)", () => {
     // Real-world regression: our signature-aware "Transport-layer instability"
@@ -473,7 +491,46 @@ describe("hasEvidenceAnchor", () => {
     const evidence = distinctiveStems("DNS resolution failed for TeamViewer hosts");
     expect(hasEvidenceAnchor({ title: "TeamViewer issue", rationale: "problem occurs" }, evidence)).toBe(false);
   });
+
+  it("does NOT anchor on the ubiquitous word 'version' (we always print the installed version)", () => {
+    // Evidence always contains "TeamViewer installed: version 15.71.4" — an LLM
+    // cause like "Incompatible software versions" must NOT auto-anchor on it.
+    const evidence = distinctiveStems("TeamViewer installed: version 15.71.4");
+    expect(
+      hasEvidenceAnchor(
+        { title: "Incompatible software versions", rationale: "The current TeamViewer version does not match the required version for monitoring" },
+        evidence
+      )
+    ).toBe(false);
+  });
 });
+
+describe("prioritizeActions", () => {
+  const fix = { step: "Stop the Mac from sleeping: sudo pmset -a sleep 0 standby 0 powernap 1 tcpkeepalive 1", risk: "low" as const, rollback: "Capture pmset -g before changing, then restore prior values." };
+  const hygiene = { step: "(Probe hygiene, not a fix) Refresh the host CA bundle / system trust store.", risk: "low" as const, rollback: "Revert to the previous ca-certificates package." };
+  const observation = { step: "These RetryHandle bursts line up with the standby wake events; only measure link quality if drops happen while awake.", risk: "low" as const, rollback: "Observation steps only — no rollback needed." };
+  const checkLogs = { step: "Check the system logs for any errors related to TeamViewer.", risk: "low" as const, rollback: "Restart the affected process." };
+  const verifySleep = { step: "Verify and confirm the presence of sleep mode on the affected machine.", risk: "low" as const, rollback: "Revert to normal settings." };
+
+  it("floats the real fix to the top and sinks hygiene/observation/filler", () => {
+    const out = prioritizeActions([hygiene, checkLogs, observation, fix, verifySleep]);
+    expect(out[0].step).toMatch(/pmset/); // the actual fix is #1
+    // generic "check the logs" / "verify presence" filler ends up last.
+    expect(out[out.length - 1].step).toMatch(/check the system logs|verify and confirm/i);
+    // hygiene note is below the fix and below the observation step.
+    expect(out.indexOf(fix)).toBeLessThan(out.indexOf(hygiene));
+    expect(out.indexOf(observation)).toBeLessThan(out.indexOf(hygiene));
+  });
+
+  it("is a stable sort within a tier (preserves specialist order)", () => {
+    const a = { step: "Restart the TeamViewer service to clear stuck sessions.", risk: "low" as const, rollback: "none" };
+    const b = { step: "Reinstall TeamViewer to reset its configuration.", risk: "medium" as const, rollback: "none" };
+    const out = prioritizeActions([a, b]);
+    expect(out[0]).toBe(a);
+    expect(out[1]).toBe(b);
+  });
+});
+
 
 
 describe("filterHypothesesAgainstEvidence", () => {

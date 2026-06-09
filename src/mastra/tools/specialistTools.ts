@@ -378,6 +378,7 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
   // as the actual evidence-anchored root cause further down.
   const power = report.power;
   const standbyExplainsDrops = !!power && power.standbyDisconnects > 0;
+  const osName = power?.os === "windows" ? "Windows" : power?.os === "linux" ? "Linux" : "macOS";
 
   if (report.topSignatures.length > 0) {
     evidence.push(
@@ -403,7 +404,7 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
         rationale:
           `Pattern repeats ${dominant.count}\u00d7: ${dominant.exampleLine.slice(0, 260)}` +
           (isReconnectNoise
-            ? " \u2014 note: these coincide with the macOS standby wake events; they are reconnection aftermath, not the root cause (see the power-management finding)."
+            ? " \u2014 note: these coincide with the " + osName + " standby wake events; they are reconnection aftermath, not the root cause (see the power-management finding)."
             : "")
       });
       // Signature-aware action routing: the dominant signature usually
@@ -440,8 +441,8 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
         if (standbyExplainsDrops) {
           actions.push({
             step:
-              "These RetryHandle / RCommand retry bursts line up with the macOS standby wake " +
-              "events detected below \u2014 they are reconnection noise after the Mac slept, NOT a " +
+              "These RetryHandle / RCommand retry bursts line up with the " + osName + " standby/sleep " +
+              "events detected below \u2014 they are reconnection noise after the machine slept, NOT a " +
               "live-session network fault. Fix the standby drops first (see the power-management " +
               "root cause). ONLY if drops ALSO happen during an ACTIVE remote-control session " +
               "(machine awake) should you measure link quality: `ping -c 50 router11.teamviewer.com` " +
@@ -486,55 +487,128 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
     evidence.push("No errors or warnings detected in log tail window.");
   }
 
-  // macOS standby / power-management root cause. This is the high-value
-  // correction: an idle Mac that enters standby drops the TeamViewer connection
-  // and reconnects on wake, producing the RetryHandle burst that the signature
+  // Standby / power-management root cause. This is the high-value correction:
+  // an idle machine that enters standby drops the TeamViewer connection and
+  // reconnects on wake, producing the RetryHandle burst that the signature
   // clustering otherwise misattributes. Surface it as an evidence-anchored
   // root cause (baseline → tagged evidenceAnchored=true in the workflow merge).
+  // OS-aware: macOS uses pmset + NetWatchdog; Windows uses powercfg +
+  // Kernel-Power sleep/resume events. (Cloud VMs / Kubernetes pods never sleep,
+  // so `power` is undefined there and this whole block is skipped.)
   if (power) {
-    if (power.pmsetSummary) {
-      evidence.push(`macOS power management (pmset): ${power.pmsetSummary}.`);
+    const isWindows = power.os === "windows";
+    const isLinux = power.os === "linux";
+    const configSummary = isWindows || isLinux ? power.powercfgSummary : power.pmsetSummary;
+    if (configSummary) {
+      evidence.push(
+        isWindows
+          ? `Windows power management (powercfg): ${configSummary}.`
+          : isLinux
+            ? `Linux power management (systemd): ${configSummary}.`
+            : `macOS power management (pmset): ${configSummary}.`
+      );
     }
     if (power.standbyDisconnects > 0) {
       const when = power.disconnectTimes.length
         ? ` (e.g. ${power.disconnectTimes.slice(-3).join(", ")})`
         : "";
-      evidence.push(
-        `NetWatchdog logged ${power.standbyDisconnects} standby disconnect event(s) ` +
-          `("Completely disconnected. Going offline") and ${power.wakeRecoveries} wake recovery(ies) ` +
-          `in the last 24h${when}.`
-      );
-      const cfg = [
-        power.standbyEnabled === true ? "standby=on" : power.standbyEnabled === false ? "standby=off" : null,
-        power.powerNapEnabled === false ? "powernap=off" : power.powerNapEnabled === true ? "powernap=on" : null,
-        power.tcpKeepAlive === false ? "tcpkeepalive=off" : null,
-        typeof power.standbyDelayLowSec === "number" ? `standbydelaylow=${power.standbyDelayLowSec}s` : null
-      ]
-        .filter(Boolean)
-        .join(", ");
+      if (isWindows) {
+        evidence.push(
+          `Kernel-Power logged ${power.standbyDisconnects} sleep-enter event(s) (Event ID 42/506) ` +
+            `and ${power.wakeRecoveries} resume event(s) (Event ID 107/507) in the last 24h${when}. ` +
+            `Each idle-sleep drops the TeamViewer connection until the machine wakes.`
+        );
+      } else if (isLinux) {
+        evidence.push(
+          `systemd-logind logged ${power.standbyDisconnects} suspend transition(s) and ` +
+            `${power.wakeRecoveries} resume(s) in the last 24h${when}. ` +
+            `Each suspend drops the TeamViewer connection until the machine wakes.`
+        );
+      } else {
+        evidence.push(
+          `NetWatchdog logged ${power.standbyDisconnects} standby disconnect event(s) ` +
+            `("Completely disconnected. Going offline") and ${power.wakeRecoveries} wake recovery(ies) ` +
+            `in the last 24h${when}.`
+        );
+      }
+      const cfg = isWindows
+        ? [
+            power.standbyEnabled === true ? "idle-sleep enabled" : power.standbyEnabled === false ? "idle-sleep disabled" : null,
+            typeof power.standbyDelayLowSec === "number" ? `standby-timeout(AC)=${power.standbyDelayLowSec}s` : null
+          ]
+            .filter(Boolean)
+            .join(", ")
+        : isLinux
+          ? [
+              power.standbyEnabled === true ? "suspend available" : power.standbyEnabled === false ? "suspend masked" : null
+            ]
+              .filter(Boolean)
+              .join(", ")
+          : [
+              power.standbyEnabled === true ? "standby=on" : power.standbyEnabled === false ? "standby=off" : null,
+              power.powerNapEnabled === false ? "powernap=off" : power.powerNapEnabled === true ? "powernap=on" : null,
+              power.tcpKeepAlive === false ? "tcpkeepalive=off" : null,
+              typeof power.standbyDelayLowSec === "number" ? `standbydelaylow=${power.standbyDelayLowSec}s` : null
+            ]
+              .filter(Boolean)
+              .join(", ");
       rootCauses.push({
-        title: "macOS standby/sleep is dropping the idle TeamViewer connection",
+        title: `${osName} standby/sleep is dropping the idle TeamViewer connection`,
         score: Math.min(0.92, 0.7 + Math.log10(power.standbyDisconnects + 1) * 0.2),
-        rationale:
-          `The macOS NetWatchdog reported ${power.standbyDisconnects} "Completely disconnected. Going offline" ` +
-          `event(s) as the Mac entered standby, each followed by a reconnect on wake \u2014 this is the actual ` +
-          `disconnect pattern. ${cfg ? `Power settings: ${cfg}. ` : ""}` +
-          `When the machine goes idle it sleeps and the connection drops until wake; the RetryHandle/RCommand ` +
-          `errors are the reconnection aftermath, not the cause.`
+        rationale: isWindows
+          ? `The Windows Kernel-Power log reported ${power.standbyDisconnects} sleep-enter event(s) ` +
+            `(Event ID 42/506), each followed by a resume on wake \u2014 this is the actual disconnect ` +
+            `pattern. ${cfg ? `Power settings: ${cfg}. ` : ""}` +
+            `When the machine goes idle it sleeps and the connection drops until wake; the RetryHandle/RCommand ` +
+            `errors are the reconnection aftermath, not the cause.`
+          : isLinux
+            ? `systemd-logind reported ${power.standbyDisconnects} suspend transition(s), each followed by a ` +
+              `resume on wake \u2014 this is the actual disconnect pattern. ${cfg ? `Power settings: ${cfg}. ` : ""}` +
+              `When the machine goes idle it suspends and the connection drops until wake; the RetryHandle/RCommand ` +
+              `errors are the reconnection aftermath, not the cause.`
+            : `The macOS NetWatchdog reported ${power.standbyDisconnects} "Completely disconnected. Going offline" ` +
+              `event(s) as the Mac entered standby, each followed by a reconnect on wake \u2014 this is the actual ` +
+              `disconnect pattern. ${cfg ? `Power settings: ${cfg}. ` : ""}` +
+              `When the machine goes idle it sleeps and the connection drops until wake; the RetryHandle/RCommand ` +
+              `errors are the reconnection aftermath, not the cause.`
       });
-      actions.push({
-        step:
-          "Stop the Mac from sleeping while TeamViewer must stay reachable. For unattended access, " +
-          "enable TeamViewer \u2192 Preferences \u2192 Advanced \u2192 'Prevent System from sleeping' (Unattended " +
-          "Access), or keep it awake at the OS level: `sudo pmset -a sleep 0 standby 0 powernap 1 " +
-          "tcpkeepalive 1` (on AC power), or run `caffeinate -s` during sessions. Verify with `pmset -g`. " +
-          "If the Mac MUST sleep, drops while asleep are by design \u2014 not a TeamViewer fault.",
-        risk: "low",
-        rollback: "Capture `pmset -g` before changing, then restore prior values with `sudo pmset -a sleep <old> standby <old> powernap <old>`."
-      });
-    } else if (power.pmsetSummary) {
+      if (isWindows) {
+        actions.push({
+          step:
+            "Stop Windows from sleeping while TeamViewer must stay reachable. For unattended access, " +
+            "enable TeamViewer \u2192 Extras \u2192 Options \u2192 Advanced \u2192 'Prevent System from sleeping', " +
+            "or keep it awake at the OS level (Admin PowerShell): `powercfg /change standby-timeout-ac 0` " +
+            "and `powercfg /change standby-timeout-dc 0`. Verify with `powercfg /q SCHEME_CURRENT SUB_SLEEP STANDBYIDLE`. " +
+            "If the machine MUST sleep, drops while asleep are by design \u2014 not a TeamViewer fault.",
+          risk: "low",
+          rollback: "Re-apply the previous idle-sleep timeout with `powercfg /change standby-timeout-ac <old-seconds>` (capture it first with `powercfg /q`)."
+        });
+      } else if (isLinux) {
+        actions.push({
+          step:
+            "Stop Linux from suspending while TeamViewer must stay reachable. On a server/headless host " +
+            "mask the sleep targets: `sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target`. " +
+            "On a desktop, disable automatic suspend in the power settings (GNOME: Settings \u2192 Power \u2192 " +
+            "'Automatic Suspend' Off). Verify with `systemctl status sleep.target` and `journalctl -u systemd-logind`. " +
+            "If the machine MUST suspend, drops while suspended are by design \u2014 not a TeamViewer fault.",
+          risk: "low",
+          rollback: "Re-enable suspend with `sudo systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.target` (or re-enable Automatic Suspend in the desktop power settings)."
+        });
+      } else {
+        actions.push({
+          step:
+            "Stop the Mac from sleeping while TeamViewer must stay reachable. For unattended access, " +
+            "enable TeamViewer \u2192 Preferences \u2192 Advanced \u2192 'Prevent System from sleeping' (Unattended " +
+            "Access), or keep it awake at the OS level: `sudo pmset -a sleep 0 standby 0 powernap 1 " +
+            "tcpkeepalive 1` (on AC power), or run `caffeinate -s` during sessions. Verify with `pmset -g`. " +
+            "If the Mac MUST sleep, drops while asleep are by design \u2014 not a TeamViewer fault.",
+          risk: "low",
+          rollback: "Capture `pmset -g` before changing, then restore prior values with `sudo pmset -a sleep <old> standby <old> powernap <old>`."
+        });
+      }
+    } else if (configSummary) {
       evidence.push(
-        "No macOS standby-related TeamViewer disconnects in the last 24h \u2014 idle-sleep is ruled out as the cause."
+        `No ${osName} standby-related TeamViewer disconnects in the last 24h \u2014 idle-sleep is ruled out as the cause.`
       );
     }
   }

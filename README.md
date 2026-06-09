@@ -15,10 +15,17 @@ are grounded against the official Knowledge Base via a local hybrid RAG index.
   no cloud, no fallback.
 - **Real probes, not canned data** — DNS / TCP `5938` / HTTPS, services & processes (Win/Linux/macOS),
   log clustering, optional TeamViewer Web API checks.
-- **macOS standby/power-management correlation** — on macOS targets the log probe reads `pmset -g`
-  and the `NetWatchdog` standby/wake events, so an "it drops every few minutes" symptom that is
-  really *idle-sleep dropping the connection* is diagnosed correctly (and the post-wake
-  RetryHandle/RCommand error burst is demoted to reconnection noise instead of being misattributed).
+- **Cross-OS standby/power-management correlation** — the log probe detects an idle machine that
+  sleeps and drops the connection on *every* supported OS, then demotes the post-wake
+  RetryHandle/RCommand error burst to reconnection noise instead of misattributing it:
+  - **macOS** — reads `pmset -g` and the `NetWatchdog` standby/wake events.
+  - **Windows** — reads `powercfg /a` + the AC/DC standby idle-timeout and the last-24h
+    Kernel-Power sleep/resume events (Event ID 42/506 → sleep, 107/507/1 → resume).
+  - **Linux** — reads `systemctl` sleep-target state + the last-24h `journalctl` systemd-logind /
+    kernel suspend/resume transitions.
+  - **Cloud VM / Kubernetes** — servers and pods never sleep, so this correctly no-ops (the right
+    signals there are deallocation / pod eviction / restart correlation, not standby).
+  All harvests are strictly read-only — they never change a host's power plan.
 - **Readable, evidence-first reports** — a fixed section order (root causes → actions → knowledge
   base → log sources → evidence) keeps the decision content on top; speculative hypotheses appear
   only when no definitive cause was found.
@@ -222,13 +229,23 @@ answer is readable at a glance:
    with the collected probe/log evidence is dropped as speculation, so the report never invents a
    plausible-sounding cause (e.g. "Permissions Issue") that nothing actually observed supports.
    Probe-derived causes (real log signatures, failed connectivity checks) are always trusted. On
-   macOS, recurring disconnects that line up with `NetWatchdog` standby events surface a dedicated
-   *"macOS standby/sleep is dropping the idle connection"* root cause and demote the correlated
+   any supported OS, recurring disconnects that line up with a sleep/standby transition surface a
+   dedicated *"<OS> standby/sleep is dropping the idle connection"* root cause (macOS `NetWatchdog`,
+   Windows Kernel-Power Event 42/506, Linux systemd-logind suspend) and demote the correlated
    reconnection-aftermath signatures (RetryHandle, license/CMML checks, chat-provider registration)
-   to noise. The gateway LLM rerank may reorder enrichment guesses but **cannot demote a
+   to noise. Ubiquitous words the report always prints (e.g. "version", "service") are treated as
+   non-distinctive anchors, so a candidate like "Incompatible software versions" can't anchor on
+   them. The gateway LLM rerank may reorder enrichment guesses but **cannot demote a
    probe-derived (evidence-anchored) cause below its computed score** — so a 1.5B model can't bury
    the real finding (e.g. knock the standby cause from 0.82 to a 0.49 floor) under a phantom guess.
-3. **Recommended Actions** — prioritized remediation steps with risk + rollback.
+   When the top cause is evidence-anchored the one-line summary is generated deterministically (the
+   small local model is never allowed to paraphrase — and possibly fabricate — a proven finding).
+3. **Recommended Actions** — remediation steps with risk + rollback, ordered so concrete-command
+   fixes float to the top and probe-hygiene / observation-only / generic filler steps sink to the
+   bottom. Actions contradicted by the evidence are dropped, not just down-ranked — e.g. any
+   firewall-inspection step is removed once DNS + TCP `5938` both prove the path is open
+   ("firewall ruled out"), and a `launchctl load` step is removed when the daemon is already in the
+   process list.
 4. **Knowledge Base** — only the official KB articles that pass an absolute on-topic relevance
    gate, sorted by relevance (off-topic filler is dropped, not just down-ranked).
 5. **Log Sources Consulted** — the exact log paths / commands inspected on the target (e.g. the

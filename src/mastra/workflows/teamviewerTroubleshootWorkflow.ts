@@ -505,7 +505,7 @@ const aggregateStep = createStep({
     // (e.g. "check firewall for port 5938" when the connectivity probe just
     // proved 5938 is reachable). Prevents the synthesized report from
     // contradicting its own evidence section.
-    const filteredActions = filterActionsAgainstEvidence(allActions, evidence);
+    const filteredActions = prioritizeActions(filterActionsAgainstEvidence(allActions, evidence));
 
     // LLM-generated executive summary (plain text, single line). The small
     // local model is prone to two failure modes: (a) serializing a tool-call
@@ -538,11 +538,22 @@ const aggregateStep = createStep({
     // When we have NO plausible root cause, the LLM tends to hallucinate one
     // (it grabs the only candidate from evidence and invents causality). Use
     // a deterministic neutral summary instead — never let the model invent.
+    const topAnchored = topRoots[0]?.evidenceAnchored === true;
     if (!hasPlausibleCause) {
       summary =
         `${meta.task === "debug" ? "Debug" : "Troubleshoot"} run completed for ${meta.product}: ` +
         "baseline network and service checks all succeeded, so probes did not identify a definitive root cause; " +
         "capture TeamViewer client logs during a live drop and re-run to narrow further.";
+    } else if (topAnchored) {
+      // The #1 cause is PROBE-DERIVED truth (a counted log signature, a
+      // correlated NetWatchdog standby disconnect, a failed connectivity
+      // check). Do NOT hand it to the 1.5B model to paraphrase — when given
+      // the real standby cause it hallucinated "a recent update to macOS has
+      // caused TeamViewer to drop", inventing a cause nothing observed. State
+      // the evidence-anchored cause verbatim instead.
+      summary =
+        `${meta.task === "debug" ? "Debug" : "Troubleshoot"} run for ${meta.product} — most likely cause: ` +
+        `${topTitle}. Review the ranked root causes and recommended actions below.`;
     } else {
       for (const strict of [false, true]) {
         const out = await gatewayAgent.generate(buildSummaryPrompt(strict));
@@ -618,6 +629,54 @@ export function deduplicateActions(actions: ActionItem[]): ActionItem[] {
     unique.set(action.step, action);
   }
   return Array.from(unique.values());
+}
+
+/**
+ * Stable-sort actions so the actual FIX surfaces first and low-value meta
+ * actions sink. The small enrichment model pads the action list with
+ * "(Probe hygiene, not a fix)" notes, observation-only measurement steps, and
+ * generic "check the logs" / "verify and confirm X" filler — none of which is
+ * the remediation. Live runs put the real pmset/standby fix at #4 behind a
+ * CA-bundle hygiene note, a "check the system logs" filler and a generic
+ * "restart the service" step, burying the answer. Tiers (lower = earlier; a
+ * stable sort preserves specialist order within a tier):
+ *   0  concrete-command fix (carries a real shell command: pmset/caffeinate/
+ *      sudo/systemctl/launchctl/backtick command) — the actionable remediation
+ *   1  prose remediation (generic "restart the service", "reinstall …")
+ *   2  diagnostic / observation-only steps ("observation steps only", measure…)
+ *   3  probe-hygiene / explicit "not a fix" notes
+ *   4  generic filler ("check the system logs", "verify and confirm the presence of…")
+ * Classification precedence matters: an observation step that happens to quote
+ * a `ping`/`traceroute` command must stay in the observation tier, so hygiene/
+ * observation/filler are detected BEFORE the concrete-command tier.
+ */
+export function prioritizeActions(actions: ActionItem[]): ActionItem[] {
+  const tierOf = (a: ActionItem): number => {
+    const step = (a.step ?? "").toLowerCase().trim();
+    const full = `${step} ${(a.rollback ?? "").toLowerCase()} ${(a.command ?? "").toLowerCase()}`;
+    // 3 — probe hygiene / explicit non-fix note.
+    if (/\(probe\s+hygiene|not a fix\b/.test(full)) return 3;
+    // 2 — observation / measurement only.
+    if (/observation steps only|observation only|measure (?:link|the)\b/.test(full)) return 2;
+    // 4 — generic "check/verify the logs/settings/presence" filler with no fix.
+    const carriesRealFix =
+      /\bpmset\b|\bcaffeinate\b|\bsudo\b|\bsystemctl\b|\blaunchctl\b|`[^`]*\w[^`]*`/.test(full);
+    if (
+      /^(check|verify|confirm|review|inspect|look)\b/.test(step) &&
+      /\b(log|logs|setting|settings|presence|status|errors?)\b/.test(step) &&
+      !carriesRealFix
+    ) {
+      return 4;
+    }
+    // 0 — actionable remediation that carries a concrete shell command.
+    if (carriesRealFix) return 0;
+    // 1 — everything else: prose remediation (restart/reinstall/enable …).
+    return 1;
+  };
+  return actions
+    .map((a, i) => ({ a, i, tier: tierOf(a) }))
+    .sort((x, y) => x.tier - y.tier || x.i - y.i)
+    .map((e) => e.a);
 }
 
 /**
@@ -713,7 +772,13 @@ const ANCHOR_STOPWORDS = new Set([
   // are NOT a distinctive anchor — an LLM cause that only touches the evidence
   // via the word "service" ("the TeamViewer service requires admin rights")
   // is still an unanchored guess and must be dropped.
-  "service", "services", "daemon", "daemons", "process", "processes"
+  "service", "services", "daemon", "daemons", "process", "processes",
+  // "version"/"versions" appear in every report because we ALWAYS print
+  // "TeamViewer installed: version X.Y.Z" in the evidence. So an LLM cause
+  // like "Incompatible software versions" auto-anchors on the bare word
+  // "version" with nothing real behind it. A GENUINE version problem anchors
+  // via other distinctive terms (e.g. "outdated", a probe note) instead.
+  "version", "versions", "update", "updates", "updated"
 ]);
 
 /**
@@ -969,14 +1034,18 @@ export function filterActionsAgainstEvidence(
       //      firewall idle-timeout") rather than a blocking-style change.
       const isProbeHygieneCarveOut = /do not change the host firewall/.test(text) || /probe hygiene/.test(text);
       const isDiagnosticContext = /\b(tcpdump|pktmon|wireshark|ping\b|traceroute|mtr\b|dig\b|nslookup|scutil|netstat|ss\s+-|capture\s+a?\s*\d*\s*(min|sec)|packet\s+capture)\b/.test(text);
-      const isBlockingRecommendation = /\b(block|blocking|blocked|allow|allow-?list|whitelist|open\s+(?:the\s+)?port|firewall\s+(?:rule|setting|configuration|config)|deny|denies|inbound\s+rule|outbound\s+rule)\b/.test(text);
       if (!isProbeHygieneCarveOut && !isDiagnosticContext) {
         // Action explicitly inspects the firewall for a port we just proved open.
         if (port5938Open && /\b5938\b/.test(text)) return false;
-        // Generic "firewall blocking TeamViewer traffic" / "firewall rules" \u2014
-        // if DNS + TCP work, blocking-class firewall recommendations are
-        // contradicted by the evidence.
-        if (firewallRuledOut && isBlockingRecommendation) return false;
+        // Firewall PROVEN irrelevant (DNS resolves AND TCP to TeamViewer hosts
+        // succeeds): ANY firewall inspection/change recommendation is moot and
+        // contradicts the evidence \u2014 whether phrased "check the firewall
+        // settings", "disable the firewall to test connectivity", or "firewall
+        // may be blocking". Earlier this only dropped explicit blocking-verb
+        // recommendations, so a live run leaked "Check the firewall settings on
+        // the system" (plural "settings"/"blocks" dodged the blocking regex).
+        // Diagnostic and probe-hygiene firewall mentions are already exempt above.
+        if (firewallRuledOut) return false;
       }
     }
     // "sudo launchctl load -w .../com.teamviewer.teamviewerd.plist" or any

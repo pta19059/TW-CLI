@@ -10,7 +10,7 @@ import type { EndpointHealthReport } from "../src/probes/endpointHealth.js";
 import type { LogProbeReport } from "../src/probes/logs.js";
 import type { AuthProbeReport } from "../src/probes/authPolicy.js";
 import { normalize } from "../src/probes/logs.js";
-import { buildMacCaptureCommand, parseMacPowerEvents } from "../src/probes/logs.js";
+import { buildMacCaptureCommand, parseMacPowerEvents, parseWindowsPowerEvents, parseLinuxPowerEvents } from "../src/probes/logs.js";
 
 describe("buildMacCaptureCommand", () => {
   it("builds a self-contained capture-then-grep pipeline for a window", () => {
@@ -80,6 +80,101 @@ describe("parseMacPowerEvents", () => {
     expect(p.standbyDisconnects).toBe(0);
     expect(p.standbyEnabled).toBeUndefined();
     expect(p.pmsetSummary).toBeUndefined();
+  });
+});
+
+describe("parseWindowsPowerEvents", () => {
+  const sample = [
+    "===CONFIG===",
+    "sleep_supported=1",
+    "standby_timeout_ac_sec=1800",
+    "standby_timeout_dc_sec=600",
+    "===EVENTS===",
+    "2026-06-08 15:53:27 Id=42",
+    "2026-06-08 16:10:02 Id=107",
+    "2026-06-08 20:19:05 Id=506",
+    "2026-06-08 20:25:11 Id=507",
+    "2026-06-08 21:35:56 Id=42",
+    "2026-06-08 21:40:00 Id=1"
+  ].join("\n");
+
+  it("counts Kernel-Power sleep-enter (42/506) as disconnects and resume (107/507/1) as recoveries", () => {
+    const p = parseWindowsPowerEvents(sample);
+    expect(p.os).toBe("windows");
+    expect(p.standbyDisconnects).toBe(3);
+    expect(p.standbyEnters).toBe(3);
+    expect(p.wakeRecoveries).toBe(3);
+    expect(p.disconnectTimes).toEqual([
+      "2026-06-08 15:53:27",
+      "2026-06-08 20:19:05",
+      "2026-06-08 21:35:56"
+    ]);
+  });
+
+  it("parses powercfg standby timeouts and derives sleep flags", () => {
+    const p = parseWindowsPowerEvents(sample);
+    expect(p.standbyEnabled).toBe(true);
+    expect(p.sleepDisabled).toBe(false);
+    expect(p.standbyDelayLowSec).toBe(1800);
+    expect(p.powercfgSummary).toContain("standby-timeout(AC)=1800s");
+    expect(p.powercfgSummary).toContain("sleep supported");
+  });
+
+  it("treats AC standby-timeout=0 as sleep disabled", () => {
+    const p = parseWindowsPowerEvents(
+      "===CONFIG===\nstandby_timeout_ac_sec=0\n===EVENTS===\n"
+    );
+    expect(p.sleepDisabled).toBe(true);
+    expect(p.standbyEnabled).toBe(false);
+    expect(p.powercfgSummary).toContain("(never)");
+  });
+
+  it("returns zero counts and undefined flags when nothing matches", () => {
+    const p = parseWindowsPowerEvents("===CONFIG===\n===EVENTS===\n");
+    expect(p.standbyDisconnects).toBe(0);
+    expect(p.standbyEnabled).toBeUndefined();
+    expect(p.powercfgSummary).toBeUndefined();
+  });
+});
+
+describe("parseLinuxPowerEvents", () => {
+  const sample = [
+    "===CONFIG===",
+    "suspend_masked=0",
+    "===EVENTS===",
+    "2026-06-08T15:53:27 host systemd-logind[1]: System is suspending. SUSPEND",
+    "2026-06-08T19:12:33 host systemd-logind[1]: System resumed. RESUME",
+    "2026-06-08T20:19:05 host kernel: PM: suspend entry SUSPEND",
+    "2026-06-08T20:25:11 host kernel: PM: suspend exit RESUME"
+  ].join("\n");
+
+  it("counts suspend transitions as disconnects and resumes as recoveries", () => {
+    const p = parseLinuxPowerEvents(sample);
+    expect(p.os).toBe("linux");
+    expect(p.standbyDisconnects).toBe(2);
+    expect(p.standbyEnters).toBe(2);
+    expect(p.wakeRecoveries).toBe(2);
+    expect(p.disconnectTimes).toEqual(["2026-06-08 15:53:27", "2026-06-08 20:19:05"]);
+  });
+
+  it("derives sleep flags from suspend_masked", () => {
+    const p = parseLinuxPowerEvents(sample);
+    expect(p.standbyEnabled).toBe(true);
+    expect(p.sleepDisabled).toBe(false);
+    expect(p.powercfgSummary).toContain("suspend available");
+  });
+
+  it("treats suspend_masked=1 as sleep disabled", () => {
+    const p = parseLinuxPowerEvents("===CONFIG===\nsuspend_masked=1\n===EVENTS===\n");
+    expect(p.sleepDisabled).toBe(true);
+    expect(p.standbyEnabled).toBe(false);
+    expect(p.powercfgSummary).toContain("masked");
+  });
+
+  it("returns zero counts when nothing matches", () => {
+    const p = parseLinuxPowerEvents("===CONFIG===\n===EVENTS===\n");
+    expect(p.standbyDisconnects).toBe(0);
+    expect(p.standbyEnabled).toBeUndefined();
   });
 });
 
@@ -355,6 +450,47 @@ describe("fromLogs", () => {
     // The transport action is reframed (standby-aware), not the generic one.
     const action = out.actions.map((a) => a.step).join("\n").toLowerCase();
     expect(action).toMatch(/standby|caffeinate|pmset|prevent system from sleeping/);
+  });
+
+  it("surfaces a Windows standby root cause when Kernel-Power logged sleep/resume events", () => {
+    const report: LogProbeReport = {
+      filesInspected: ["C:/ProgramData/TeamViewer/Logs/TeamViewer15_Logfile.log"],
+      totalLines: 88, errorCount: 40, warningCount: 12,
+      topSignatures: [
+        {
+          signature: "RetryHandle::HandleRetry(): Trying resend to 13 failed with error RCommand:1, retrying",
+          count: 7,
+          exampleLine: "TeamViewer_Service ... RetryHandle::HandleRetry(): Trying resend to 13 failed with error RCommand:1, retrying"
+        }
+      ],
+      diagnostics: [],
+      power: {
+        os: "windows",
+        standbyDisconnects: 3,
+        standbyEnters: 3,
+        wakeRecoveries: 3,
+        disconnectTimes: ["2026-06-08 15:53:27", "2026-06-08 20:19:05", "2026-06-08 21:35:56"],
+        standbyEnabled: true,
+        standbyDelayLowSec: 1800,
+        powercfgSummary: "sleep supported, standby-timeout(AC)=1800s, standby-timeout(DC)=600s"
+      }
+    };
+    const out = fromLogs(report);
+    const standby = out.rootCauses.find((r) => /windows standby|sleep/i.test(r.title));
+    expect(standby).toBeDefined();
+    expect(standby!.title).toMatch(/windows standby/i);
+    // The standby cause must OUTRANK the demoted RetryHandle signature.
+    const retry = out.rootCauses.find((r) => /recurring failure signature/i.test(r.title));
+    expect(retry).toBeDefined();
+    expect(standby!.score).toBeGreaterThan(retry!.score);
+    expect(retry!.score).toBeLessThan(0.5);
+    // Windows-flavored remediation + evidence (powercfg / Kernel-Power), not pmset.
+    const action = out.actions.map((a) => a.step).join("\n").toLowerCase();
+    expect(action).toMatch(/powercfg|standby-timeout|prevent system from sleeping/);
+    expect(action).not.toMatch(/pmset|caffeinate/);
+    const evidence = out.evidence.join("\n");
+    expect(evidence).toMatch(/Kernel-Power/);
+    expect(evidence).toMatch(/powercfg/);
   });
 
   it("demotes a license/CMML signature as reconnection noise when standby is the proven cause", () => {

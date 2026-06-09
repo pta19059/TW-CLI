@@ -31,26 +31,34 @@ export interface SignatureCluster {
  * instead of being misattributed to the post-wake RetryHandle error burst.
  */
 export interface PowerEventSummary {
-  /** "Completely disconnected. Going offline" NetWatchdog events (the real drops). */
+  /** Which OS produced this summary — drives OS-specific report wording. */
+  os?: RemoteOs;
+  /**
+   * The real drops. macOS: "Completely disconnected. Going offline" NetWatchdog
+   * events. Windows: Kernel-Power sleep-enter events (Id 42 / 506). Linux:
+   * systemd-logind "PrepareForSleep" suspend transitions.
+   */
   standbyDisconnects: number;
-  /** "OnStandby going to sleep" transitions. */
+  /** Sleep/standby transitions (macOS "OnStandby going to sleep"; same as standbyDisconnects on Win/Linux). */
   standbyEnters: number;
-  /** "OnStandby woke up" / "Internet is now connected" recoveries. */
+  /** Wake/resume recoveries (macOS "OnStandby woke up"; Windows Id 107/507/1; Linux resume). */
   wakeRecoveries: number;
-  /** Best-effort timestamps of the disconnect events, oldest→newest. */
+  /** Best-effort timestamps of the disconnect/sleep events, oldest→newest. */
   disconnectTimes: string[];
-  /** pmset `sleep == 0` (true = sleep disabled). undefined if not parsed. */
+  /** pmset `sleep == 0` / Windows AC standby-timeout == 0 (true = sleep disabled). */
   sleepDisabled?: boolean;
-  /** pmset `standby == 1`. */
+  /** pmset `standby == 1` / Windows AC standby-timeout > 0. */
   standbyEnabled?: boolean;
-  /** pmset `powernap == 1`. */
+  /** pmset `powernap == 1` (macOS only). */
   powerNapEnabled?: boolean;
-  /** pmset `tcpkeepalive == 1`. */
+  /** pmset `tcpkeepalive == 1` (macOS only). */
   tcpKeepAlive?: boolean;
-  /** pmset `standbydelaylow` (seconds before low-power standby). */
+  /** pmset `standbydelaylow` / Windows AC standby idle timeout (seconds). */
   standbyDelayLowSec?: number;
-  /** Compact human-readable pmset summary for the Evidence block. */
+  /** Compact human-readable pmset summary for the Evidence block (macOS). */
   pmsetSummary?: string;
+  /** Compact human-readable powercfg summary for the Evidence block (Windows). */
+  powercfgSummary?: string;
 }
 
 export interface LogProbeReport {
@@ -444,6 +452,7 @@ export function parseMacPowerEvents(raw: string): PowerEventSummary {
     standbyEnters,
     wakeRecoveries,
     disconnectTimes,
+    os: "macos",
     sleepDisabled: flag("sleep", 0),
     standbyEnabled: flag("standby", 1),
     powerNapEnabled: flag("powernap", 1),
@@ -476,6 +485,211 @@ async function harvestMacPowerEvents(ctx: ExecutionContext): Promise<PowerEventS
   }
 }
 
+/**
+ * Parse the combined powercfg + Kernel-Power event block emitted by
+ * harvestWindowsPowerEvents into a structured PowerEventSummary. Pure +
+ * exported so it is unit-testable without a real Windows host.
+ *
+ * Expected input shape (two labelled sections):
+ *   ===CONFIG===
+ *   sleep_supported=1
+ *   standby_timeout_ac_sec=1800
+ *   standby_timeout_dc_sec=600
+ *   ===EVENTS===
+ *   2026-06-08 15:53:27 Id=42      (system entering sleep)
+ *   2026-06-08 19:12:33 Id=107     (system resumed from sleep)
+ *
+ * Windows mapping vs macOS:
+ *   • Kernel-Power Id 42 / 506  → system entered (modern) standby = a real drop
+ *   • Kernel-Power Id 107 / 507 / 1 → resume from sleep = the reconnect on wake
+ * Each idle-sleep drops the TeamViewer connection until the box wakes, exactly
+ * like the macOS NetWatchdog standby pattern — so the post-wake RetryHandle
+ * burst is reconnection aftermath, not the root cause.
+ */
+export function parseWindowsPowerEvents(raw: string): PowerEventSummary {
+  let section: "config" | "events" | "" = "";
+  const config: Record<string, string> = {};
+  const eventLines: string[] = [];
+  for (const line of (raw ?? "").split(/\r?\n/)) {
+    const t = line.trim();
+    if (/^===\s*CONFIG\s*===$/i.test(t)) { section = "config"; continue; }
+    if (/^===\s*EVENTS\s*===$/i.test(t)) { section = "events"; continue; }
+    if (section === "config") {
+      const m = t.match(/^([a-z_]+)\s*=\s*(-?\d+)$/i);
+      if (m) config[m[1].toLowerCase()] = m[2];
+    } else if (section === "events" && t) {
+      eventLines.push(t);
+    }
+  }
+
+  let standbyDisconnects = 0; // sleep-enter events (42 / 506)
+  let wakeRecoveries = 0; // resume events (107 / 507 / 1)
+  const disconnectTimes: string[] = [];
+  for (const l of eventLines) {
+    const idm = l.match(/\bId\s*=\s*(\d+)/i);
+    if (!idm) continue;
+    const id = Number(idm[1]);
+    if (id === 42 || id === 506) {
+      standbyDisconnects++;
+      const tm = l.match(/\b(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
+      if (tm) disconnectTimes.push(tm[1]);
+    } else if (id === 107 || id === 507 || id === 1) {
+      wakeRecoveries++;
+    }
+  }
+
+  const num = (k: string): number | undefined => (k in config ? Number(config[k]) : undefined);
+  const acSec = num("standby_timeout_ac_sec");
+  const dcSec = num("standby_timeout_dc_sec");
+  const sleepSupported = num("sleep_supported");
+  const parts: string[] = [];
+  if (sleepSupported !== undefined) parts.push(`sleep ${sleepSupported === 1 ? "supported" : "unavailable"}`);
+  if (acSec !== undefined) parts.push(`standby-timeout(AC)=${acSec}s${acSec === 0 ? " (never)" : ""}`);
+  if (dcSec !== undefined) parts.push(`standby-timeout(DC)=${dcSec}s${dcSec === 0 ? " (never)" : ""}`);
+  const powercfgSummary = parts.length ? parts.join(", ") : undefined;
+
+  return {
+    standbyDisconnects,
+    standbyEnters: standbyDisconnects,
+    wakeRecoveries,
+    disconnectTimes,
+    os: "windows",
+    sleepDisabled: acSec === undefined ? undefined : acSec === 0,
+    standbyEnabled: acSec === undefined ? undefined : acSec > 0,
+    standbyDelayLowSec: acSec,
+    powercfgSummary
+  };
+}
+
+/**
+ * Windows power-management harvest: one read-only PowerShell command that emits
+ * the current sleep configuration (powercfg) plus the last-24h Kernel-Power
+ * sleep/resume events, so parseWindowsPowerEvents can correlate idle-sleep with
+ * the TeamViewer disconnect/reconnect bursts. Returns null on non-Windows or if
+ * the command fails. All calls are read-only (no powercfg /setactive, no
+ * /change) — it never alters the host's power plan.
+ */
+async function harvestWindowsPowerEvents(ctx: ExecutionContext): Promise<PowerEventSummary | null> {
+  if (ctx.os !== "windows") return null;
+  const cmd =
+    `Write-Output '===CONFIG==='; ` +
+    `$states = (powercfg /a 2>$null) -join ' '; ` +
+    `if ($states -match 'Standby') { 'sleep_supported=1' } else { 'sleep_supported=0' }; ` +
+    `$q = (powercfg /q SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 2>$null) -join ' '; ` +
+    `$ac = [regex]::Match($q, 'Current AC Power Setting Index:\\s*0x([0-9A-Fa-f]+)'); ` +
+    `if ($ac.Success) { 'standby_timeout_ac_sec=' + [Convert]::ToInt32($ac.Groups[1].Value,16) }; ` +
+    `$dc = [regex]::Match($q, 'Current DC Power Setting Index:\\s*0x([0-9A-Fa-f]+)'); ` +
+    `if ($dc.Success) { 'standby_timeout_dc_sec=' + [Convert]::ToInt32($dc.Groups[1].Value,16) }; ` +
+    `Write-Output '===EVENTS==='; ` +
+    `Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; StartTime=(Get-Date).AddHours(-24)} -ErrorAction SilentlyContinue | ` +
+    `Where-Object { $_.Id -in 42,107,506,507 } | Sort-Object TimeCreated | ` +
+    `ForEach-Object { '{0:yyyy-MM-dd HH:mm:ss} Id={1}' -f $_.TimeCreated, $_.Id }`;
+  try {
+    const r = await ctx.runShell(cmd, { timeoutMs: 30000 });
+    const out = r.stdout || "";
+    if (!out.trim()) return null;
+    return parseWindowsPowerEvents(out);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse the systemd-logind / kernel suspend block emitted by
+ * harvestLinuxPowerEvents into a structured PowerEventSummary. Pure + exported
+ * so it is unit-testable without a real Linux host.
+ *
+ * Expected input shape (two labelled sections):
+ *   ===CONFIG===
+ *   suspend_masked=0
+ *   ===EVENTS===
+ *   2026-06-08T15:53:27 SUSPEND
+ *   2026-06-08T19:12:33 RESUME
+ *
+ * Linux mapping vs macOS: a desktop/laptop entering systemd suspend drops the
+ * TeamViewer connection exactly like macOS standby. Most Linux *servers* and
+ * cloud VMs never suspend, so this is typically a clean "ruled out" no-op there.
+ */
+export function parseLinuxPowerEvents(raw: string): PowerEventSummary {
+  let section: "config" | "events" | "" = "";
+  const config: Record<string, string> = {};
+  const eventLines: string[] = [];
+  for (const line of (raw ?? "").split(/\r?\n/)) {
+    const t = line.trim();
+    if (/^===\s*CONFIG\s*===$/i.test(t)) { section = "config"; continue; }
+    if (/^===\s*EVENTS\s*===$/i.test(t)) { section = "events"; continue; }
+    if (section === "config") {
+      const m = t.match(/^([a-z_]+)\s*=\s*(-?\d+)$/i);
+      if (m) config[m[1].toLowerCase()] = m[2];
+    } else if (section === "events" && t) {
+      eventLines.push(t);
+    }
+  }
+
+  let standbyDisconnects = 0;
+  let wakeRecoveries = 0;
+  const disconnectTimes: string[] = [];
+  for (const l of eventLines) {
+    // harvestLinuxPowerEvents appends an uppercase SUSPEND/RESUME marker token
+    // at end-of-line. Match that token (case-sensitive, anchored) so the
+    // lowercase word "suspend" inside a "suspend exit RESUME" line never
+    // double-counts as a suspend.
+    const marker = l.match(/\b(SUSPEND|RESUME)\s*$/);
+    if (!marker) continue;
+    if (marker[1] === "SUSPEND") {
+      standbyDisconnects++;
+      const tm = l.match(/\b(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})/);
+      if (tm) disconnectTimes.push(tm[1].replace("T", " "));
+    } else {
+      wakeRecoveries++;
+    }
+  }
+
+  const suspendMasked = "suspend_masked" in config ? Number(config["suspend_masked"]) : undefined;
+  const parts: string[] = [];
+  if (suspendMasked !== undefined) parts.push(`suspend ${suspendMasked === 1 ? "masked (disabled)" : "available"}`);
+  const powercfgSummary = parts.length ? parts.join(", ") : undefined;
+
+  return {
+    standbyDisconnects,
+    standbyEnters: standbyDisconnects,
+    wakeRecoveries,
+    disconnectTimes,
+    os: "linux",
+    sleepDisabled: suspendMasked === undefined ? undefined : suspendMasked === 1,
+    standbyEnabled: suspendMasked === undefined ? undefined : suspendMasked === 0,
+    powercfgSummary
+  };
+}
+
+/**
+ * Linux power-management harvest: read-only journalctl query for the last-24h
+ * systemd-logind / kernel suspend & resume transitions, plus whether suspend is
+ * masked. Returns null on non-Linux, when journalctl is unavailable (e.g. a
+ * container with no systemd — the common Kubernetes case), or on failure.
+ */
+async function harvestLinuxPowerEvents(ctx: ExecutionContext): Promise<PowerEventSummary | null> {
+  if (ctx.os !== "linux") return null;
+  const cmd =
+    `echo "===CONFIG==="; ` +
+    `if command -v systemctl >/dev/null 2>&1; then ` +
+    `m=$(systemctl is-enabled sleep.target suspend.target 2>/dev/null | grep -c masked); ` +
+    `echo "suspend_masked=$([ "$m" -ge 1 ] && echo 1 || echo 0)"; fi; ` +
+    `echo "===EVENTS==="; ` +
+    `if command -v journalctl >/dev/null 2>&1; then ` +
+    `journalctl --since "24 hours ago" -o short-iso --no-pager 2>/dev/null ` +
+    `| egrep -i 'PrepareForSleep|System is suspending|suspend entry|System resumed|suspend exit' ` +
+    `| sed -E 's/.*(suspend entry|System is suspending|PrepareForSleep.*start|PrepareForSleep.*b true).*/\\0 SUSPEND/; s/.*(suspend exit|System resumed|PrepareForSleep.*b false).*/\\0 RESUME/' ` +
+    `| tail -200; fi`;
+  try {
+    const r = await ctx.runShell(cmd, { timeoutMs: 30000 });
+    const out = r.stdout || "";
+    if (!out.trim()) return null;
+    return parseLinuxPowerEvents(out);
+  } catch {
+    return null;
+  }
+}
 
 export async function runLogProbe(
   profile: ProductDiagnosticProfile = getProductProfile("teamviewer-remote"),
@@ -487,7 +701,14 @@ export async function runLogProbe(
   // macOS power-management correlation (read-only). Gathered once up front so
   // EVERY return path (live capture, history, empty) carries the standby story.
   // On non-macOS targets this is a no-op (returns undefined).
-  const power = ctx.os === "macos" ? ((await harvestMacPowerEvents(ctx)) ?? undefined) : undefined;
+  const power =
+    ctx.os === "macos"
+      ? ((await harvestMacPowerEvents(ctx)) ?? undefined)
+      : ctx.os === "windows"
+        ? ((await harvestWindowsPowerEvents(ctx)) ?? undefined)
+        : ctx.os === "linux"
+          ? ((await harvestLinuxPowerEvents(ctx)) ?? undefined)
+          : undefined;
 
   // LIVE CAPTURE MODE (macOS only, opt-in via --capture <minutes>).
   // For intermittent "drops every few minutes" symptoms the last-24h history
