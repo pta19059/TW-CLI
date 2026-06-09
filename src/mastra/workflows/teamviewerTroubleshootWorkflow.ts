@@ -25,7 +25,7 @@ import {
   runLogIntelligenceAnalysis
 } from "../tools/specialistTools.js";
 import { sanitizePromptInput } from "../util/sanitize.js";
-import { groundingFacts, retrieveKnowledgeHits, isRelevantReference, referenceRelevance, type DocTopic, type KnowledgeHit } from "../../knowledge/teamviewerDocs.js";
+import { groundingFacts, retrieveKnowledgeHits, isReferenceCandidate, isKbArticleUrl, referenceRelevance, REFERENCE_STRONG_FLOOR, type DocTopic, type KnowledgeHit } from "../../knowledge/teamviewerDocs.js";
 import { generateStructured } from "../util/llmJson.js";
 
 const inputSchema = z.object({
@@ -282,15 +282,21 @@ function buildSpecialistStep(def: SpecialistDef) {
         // landing page) slip into the citations. The issue text ("drops every
         // few minutes") is the precise relevance signal.
         const relevanceQuery = issue.slice(0, 240);
+        // Prompt ANCHORS: top-3 only, to keep the prompt tight.
         const top = hits.slice(0, 3).map((h: KnowledgeHit) => {
           const snippet = h.text.replace(/\s+/g, " ").trim().slice(0, 220);
           const label = h.title ? `${h.title}` : h.source;
-          // Track the source as a citeable reference ONLY when it is actually
-          // on-topic for the user's issue. The retriever returns the top-N of
-          // its pool even when the pool is weak, so without this absolute gate
-          // a connection-drop issue would cite unrelated pages. isRelevantReference
-          // uses an absolute floor, so an off-topic issue yields ZERO references.
-          if (h.source && isRelevantReference(relevanceQuery, h)) {
+          return `- [${label}] ${snippet}`;
+        });
+        // REFERENCES: evaluate the FULL returned pool (not just the top-3) and
+        // keep every candidate that clears the relaxed "related" floor, tagging
+        // each with its relevance. The aggregate step does the final tiering
+        // (strong always shown; related KB-articles backfill a sparse list) and
+        // capping — centralizing the decision across all four specialists so a
+        // genuinely relevant article surfaced by one specialist isn't dropped
+        // just because it wasn't that specialist's top-3.
+        for (const h of hits) {
+          if (h.source && isReferenceCandidate(relevanceQuery, h)) {
             kbReferences.push({
               title: h.title,
               source: h.source,
@@ -298,8 +304,7 @@ function buildSpecialistStep(def: SpecialistDef) {
               relevance: referenceRelevance(relevanceQuery, h)
             });
           }
-          return `- [${label}] ${snippet}`;
-        });
+        }
         if (top.length > 0) {
           kbAnchors = `KB anchors (use these to ground hypotheses/actions; cite the bracketed label inline if you reuse a passage):\n${top.join("\n")}\n`;
         }
@@ -419,9 +424,15 @@ const aggregateStep = createStep({
     // even when DNS+TCP probes proved the firewall is fine.
     const filteredHypotheses = filterHypothesesAgainstEvidence(allHypotheses, evidence);
     // Aggregate KB references across specialists, deduped by source URL and
-    // sorted by on-topic relevance so the most pertinent pages appear first.
-    // Capped low (6) because a focused, relevant shortlist is more useful than
-    // a long list padded with marginal hits.
+    // sorted by on-topic relevance. Two-tier selection so the citation list is
+    // neither padded with off-topic filler nor too sparse to be useful:
+    //   • STRONG tier (relevance >= REFERENCE_STRONG_FLOOR): always cited.
+    //   • RELATED tier (below strong but a real /knowledge-base/ ARTICLE above
+    //     the related floor): used ONLY to backfill toward MIN_REFERENCES.
+    //     Marketing/product-landing pages (which score in the same band) are
+    //     excluded via isKbArticleUrl, so they never sneak back in.
+    const MIN_REFERENCES = 4;
+    const MAX_REFERENCES = 6;
     const dedupRefMap = new Map<string, { title?: string; source: string; topic: string; relevance?: number }>();
     for (const b of branches) {
       for (const ref of (b.references ?? [])) {
@@ -431,9 +442,19 @@ const aggregateStep = createStep({
         }
       }
     }
-    const references = Array.from(dedupRefMap.values())
-      .sort((a, b) => (b.relevance ?? 0) - (a.relevance ?? 0))
-      .slice(0, 6);
+    const sortedRefs = Array.from(dedupRefMap.values()).sort(
+      (a, b) => (b.relevance ?? 0) - (a.relevance ?? 0)
+    );
+    const strongRefs = sortedRefs.filter((r) => (r.relevance ?? 0) >= REFERENCE_STRONG_FLOOR);
+    const relatedRefs = sortedRefs.filter(
+      (r) => (r.relevance ?? 0) < REFERENCE_STRONG_FLOOR && isKbArticleUrl(r.source)
+    );
+    const references = [...strongRefs];
+    for (const r of relatedRefs) {
+      if (references.length >= MIN_REFERENCES) break;
+      references.push(r);
+    }
+    references.splice(MAX_REFERENCES);
 
     // Collect the concrete log sources consulted across all specialists
     // (only the log specialist populates these). Deduped by source string so

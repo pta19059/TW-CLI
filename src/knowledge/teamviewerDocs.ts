@@ -1471,15 +1471,42 @@ export function referenceRelevance(query: string, h: KnowledgeHit): number {
  */
 export function isRelevantReference(query: string, h: KnowledgeHit): boolean {
   const rel = referenceRelevance(query, h);
-  return rel >= REFERENCE_RELEVANCE_FLOOR || (h.sem ?? 0) >= REFERENCE_SEM_FLOOR;
+  return rel >= REFERENCE_STRONG_FLOOR || (h.sem ?? 0) >= REFERENCE_SEM_FLOOR;
 }
 
-/** Blended-relevance floor for citing a doc/fact as a reference.
- *  Calibrated against the local embedder, which clusters ALL TeamViewer docs
- *  at sem≈0.41–0.52 (even the product landing page) — so the blended score,
- *  not raw cosine, is the discriminating signal. At 0.6 the product/landing
- *  pages and unrelated topics fall away while symptom-matched pages survive. */
-const REFERENCE_RELEVANCE_FLOOR = 0.6;
+/**
+ * Looser "related" gate used to BACKFILL a sparse citation list. A page passes
+ * when its blended relevance clears the (lower) related floor. Callers should
+ * additionally require {@link isKbArticleUrl} for related-tier candidates so
+ * marketing / product-landing pages (which score in the same 0.4–0.5 band as
+ * genuine borderline KB articles, and which the user explicitly does not want)
+ * are never promoted — only real knowledge-base articles backfill.
+ */
+export function isReferenceCandidate(query: string, h: KnowledgeHit): boolean {
+  return referenceRelevance(query, h) >= REFERENCE_RELATED_FLOOR || (h.sem ?? 0) >= REFERENCE_SEM_FLOOR;
+}
+
+/**
+ * True for canonical knowledge-base ARTICLE URLs (support KB or community),
+ * false for marketing/product-landing pages (`/products/...`, site root).
+ * Used to keep the relaxed "related" reference tier free of marketing pages.
+ */
+export function isKbArticleUrl(url: string): boolean {
+  return /\/knowledge-base\/|\/kb\/articles\/|community\.teamviewer\.com/i.test(url);
+}
+
+/** Strong on-topic floor: a reference at/above this is ALWAYS cited. Calibrated
+ *  against the local embedder, which clusters ALL TeamViewer docs at
+ *  sem≈0.41–0.52 (even the product landing page) — so the blended score, not
+ *  raw cosine, is the discriminating signal. At 0.6 the product/landing pages
+ *  and unrelated topics fall away while symptom-matched pages survive. */
+export const REFERENCE_STRONG_FLOOR = 0.6;
+/** Related floor: a KB-ARTICLE reference between this and the strong floor is
+ *  used ONLY to backfill a sparse citation list (and only via isKbArticleUrl,
+ *  so marketing pages in the same band are excluded). 0.42 admits genuine
+ *  borderline troubleshooting articles (e.g. "Data flow in connections") that
+ *  the strict 0.6 gate would otherwise drop, which left reports too sparse. */
+export const REFERENCE_RELATED_FLOOR = 0.42;
 /** Semantic-similarity escape hatch. Deliberately set ABOVE the embedder's
  *  TeamViewer-doc cluster ceiling (~0.52) so it only fires for genuinely
  *  exceptional semantic matches, not for the whole TeamViewer corpus. */
