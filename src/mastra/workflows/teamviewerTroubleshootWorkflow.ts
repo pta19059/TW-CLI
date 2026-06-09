@@ -40,7 +40,9 @@ type WorkflowInput = z.infer<typeof inputSchema>;
 const rootCauseSchema = z.object({
   title: z.string(),
   score: z.number(),
-  rationale: z.string()
+  rationale: z.string(),
+  /** Probe-derived (true) vs LLM-generated (false/undefined). See RootCauseCandidate. */
+  evidenceAnchored: z.boolean().optional()
 });
 
 const actionSchema = z.object({
@@ -343,11 +345,19 @@ function buildSpecialistStep(def: SpecialistDef) {
       const enrichmentRoots = enrichment.rootCauses ?? [];
       const enrichmentActions = enrichment.actions ?? [];
       const enrichmentHypotheses = enrichment.hypotheses ?? [];
-      const mergedRoots = [...baseline.rootCauses, ...enrichmentRoots]
+      // Tag provenance: baseline root causes come straight from a probe (a real
+      // log signature, a failed connectivity check) and are ALWAYS trusted;
+      // enrichment root causes are LLM guesses that must earn their place by
+      // anchoring to the collected evidence (see filterRootCausesAgainstEvidence).
+      const mergedRoots = [
+        ...baseline.rootCauses.map((r) => ({ ...r, evidenceAnchored: true })),
+        ...enrichmentRoots.map((r) => ({ ...r, evidenceAnchored: false }))
+      ]
         .map((r) => ({
           title: r.title.trim(),
           score: Math.max(0, Math.min(1, Number(r.score) || 0)),
-          rationale: r.rationale.trim()
+          rationale: r.rationale.trim(),
+          evidenceAnchored: r.evidenceAnchored
         }))
         .filter((r) => r.title);
 
@@ -670,6 +680,67 @@ export function cleanSummary(raw: string): string {
 }
 
 /**
+ * Generic / domain-filler words that carry no diagnostic specificity. A root
+ * cause whose ONLY tokens are in this set (or stopwords) is a vague guess with
+ * nothing to anchor to the evidence.
+ */
+const ANCHOR_STOPWORDS = new Set([
+  // structural english
+  "the", "and", "for", "with", "this", "that", "from", "have", "has", "are",
+  "was", "were", "will", "would", "could", "should", "may", "might", "can",
+  "due", "via", "into", "onto", "your", "their", "its", "not", "but", "any",
+  "all", "out", "off", "per", "had", "been", "being", "such", "than", "then",
+  // generic diagnostic filler
+  "issue", "issues", "problem", "problems", "error", "errors", "failure",
+  "failures", "fail", "fails", "failed", "cause", "causes", "caused", "root",
+  "recurring", "recurrence", "suggest", "suggests", "suggested", "possible",
+  "possibly", "likely", "potential", "potentially", "related", "relate",
+  "relating", "unknown", "general", "generic", "various", "several",
+  // domain words present in (almost) every line → not distinctive
+  "teamviewer", "remote", "client", "clients", "server", "servers", "system",
+  "systems", "host", "hosts", "user", "users", "device", "devices",
+  "application", "app", "software", "program", "running", "occur", "occurs",
+  "occurring", "happening", "behavior", "behaviour"
+]);
+
+/**
+ * Returns the set of distinctive 4-char stems from a piece of text. Lowercases,
+ * keeps alpha runs >= 4 chars, drops stopwords/filler, and reduces each to its
+ * 4-char prefix so light inflection (retry/retries/retrying, resolve/resolved/
+ * resolver) collapses to the same stem.
+ */
+export function distinctiveStems(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of (text ?? "").toLowerCase().matchAll(/[a-z]{4,}/g)) {
+    const w = m[0];
+    if (ANCHOR_STOPWORDS.has(w)) continue;
+    out.add(w.slice(0, 4));
+  }
+  return out;
+}
+
+/**
+ * A root cause is "evidence-anchored" when at least one of its distinctive
+ * stems also appears among the distinctive stems of the collected evidence.
+ * This is the discriminator that separates a real, observation-backed cause
+ * from a free-floating LLM guess ("Permissions Issue — recurrence suggests
+ * permission-related problems" shares NO stem with any probe/log line, so it
+ * is rejected). A candidate with no distinctive stems at all (purely generic
+ * wording) is treated as unanchored.
+ */
+export function hasEvidenceAnchor(
+  root: { title: string; rationale?: string },
+  evidenceStems: Set<string>
+): boolean {
+  const stems = distinctiveStems(`${root.title} ${root.rationale ?? ""}`);
+  if (stems.size === 0) return false;
+  for (const s of stems) {
+    if (evidenceStems.has(s)) return true;
+  }
+  return false;
+}
+
+/**
  * Same evidence-vs-recommendation logic as filterActionsAgainstEvidence,
  * but applied to root-cause candidates BEFORE the LLM rerank step — the
  * LLM otherwise keeps re-promoting firewall as the top cause even when
@@ -685,6 +756,9 @@ export function filterRootCausesAgainstEvidence(
   evidence: string[]
 ): RootCauseCandidate[] {
   const joined = evidence.join(" ");
+  // Distinctive stems of the collected evidence, used to decide whether an
+  // LLM-generated (unanchored) candidate has ANY grounding in what we observed.
+  const evidenceStems = distinctiveStems(joined);
   const port5938Open = /tcp\s+5938\s+reachability:\s*\d+\/\d+[^\n]*?\bok\b/i.test(joined);
   const endpointTcpOk = /endpoint\s+tcp\s+reachability:\s*([1-9]\d*)\/\d+[^\n]*?\bok\b/i.test(joined);
   const dnsOk = /dns\s+resolved\s+([1-9]\d*)\/\d+\s+teamviewer\s+hosts/i.test(joined);
@@ -708,6 +782,16 @@ export function filterRootCausesAgainstEvidence(
     const titleClean = (r.title ?? "").trim();
     if (titleClean.length < 6) return false;
     if (!/[a-z]{4,}/i.test(titleClean)) return false;
+    // EVIDENCE-ANCHOR GATE (the core reliability rule): an LLM-generated
+    // candidate (evidenceAnchored === false) must share at least one
+    // distinctive stem with the collected evidence, otherwise it's pure
+    // speculation ("Permissions Issue" with no permission signal anywhere).
+    // Probe-derived candidates (evidenceAnchored === true) are exempt — they
+    // ARE the evidence. Candidates with no provenance flag (undefined, e.g.
+    // direct callers / tests) are also exempt to preserve backward behaviour.
+    if (r.evidenceAnchored === false && !hasEvidenceAnchor(r, evidenceStems)) {
+      return false;
+    }
     const mentionsFirewall = /firewall/.test(text);
     if (mentionsFirewall) {
       if (port5938Open && /\b5938\b/.test(text)) return false;

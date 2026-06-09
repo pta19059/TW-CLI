@@ -10,6 +10,30 @@ import type { EndpointHealthReport } from "../src/probes/endpointHealth.js";
 import type { LogProbeReport } from "../src/probes/logs.js";
 import type { AuthProbeReport } from "../src/probes/authPolicy.js";
 import { normalize } from "../src/probes/logs.js";
+import { buildMacCaptureCommand } from "../src/probes/logs.js";
+
+describe("buildMacCaptureCommand", () => {
+  it("builds a self-contained capture-then-grep pipeline for a window", () => {
+    const cmd = buildMacCaptureCommand(120);
+    expect(cmd).toContain("log stream");
+    expect(cmd).toContain("--predicate");
+    expect(cmd).toContain("mktemp");
+    expect(cmd).toContain("sleep 120");
+    expect(cmd).toContain("kill");
+    expect(cmd).toMatch(/egrep|grep -E/);
+    expect(cmd).toContain("rm -f");
+  });
+
+  it("floors the sleep window to at least 1 second", () => {
+    const cmd = buildMacCaptureCommand(0);
+    expect(cmd).toContain("sleep 1");
+  });
+
+  it("filters for failure-related keywords", () => {
+    const cmd = buildMacCaptureCommand(30);
+    expect(cmd.toLowerCase()).toMatch(/disconnect|drop|timeout|reconnect/);
+  });
+});
 
 describe("fromConnectivity", () => {
   it("flags DNS and TCP failures as root causes", () => {

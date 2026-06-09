@@ -63,6 +63,23 @@ function parseConnectionFlags(argv: string[]): { user: string; port?: number; id
   return { user, port, identity };
 }
 
+/**
+ * Read --capture <minutes> and return the live-capture window in SECONDS.
+ * Accepts an integer or decimal number of minutes (e.g. `--capture 2` or
+ * `--capture 0.5`). Returns undefined when the flag is absent. Exits 2 on an
+ * invalid value so the user gets immediate feedback rather than a silent no-op.
+ */
+function parseCaptureFlag(argv: string[]): number | undefined {
+  const raw = parseFlagValue(argv, ["--capture"]);
+  if (raw === undefined) return undefined;
+  const minutes = Number(raw);
+  if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 60) {
+    console.error(`Invalid --capture (expected minutes, 0 < n <= 60): ${raw}`);
+    process.exit(2);
+  }
+  return Math.round(minutes * 60);
+}
+
 // The set of recognised first tokens is derived from Commander itself so we
 // never have to hand-maintain this list when adding a new command. Anything
 // not registered as a Commander command falls through to the natural-language
@@ -94,11 +111,11 @@ async function main(): Promise<void> {
   // them in a child with a filtered stderr stream so the output stays clean.
   if (await maybeFilterNativeStderr(argv)) return;
 
-  // One-shot mode: `twc -p "issue text" [--product X] [--target Y] [--task T] [--context C] [--markdown] [--user U [--port N] [--key path]]`
+  // One-shot mode: `twc -p "issue text" [--product X] [--target Y] [--task T] [--context C] [--markdown] [--user U [--port N] [--key path]] [--capture <minutes>]`
   if (hasFlag(argv, ["-p", "--prompt"])) {
     const issue = parseFlagValue(argv, ["-p", "--prompt"]);
     if (!issue) {
-      console.error("Usage: twc -p \"<issue>\" [--product <key>] [--target <value>] [--task troubleshoot|debug] [--context <text>] [--model <id>] [--markdown] [--user <ssh-user> [--port N] [--key <path>]]");
+      console.error("Usage: twc -p \"<issue>\" [--product <key>] [--target <value>] [--task troubleshoot|debug] [--context <text>] [--model <id>] [--markdown] [--user <ssh-user> [--port N] [--key <path>]] [--capture <minutes>]");
       process.exitCode = 1;
       return;
     }
@@ -110,6 +127,7 @@ async function main(): Promise<void> {
     const context = parseFlagValue(argv, ["--context"]);
     const markdown = argv.includes("--markdown");
     const connection = parseConnectionFlags(argv);
+    const captureWindowSec = parseCaptureFlag(argv);
 
     try {
       const product = resolveProductOrThrow(rawProduct);
@@ -119,7 +137,8 @@ async function main(): Promise<void> {
         target,
         issue,
         context,
-        connection
+        connection,
+        captureWindowSec
       });
       console.log("");
       console.log(markdown ? renderReportMarkdown(report) : rendered);
@@ -160,7 +179,8 @@ async function main(): Promise<void> {
       task: "troubleshoot",
       target: parseFlagValue(argv, ["--target"]) ?? intent.target ?? "local-device",
       issue,
-      connection: parseConnectionFlags(argv)
+      connection: parseConnectionFlags(argv),
+      captureWindowSec: parseCaptureFlag(argv)
     });
     console.log("");
     console.log(rendered);

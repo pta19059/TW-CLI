@@ -5,7 +5,9 @@ import {
   deduplicateActions,
   filterActionsAgainstEvidence,
   filterHypothesesAgainstEvidence,
-  filterRootCausesAgainstEvidence
+  filterRootCausesAgainstEvidence,
+  hasEvidenceAnchor,
+  distinctiveStems
 } from "../src/mastra/workflows/teamviewerTroubleshootWorkflow.js";
 
 describe("deduplicateActions", () => {
@@ -310,7 +312,91 @@ describe("filterRootCausesAgainstEvidence", () => {
     expect(out.length).toBe(1);
     expect(out[0].title).toMatch(/Outdated/);
   });
+
+  // --- Evidence-anchor gate (Round 8): LLM candidates must touch the evidence ---
+  it("drops an LLM candidate (evidenceAnchored=false) that shares nothing with the evidence", () => {
+    const out = filterRootCausesAgainstEvidence(
+      [
+        {
+          title: "Permissions Issue",
+          score: 0.42,
+          rationale: "Recurrence suggests permission-related problems",
+          evidenceAnchored: false
+        }
+      ],
+      [
+        "DNS resolved 6/6 TeamViewer hosts",
+        "TCP 5938 reachability: 3/3 routers OK",
+        "Log signature: TAF::CMML ValidHours=2 TimeOut=20000 ms (x8)"
+      ]
+    );
+    expect(out.length).toBe(0);
+  });
+
+  it("keeps an LLM candidate (evidenceAnchored=false) that anchors to an evidence token", () => {
+    const out = filterRootCausesAgainstEvidence(
+      [
+        {
+          title: "DNS resolution instability",
+          score: 0.5,
+          rationale: "Intermittent failures to resolve TeamViewer hosts",
+          evidenceAnchored: false
+        }
+      ],
+      [
+        "DNS resolution failed for 2/6 TeamViewer hosts during the window",
+        "TCP 5938 reachability: 3/3 routers OK"
+      ]
+    );
+    expect(out.length).toBe(1);
+    expect(out[0].title).toMatch(/DNS resolution/);
+  });
+
+  it("keeps a probe-derived candidate (evidenceAnchored=true) even with no token overlap", () => {
+    const out = filterRootCausesAgainstEvidence(
+      [
+        {
+          title: "Recurring failure signature in logs",
+          score: 0.41,
+          rationale: "Observed 8 matching entries",
+          evidenceAnchored: true
+        }
+      ],
+      ["Target scope: example.com"]
+    );
+    expect(out.length).toBe(1);
+  });
+
+  it("keeps untagged candidates (evidenceAnchored undefined) regardless of anchoring", () => {
+    const out = filterRootCausesAgainstEvidence(
+      [{ title: "Outdated TeamViewer client", score: 0.5, rationale: "Older clients have known disconnect bugs." }],
+      ["Target scope: example.com"]
+    );
+    expect(out.length).toBe(1);
+  });
 });
+
+describe("hasEvidenceAnchor", () => {
+  it("returns false for a vague cause with no overlap", () => {
+    const evidence = distinctiveStems("license TimeOut ValidHours telemetry signature");
+    expect(
+      hasEvidenceAnchor({ title: "Permissions Issue", rationale: "Recurrence suggests permission-related problems" }, evidence)
+    ).toBe(false);
+  });
+
+  it("returns true when a distinctive stem overlaps the evidence", () => {
+    const evidence = distinctiveStems("DNS resolution failed for TeamViewer hosts");
+    expect(
+      hasEvidenceAnchor({ title: "DNS resolution instability", rationale: "intermittent resolve failures" }, evidence)
+    ).toBe(true);
+  });
+
+  it("returns false for a purely generic title with no distinctive stems", () => {
+    const evidence = distinctiveStems("DNS resolution failed for TeamViewer hosts");
+    expect(hasEvidenceAnchor({ title: "TeamViewer issue", rationale: "problem occurs" }, evidence)).toBe(false);
+  });
+});
+
 
 describe("filterHypothesesAgainstEvidence", () => {
   const evidenceAllGreen = [

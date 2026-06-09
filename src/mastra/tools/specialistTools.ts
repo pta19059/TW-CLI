@@ -6,7 +6,7 @@ import { runConnectivityProbe, type ConnectivityReport } from "../../probes/conn
 import { runEndpointHealthProbe, type EndpointHealthReport } from "../../probes/endpointHealth.js";
 import { runLogProbe, type LogProbeReport } from "../../probes/logs.js";
 import { runAuthPolicyProbe, type AuthProbeReport } from "../../probes/authPolicy.js";
-import { getCurrentContext } from "../../runtime/runContext.js";
+import { getCurrentContext, getRunOptions } from "../../runtime/runContext.js";
 
 function resolveProfile(product?: string) {
   return getProductProfile((product as ProductKey) ?? "teamviewer-remote");
@@ -477,7 +477,11 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
 export async function runLogIntelligenceAnalysis(
   input: z.infer<typeof specialistInputSchema>
 ): Promise<SpecialistOutput> {
-  const report = await runLogProbe(resolveProfile(input.product), getCurrentContext());
+  const report = await runLogProbe(
+    resolveProfile(input.product),
+    getCurrentContext(),
+    getRunOptions().captureWindowSec
+  );
   return fromLogs(report);
 }
 

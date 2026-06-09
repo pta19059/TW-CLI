@@ -32,6 +32,8 @@ interface ReplState {
     port?: number;
     identity?: string;
   };
+  /** Optional live log-capture window in seconds (set via /capture <minutes>). */
+  captureWindowSec?: number;
 }
 
 const HELP_LINES = [
@@ -43,6 +45,7 @@ const HELP_LINES = [
   `${color.bold("/user <ssh-user>")}     run probes on the current target via SSH (empty to clear)`,
   `${color.bold("/port <number>")}       SSH port (default 22; empty to reset)`,
   `${color.bold("/key <path>")}          SSH private-key path (empty to reset)`,
+  `${color.bold("/capture <minutes>")}   live-stream logs during the run to catch an intermittent failure (macOS; empty to disable)`,
   `${color.bold("/products")}            list supported TeamViewer products`,
   `${color.bold("/agents")}              list Mastra agent roles`,
   `${color.bold("/jobs [N]")}            list recent background jobs`,
@@ -368,6 +371,21 @@ async function handleSlash(line: string, state: ReplState, rl: readline.Interfac
       console.log(color.green(arg ? `  SSH identity set to '${arg}'.` : "  SSH identity reset."));
       return true;
     }
+    case "capture": {
+      if (!arg) {
+        state.captureWindowSec = undefined;
+        console.log(color.green("  Live capture disabled. The log probe reads recent history."));
+        return true;
+      }
+      const minutes = Number(arg);
+      if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 60) {
+        console.log(color.red(`  Invalid /capture value '${arg}' (expected minutes, 0 < n <= 60).`));
+        return true;
+      }
+      state.captureWindowSec = Math.round(minutes * 60);
+      console.log(color.green(`  Live capture ON: next run streams logs for ${state.captureWindowSec}s (reproduce the issue during the run). macOS targets only.`));
+      return true;
+    }
     default:
       console.log(color.red(`  Unknown command '/${cmd}'. Type /help.`));
       return true;
@@ -469,7 +487,8 @@ export async function runRepl(options: ReplOptions = {}): Promise<void> {
         target: state.target,
         issue: nlLine,
         context: state.context,
-        connection: state.connection
+        connection: state.connection,
+        captureWindowSec: state.captureWindowSec
       });
       console.log("");
       console.log(rendered);

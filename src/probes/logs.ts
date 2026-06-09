@@ -298,11 +298,108 @@ async function harvestMacUnifiedLog(
   }
 }
 
+/** Line-class filter shared by the history (`log show`) and live (`log stream`) paths. */
+const UNIFIED_LOG_FILTER =
+  "error|warn|fail|drop|disconnect|timeout|reconnect|abort|reject|denied|" +
+  "unable|cannot|refused|handshake|reset|retry|netwatchdog|resolve";
+
+/**
+ * Build the POSIX shell command that captures a LIVE macOS unified-log stream
+ * for `windowSec` seconds. Pure + exported so the command shape is unit-testable
+ * without a real macOS host.
+ *
+ * Design (reliability-first): the live `log stream` writes to a temp file for
+ * the whole window, then we cleanly kill it, grep the COMPLETE file for
+ * failure-class lines, and remove the temp file. This avoids relying on
+ * partial-stdout-on-timeout or mid-pipe buffering — the command exits 0 with
+ * the full filtered capture, so `ctx.runShell` returns deterministic output.
+ */
+export function buildMacCaptureCommand(windowSec: number): string {
+  const secs = Math.max(1, Math.floor(windowSec));
+  const predicate = `process CONTAINS "TeamViewer" OR subsystem CONTAINS[c] "teamviewer"`;
+  return (
+    `TWC_CAP=$(mktemp /tmp/twc_capture.XXXXXX); ` +
+    `log stream --predicate '${predicate}' --info --style compact >"$TWC_CAP" 2>/dev/null & ` +
+    `TWC_PID=$!; ` +
+    `sleep ${secs}; ` +
+    `kill "$TWC_PID" 2>/dev/null; ` +
+    `wait "$TWC_PID" 2>/dev/null; ` +
+    `egrep -i '${UNIFIED_LOG_FILTER}' "$TWC_CAP" 2>/dev/null | tail -800; ` +
+    `rm -f "$TWC_CAP"`
+  );
+}
+
+/**
+ * macOS LIVE capture: stream the unified log for `windowSec` seconds and return
+ * the failure-class lines that occurred DURING the window. Used by the
+ * `--capture` mode so an intermittent disconnect can be diagnosed from the real
+ * event rather than from stale history.
+ */
+async function captureMacUnifiedLog(
+  ctx: ExecutionContext,
+  windowSec: number
+): Promise<{ text: string; lineCount: number } | null> {
+  if (ctx.os !== "macos") return null;
+  const cmd = buildMacCaptureCommand(windowSec);
+  // Give the remote/local shell the full window + generous margin for SSH
+  // round-trip, process spin-up and teardown.
+  const timeoutMs = Math.max(1, Math.floor(windowSec)) * 1000 + 20000;
+  try {
+    const r = await ctx.runShell(cmd, { timeoutMs });
+    const text = (r.stdout || "").trim();
+    if (!text) return { text: "", lineCount: 0 };
+    const lineCount = text.split(/\r?\n/).filter((l) => l.trim()).length;
+    return { text, lineCount };
+  } catch {
+    return null;
+  }
+}
+
 export async function runLogProbe(
   profile: ProductDiagnosticProfile = getProductProfile("teamviewer-remote"),
-  ctx: ExecutionContext = new LocalContext()
+  ctx: ExecutionContext = new LocalContext(),
+  captureWindowSec?: number
 ): Promise<LogProbeReport> {
   const diagnostics: string[] = [];
+
+  // LIVE CAPTURE MODE (macOS only, opt-in via --capture <minutes>).
+  // For intermittent "drops every few minutes" symptoms the last-24h history
+  // often misses the actual failure burst (it's full of steady-state license
+  // checks). Instead, stream the unified log for the requested window so the
+  // diagnosis runs on the REAL disconnect event captured live. If nothing
+  // error-class shows up in the window, fall through to the normal history.
+  if (captureWindowSec && captureWindowSec > 0) {
+    if (ctx.os === "macos") {
+      const cap = await captureMacUnifiedLog(ctx, captureWindowSec);
+      if (cap && cap.lineCount > 0) {
+        const scan = scanText(cap.text);
+        diagnostics.push(
+          `Live-captured ${cap.lineCount} TeamViewer unified-log entries over a ${captureWindowSec}s window ` +
+            `(${scan.errorCount} error(s), ${scan.warningCount} warning(s)). Diagnosis runs on this live capture.`
+        );
+        return {
+          filesInspected: [`<macOS unified log (live capture, ${captureWindowSec}s): log stream --predicate process CONTAINS TeamViewer>`],
+          totalLines: scan.totalLines,
+          errorCount: scan.errorCount,
+          warningCount: scan.warningCount,
+          topSignatures: scan.topSignatures,
+          diagnostics,
+          product: profile.name,
+          executionTarget: ctx.description
+        };
+      }
+      diagnostics.push(
+        `Live capture window (${captureWindowSec}s) elapsed with no error/warning-class TeamViewer entries — ` +
+          `the symptom did not reproduce during the window. Falling back to recent log history.`
+      );
+    } else {
+      diagnostics.push(
+        `Live capture (--capture) is currently supported on macOS targets only; this target is ${ctx.os}. ` +
+          `Falling back to recent log history.`
+      );
+    }
+  }
+
   const files = ctx.kind === "local"
     ? await findLogFilesLocal(profile, ctx)
     : await findLogFilesRemote(profile, ctx);

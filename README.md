@@ -55,7 +55,7 @@ The `twc` prefix is optional inside the interactive shell. Run `twc --help` or `
 | `twc` | Open the interactive REPL (banner + slash commands) | `twc` |
 | `twc chat [--product <key>]` | Open the REPL with a preset product | `twc chat --product teamviewer-tensor` |
 | `twc "<free text>"` | Troubleshoot from a natural-language sentence (auto-detects product/target) | `twc "tensor session drops on vm-twc-demo"` |
-| `twc -p "<issue>" [--product <key>] [--target <v>] [--task <t>] [--context <c>] [--model <id>] [--markdown]` | One-shot synchronous run | `twc -p "Session drops" --product teamviewer-remote --target endpoint-001 --markdown` |
+| `twc -p "<issue>" [--product <key>] [--target <v>] [--task <t>] [--context <c>] [--model <id>] [--markdown] [--capture <minutes>]` | One-shot synchronous run. `--capture <minutes>` live-streams the target's logs during the run (macOS only) so an *intermittent* failure can be reproduced and diagnosed from the real event rather than a stale snapshot. | `twc -p "Session drops" --product teamviewer-remote --target endpoint-001 --markdown` |
 | `twc products list` | List the whitelisted TeamViewer products | `twc products list` |
 | `twc agents list` | List the Mastra agent roles | `twc agents list` |
 | `twc agents plan --task <t> --issue "<text>"` | Show which agents would be selected (dry run) | `twc agents plan --task troubleshoot --issue "policy not applied"` |
@@ -90,6 +90,10 @@ twc -p "Session drops after 5 minutes" --product teamviewer-remote --target endp
 
 # Background troubleshoot job, wait and print the result inline:
 twc troubleshoot teamviewer-tensor --target tenant-acme --issue "Policy rollout not applied" --wait
+
+# Catch an INTERMITTENT drop: live-stream the Mac's unified log for 2 minutes and
+# reproduce the disconnect during the window — the diagnosis runs on the captured event.
+twc -p "TeamViewer drops every few minutes" --product teamviewer-remote --target XXX.XXX.XXX.XXX --user <user> --capture 2
 
 # Remote troubleshoot: run every probe on a Mac/Linux host via SSH instead of locally.
 # Requires passwordless SSH (key already in ~/.ssh/authorized_keys on the target).
@@ -210,6 +214,10 @@ answer is readable at a glance:
 
 1. **Summary / Target / Confidence** — one-line outcome, where the probes ran, confidence + escalation.
 2. **Root Causes** — ranked, scored causes (or an honest "none identified" when probes can't conclude).
+   LLM-proposed causes must be **evidence-anchored**: a candidate that shares no distinctive term
+   with the collected probe/log evidence is dropped as speculation, so the report never invents a
+   plausible-sounding cause (e.g. "Permissions Issue") that nothing actually observed supports.
+   Probe-derived causes (real log signatures, failed connectivity checks) are always trusted.
 3. **Recommended Actions** — prioritized remediation steps with risk + rollback.
 4. **Knowledge Base** — only the official KB articles that pass an absolute on-topic relevance
    gate, sorted by relevance (off-topic filler is dropped, not just down-ranked).
@@ -275,6 +283,7 @@ Open the REPL with `twc` (or `twc chat --product <key>` to preset a product). In
 | `/user <ssh-user>` | run probes on the current target via SSH (empty to clear) |
 | `/port <number>` | SSH port (default 22; empty to reset) |
 | `/key <path>` | SSH private-key path (empty to reset) |
+| `/capture <minutes>` | live-stream the target's logs during the next run to catch an intermittent failure (macOS only; empty to disable) |
 | `/products` | list whitelist |
 | `/agents` | list Mastra agent roles |
 | `/jobs [N]` | list recent background jobs |

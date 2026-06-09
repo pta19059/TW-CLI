@@ -21,6 +21,12 @@ export interface OneShotRequest {
     port?: number;
     identity?: string;
   };
+  /**
+   * Optional live-capture window in seconds. When set, the log probe streams
+   * the macOS unified log for this long (waiting for the intermittent failure
+   * to actually occur) instead of reading stale history.
+   */
+  captureWindowSec?: number;
 }
 
 export interface OneShotResult {
@@ -29,7 +35,11 @@ export interface OneShotResult {
 }
 
 export async function runOneShot(req: OneShotRequest): Promise<OneShotResult> {
-  const spinner = startSpinner(`Running ${req.task} workflow for ${productName(req.product)}…`);
+  const captureNote =
+    req.captureWindowSec && req.captureWindowSec > 0
+      ? ` · live-capturing logs for ${req.captureWindowSec}s (reproduce the issue now)`
+      : "";
+  const spinner = startSpinner(`Running ${req.task} workflow for ${productName(req.product)}…${captureNote}`);
   const startedAt = Date.now();
   try {
     const ctx = req.connection
@@ -41,17 +51,20 @@ export async function runOneShot(req: OneShotRequest): Promise<OneShotResult> {
         })
       : new LocalContext();
 
-    const report = await withRunContext(ctx, () =>
-      runMastraAgent({
-        product: req.product,
-        task: req.task,
-        input: {
-          target: req.target,
-          issue: req.issue,
-          context: req.context,
-          connection: req.connection
-        }
-      })
+    const report = await withRunContext(
+      ctx,
+      () =>
+        runMastraAgent({
+          product: req.product,
+          task: req.task,
+          input: {
+            target: req.target,
+            issue: req.issue,
+            context: req.context,
+            connection: req.connection
+          }
+        }),
+      { captureWindowSec: req.captureWindowSec }
     );
     // Stamp the report with WHERE the probes actually ran so the rendered
     // output (text + markdown) can surface it.

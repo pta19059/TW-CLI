@@ -15,9 +15,34 @@ import { LocalContext, type ExecutionContext } from "./execContext.js";
 
 const storage = new AsyncLocalStorage<ExecutionContext>();
 
-/** Run `fn` with `ctx` available to any code via getCurrentContext(). */
-export function withRunContext<T>(ctx: ExecutionContext, fn: () => Promise<T>): Promise<T> {
-  return storage.run(ctx, fn);
+/**
+ * Optional per-run options that travel alongside the ExecutionContext for the
+ * duration of a single workflow run. Kept in a SEPARATE store so the existing
+ * getCurrentContext() signature (which returns just the ExecutionContext) is
+ * unchanged — probes that need these opt in via getRunOptions().
+ */
+export interface RunOptions {
+  /**
+   * When set, the log probe captures a LIVE log stream for this many seconds
+   * (waiting for an intermittent failure to actually occur) instead of reading
+   * the last-24h history. The single biggest reliability win for sporadic
+   * "drops every few minutes" symptoms — diagnose the real event, not the past.
+   */
+  captureWindowSec?: number;
+}
+
+const optionsStorage = new AsyncLocalStorage<RunOptions>();
+
+/**
+ * Run `fn` with `ctx` available to any code via getCurrentContext(). Optional
+ * run options (e.g. live-capture window) are exposed via getRunOptions().
+ */
+export function withRunContext<T>(
+  ctx: ExecutionContext,
+  fn: () => Promise<T>,
+  options: RunOptions = {}
+): Promise<T> {
+  return storage.run(ctx, () => optionsStorage.run(options, fn));
 }
 
 /**
@@ -26,4 +51,9 @@ export function withRunContext<T>(ctx: ExecutionContext, fn: () => Promise<T>): 
  */
 export function getCurrentContext(): ExecutionContext {
   return storage.getStore() ?? new LocalContext();
+}
+
+/** Return the active run options, or an empty object outside a run. Never throws. */
+export function getRunOptions(): RunOptions {
+  return optionsStorage.getStore() ?? {};
 }
