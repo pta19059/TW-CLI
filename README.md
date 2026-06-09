@@ -1,6 +1,8 @@
 # TWC CLI (TeamViewer Command Line)
 
-![TWC CLI interactive shell](docs/assets/banner.png)
+![TWC CLI — troubleshoot run: banner, summary and ranked root causes](docs/assets/report-01-summary.png)
+![TWC CLI — recommended actions, knowledge base and log sources](docs/assets/report-02-actions.png)
+![TWC CLI — connectivity probes, host inventory and escalation decision](docs/assets/report-03-evidence.png)
 
 **Local-first, AI-assisted CLI for diagnosing and troubleshooting TeamViewer.**
 Five Mastra agents run on Foundry Local (on-device, no cloud) against real probe evidence —
