@@ -357,6 +357,42 @@ describe("fromLogs", () => {
     expect(action).toMatch(/standby|caffeinate|pmset|prevent system from sleeping/);
   });
 
+  it("demotes a license/CMML signature as reconnection noise when standby is the proven cause", () => {
+    const report: LogProbeReport = {
+      filesInspected: ["<macOS unified log>"],
+      totalLines: 134, errorCount: 75, warningCount: 22,
+      topSignatures: [
+        {
+          signature: "TAF::CMML: ValidHours=2, TimeOut=<num> ms",
+          count: 8,
+          exampleLine: "Df TeamViewer[467:178f] [com.teamviewer.TeamViewer:-G501-3] TAF::CMML: ValidHours=2, TimeOut=20000 ms"
+        }
+      ],
+      diagnostics: [],
+      power: {
+        standbyDisconnects: 3,
+        standbyEnters: 3,
+        wakeRecoveries: 3,
+        disconnectTimes: ["2026-06-08 15:53:27", "2026-06-08 20:19:05", "2026-06-08 21:35:56"],
+        standbyEnabled: true,
+        powerNapEnabled: false,
+        tcpKeepAlive: true,
+        standbyDelayLowSec: 10800,
+        pmsetSummary: "sleep=0, standby=1, powernap=0, tcpkeepalive=1, standbydelaylow=10800"
+      }
+    };
+    const out = fromLogs(report);
+    const standby = out.rootCauses.find((r) => /standby|sleep/i.test(r.title));
+    const sig = out.rootCauses.find((r) => /recurring failure signature/i.test(r.title));
+    expect(standby).toBeDefined();
+    expect(sig).toBeDefined();
+    // The license/CMML burst at wake is demoted below standby (it is the same
+    // reconnection aftermath, just a different subsystem than RetryHandle).
+    expect(sig!.score).toBeLessThan(0.5);
+    expect(sig!.rationale.toLowerCase()).toContain("reconnection aftermath");
+    expect(standby!.score).toBeGreaterThan(sig!.score);
+  });
+
   it("rules out idle-sleep when pmset is present but no standby disconnects occurred", () => {
     const report: LogProbeReport = {
       filesInspected: ["<macOS unified log>"],

@@ -387,9 +387,16 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
     const dominant = report.topSignatures[0];
     if (dominant.count >= 3) {
       const sigText = `${dominant.exampleLine} ${dominant.signature}`.toLowerCase();
+      // When standby is the PROVEN cause of the drops, the WHOLE recurring
+      // error burst at wake is reconnection aftermath, not just the retry
+      // lines: the client re-establishes its master link and its license
+      // check (TAF::CMML / GetLicenseLimit), chat-provider registration and
+      // resend/retry subsystems all fail transiently until the session is
+      // back. This is gated on standbyExplainsDrops, so a genuine license or
+      // timeout problem on a machine that ISN'T sleeping is never demoted.
       const isReconnectNoise =
         standbyExplainsDrops &&
-        /retryhandle|::handleretry|resend to|rcommand|retry|netwatchdog|reconnect/.test(sigText);
+        /retryhandle|::handleretry|resend to|rcommand|retry|netwatchdog|reconnect|taf::|cmml|licenselimit|getlicense|licensecallback|chatprovider|providerregistration|registration failed|timed? ?out|timeout/.test(sigText);
       rootCauses.push({
         title: "Recurring failure signature in TeamViewer logs",
         score: isReconnectNoise ? 0.35 : Math.min(0.9, 0.55 + Math.log10(dominant.count) * 0.15),

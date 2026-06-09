@@ -491,34 +491,7 @@ const aggregateStep = createStep({
         schema: z.object({ rootCauses: z.array(rootCauseSchema) }),
         retries: 1
       });
-      const knownTitles = new Map(filteredRoots.map((r) => [r.title, r]));
-      const seenTitles = new Set<string>();
-      rerankedRoots = reranked.rootCauses
-        .filter((r) => knownTitles.has(r.title))
-        .map((r) => {
-          const original = knownTitles.get(r.title)!;
-          const rerankScore = Math.max(0, Math.min(1, Number(r.score) || 0));
-          // FLOOR: don't allow the LLM to drop a probe-derived score by more
-          // than 40% — the candidate came from real evidence (e.g. "32× curl
-          // request failed" in the unified log), the LLM should be reranking
-          // among real signals, not dismissing them. Without this floor a
-          // model that has no opinion returns score 0 and silently buries
-          // legitimate findings.
-          const floor = original.score * 0.6;
-          const finalScore = Math.max(floor, rerankScore);
-          seenTitles.add(r.title);
-          return { ...original, score: finalScore };
-        });
-      // UNION: any candidate the LLM forgot to mention is re-added with the
-      // same 0.6×original floor. Small CPU models routinely return only a
-      // subset of the candidates we asked them to rerank — without this
-      // union, evidence-grounded findings disappear from the report just
-      // because the model truncated its reply.
-      for (const original of filteredRoots) {
-        if (!seenTitles.has(original.title)) {
-          rerankedRoots.push({ ...original, score: original.score * 0.6 });
-        }
-      }
+      rerankedRoots = applyRerankScores(filteredRoots, reranked.rootCauses);
       if (rerankedRoots.length === 0) {
         rerankedRoots = filteredRoots;
       }
@@ -645,6 +618,40 @@ export function deduplicateActions(actions: ActionItem[]): ActionItem[] {
     unique.set(action.step, action);
   }
   return Array.from(unique.values());
+}
+
+/**
+ * Merge the LLM rerank output back onto the probe-derived candidates.
+ *
+ * EVIDENCE-ANCHORED PROTECTION: a candidate tagged `evidenceAnchored === true`
+ * came straight from a probe (a counted log signature, a correlated NetWatchdog
+ * standby disconnect, a failed connectivity check) and its score was computed
+ * from real evidence counts. A small local model (qwen2.5-1.5b) must NOT be
+ * able to demote that finding — left to its own devices the rerank knocked the
+ * macOS-standby root cause from 0.82 down to the 0.6× floor (0.49), burying the
+ * true cause under phantom enrichment guesses and tripping escalation. So
+ * evidence-anchored causes KEEP their original score verbatim; the LLM rerank
+ * only re-scores enrichment (evidenceAnchored !== true) candidates, which are
+ * still floored at 0.6× their original so a model that returns 0 can't silently
+ * delete them.
+ */
+export function applyRerankScores(
+  candidates: RootCauseCandidate[],
+  reranked: { title: string; score: number }[]
+): RootCauseCandidate[] {
+  const byTitle = new Map(
+    reranked.map((r) => [r.title, Math.max(0, Math.min(1, Number(r.score) || 0))])
+  );
+  return candidates.map((original) => {
+    if (original.evidenceAnchored === true) {
+      // Probe-derived truth: preserve the computed score exactly.
+      return { ...original };
+    }
+    const rerankScore = byTitle.get(original.title);
+    const floor = original.score * 0.6;
+    const finalScore = rerankScore === undefined ? floor : Math.max(floor, rerankScore);
+    return { ...original, score: finalScore };
+  });
 }
 
 /**

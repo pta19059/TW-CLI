@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyRerankScores,
   calculateConfidence,
   cleanSummary,
   deduplicateActions,
@@ -19,6 +20,58 @@ describe("deduplicateActions", () => {
     ]);
     expect(out.length).toBe(2);
     expect(out.find((a) => a.step === "A")?.risk).toBe("high");
+  });
+});
+
+describe("applyRerankScores", () => {
+  it("preserves the score of evidence-anchored causes even when the LLM tries to demote them", () => {
+    const candidates = [
+      { title: "macOS standby/sleep is dropping the idle TeamViewer connection", score: 0.82, rationale: "NetWatchdog standby", evidenceAnchored: true }
+    ];
+    // The small model tries to knock it down to 0.2.
+    const out = applyRerankScores(candidates, [
+      { title: "macOS standby/sleep is dropping the idle TeamViewer connection", score: 0.2 }
+    ]);
+    expect(out[0].score).toBe(0.82);
+  });
+
+  it("keeps a deliberately demoted evidence-anchored signature at its demoted score (LLM cannot re-promote it)", () => {
+    const candidates = [
+      { title: "Recurring failure signature in TeamViewer logs", score: 0.35, rationale: "RetryHandle — reconnection aftermath", evidenceAnchored: true }
+    ];
+    const out = applyRerankScores(candidates, [
+      { title: "Recurring failure signature in TeamViewer logs", score: 0.7 }
+    ]);
+    expect(out[0].score).toBe(0.35);
+  });
+
+  it("lets the LLM rescore enrichment causes but floors them at 0.6x original", () => {
+    const candidates = [
+      { title: "Phantom guess", score: 0.5, rationale: "...", evidenceAnchored: false }
+    ];
+    // LLM raises it.
+    expect(applyRerankScores(candidates, [{ title: "Phantom guess", score: 0.8 }])[0].score).toBe(0.8);
+    // LLM forgets it -> floored at 0.6x.
+    expect(applyRerankScores(candidates, [])[0].score).toBeCloseTo(0.3, 5);
+    // LLM tries to zero it -> floored at 0.6x.
+    expect(applyRerankScores(candidates, [{ title: "Phantom guess", score: 0 }])[0].score).toBeCloseTo(0.3, 5);
+  });
+
+  it("keeps the standby cause ranked above phantom enrichment after rerank", () => {
+    const candidates = [
+      { title: "macOS standby/sleep is dropping the idle TeamViewer connection", score: 0.82, rationale: "NetWatchdog", evidenceAnchored: true },
+      { title: "Disconnected sessions during system shutdown/reboot", score: 0.55, rationale: "guess", evidenceAnchored: false }
+    ];
+    // Reproduces the real report: the LLM tried to demote standby and scored
+    // the phantom enrichment modestly. With anchored protection, standby keeps
+    // 0.82 and stays #1 instead of collapsing to the 0.49 floor.
+    const out = applyRerankScores(candidates, [
+      { title: "macOS standby/sleep is dropping the idle TeamViewer connection", score: 0.3 },
+      { title: "Disconnected sessions during system shutdown/reboot", score: 0.42 }
+    ]).sort((a, b) => b.score - a.score);
+    expect(out[0].title).toContain("standby");
+    expect(out[0].score).toBe(0.82);
+    expect(out[1].score).toBe(0.42);
   });
 });
 

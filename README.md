@@ -224,7 +224,10 @@ answer is readable at a glance:
    Probe-derived causes (real log signatures, failed connectivity checks) are always trusted. On
    macOS, recurring disconnects that line up with `NetWatchdog` standby events surface a dedicated
    *"macOS standby/sleep is dropping the idle connection"* root cause and demote the correlated
-   RetryHandle signature to reconnection noise.
+   reconnection-aftermath signatures (RetryHandle, license/CMML checks, chat-provider registration)
+   to noise. The gateway LLM rerank may reorder enrichment guesses but **cannot demote a
+   probe-derived (evidence-anchored) cause below its computed score** — so a 1.5B model can't bury
+   the real finding (e.g. knock the standby cause from 0.82 to a 0.49 floor) under a phantom guess.
 3. **Recommended Actions** — prioritized remediation steps with risk + rollback.
 4. **Knowledge Base** — only the official KB articles that pass an absolute on-topic relevance
    gate, sorted by relevance (off-topic filler is dropped, not just down-ranked).
