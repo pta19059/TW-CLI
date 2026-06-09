@@ -44,6 +44,19 @@ export interface SpecialistOutput {
   evidence: string[];
   rootCauses: RootCauseCandidate[];
   actions: ActionItem[];
+  /** Concrete log sources the probe actually read (file paths, the macOS
+   *  unified-log command, the kubectl/journalctl invocation, etc). Surfaced in
+   *  the rendered report so the user can see EXACTLY which logs were consulted
+   *  on the target — applies to macOS, Windows, Kubernetes and cloud VMs. Only
+   *  the log specialist populates this. */
+  logSources?: LogSource[];
+}
+
+export interface LogSource {
+  /** Path or command of the consulted source. */
+  source: string;
+  /** Optional one-line detail (line/error/warning counts, byte size, window). */
+  detail?: string;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -354,7 +367,7 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
     // them: this is the ONLY signal the user has to debug TCC / Full Disk
     // Access / path-mismatch issues on macOS hosts reached via SSH.
     for (const d of report.diagnostics) evidence.push(d);
-    return { evidence, rootCauses, actions };
+    return { evidence, rootCauses, actions, logSources: [] };
   }
   evidence.push(`Inspected ${report.filesInspected.length} log file(s): ${report.filesInspected.join(" | ")}`);
   evidence.push(`Lines scanned: ${report.totalLines}, errors: ${report.errorCount}, warnings: ${report.warningCount}`);
@@ -437,7 +450,28 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
   }
 
   for (const d of report.diagnostics) evidence.push(d);
-  return { evidence, rootCauses, actions };
+
+  // Structured list of the log sources actually consulted, so the report can
+  // show the user EXACTLY which logs were read on the target (macOS unified
+  // log, Windows TVNetwork.log, a Linux file, kubectl/journalctl output...).
+  const logSources: LogSource[] = report.filesInspected.map((f): LogSource => {
+    if (/^<\s*macos unified log/i.test(f)) {
+      return {
+        source: "macOS unified log (Apple os_log)",
+        detail:
+          `log show --predicate 'process CONTAINS "TeamViewer"' --info --last 24h` +
+          ` \u00b7 ${report.totalLines} lines, ${report.errorCount} err, ${report.warningCount} warn`
+      };
+    }
+    return { source: f };
+  });
+  // When real files were read, attach the aggregate scan totals to the first
+  // entry so the counts are visible without re-reading the Evidence block.
+  if (logSources.length > 0 && !logSources[0].detail) {
+    logSources[0].detail = `${report.totalLines} lines scanned, ${report.errorCount} err, ${report.warningCount} warn (across ${logSources.length} file(s))`;
+  }
+
+  return { evidence, rootCauses, actions, logSources };
 }
 
 export async function runLogIntelligenceAnalysis(

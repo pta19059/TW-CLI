@@ -61,7 +61,12 @@ export interface WorkflowReport {
   /** Knowledge-base passages retrieved (LanceDB hybrid) and injected into the
    *  specialist prompts. Surfaced in the rendered report as a References section
    *  so the user can verify which KB pages grounded each specialist's reasoning. */
-  references?: Array<{ title?: string; source: string; topic: string }>;
+  references?: Array<{ title?: string; source: string; topic: string; relevance?: number }>;
+  /** Concrete log sources the log probe actually read on the target (file paths,
+   *  the macOS unified-log command, kubectl/journalctl invocations, ...). Surfaced
+   *  in the rendered report so the user can see exactly which logs were consulted.
+   *  Cross-platform: works for macOS, Windows, Kubernetes and cloud VMs. */
+  logSources?: Array<{ source: string; detail?: string }>;
 }
 
 export interface JobInput {

@@ -25,7 +25,7 @@ import {
   runLogIntelligenceAnalysis
 } from "../tools/specialistTools.js";
 import { sanitizePromptInput } from "../util/sanitize.js";
-import { groundingFacts, retrieveKnowledgeHits, type DocTopic, type KnowledgeHit } from "../../knowledge/teamviewerDocs.js";
+import { groundingFacts, retrieveKnowledgeHits, isRelevantReference, referenceRelevance, type DocTopic, type KnowledgeHit } from "../../knowledge/teamviewerDocs.js";
 import { generateStructured } from "../util/llmJson.js";
 
 const inputSchema = z.object({
@@ -55,7 +55,15 @@ const actionSchema = z.object({
 const referenceSchema = z.object({
   title: z.string().optional(),
   source: z.string(),
-  topic: z.string()
+  topic: z.string(),
+  /** Blended on-topic score (teamviewerDocs.referenceRelevance) used to sort
+   *  and cap references globally so only the most relevant pages are cited. */
+  relevance: z.number().optional()
+});
+
+const logSourceSchema = z.object({
+  source: z.string(),
+  detail: z.string().optional()
 });
 
 const reportSchema = z.object({
@@ -73,7 +81,8 @@ const reportSchema = z.object({
       note: z.string()
     })
   ),
-  references: z.array(referenceSchema).default([])
+  references: z.array(referenceSchema).default([]),
+  logSources: z.array(logSourceSchema).default([])
 });
 
 const metaSchema = inputSchema.extend({
@@ -90,7 +99,8 @@ const specialistResultSchema = z.object({
   rootCauses: z.array(rootCauseSchema),
   actions: z.array(actionSchema),
   hypotheses: z.array(z.string()),
-  references: z.array(referenceSchema).default([])
+  references: z.array(referenceSchema).default([]),
+  logSources: z.array(logSourceSchema).default([])
 });
 type SpecialistResult = z.infer<typeof specialistResultSchema>;
 
@@ -163,6 +173,7 @@ interface SpecialistDef {
     evidence: string[];
     rootCauses: RootCauseCandidate[];
     actions: ActionItem[];
+    logSources?: Array<{ source: string; detail?: string }>;
   }>;
   active: (buckets: string[], task: JobType) => boolean;
   topic: string;
@@ -226,7 +237,8 @@ function buildSpecialistStep(def: SpecialistDef) {
           rootCauses: [],
           actions: [],
           hypotheses: [],
-          references: []
+          references: [],
+          logSources: []
         };
       }
 
@@ -238,7 +250,8 @@ function buildSpecialistStep(def: SpecialistDef) {
       }).catch((err: unknown) => ({
         evidence: [`Baseline probe error: ${err instanceof Error ? err.message : String(err)}`],
         rootCauses: [] as RootCauseCandidate[],
-        actions: [] as ActionItem[]
+        actions: [] as ActionItem[],
+        logSources: [] as Array<{ source: string; detail?: string }>
       }));
 
       const issue = sanitizePromptInput(inputData.issue);
@@ -257,17 +270,33 @@ function buildSpecialistStep(def: SpecialistDef) {
       // prompt. Failure here is non-fatal — retrieval may be offline or empty
       // (no index yet) and the specialist still has groundingFacts + baseline.
       let kbAnchors = "";
-      const kbReferences: Array<{ title?: string; source: string; topic: string }> = [];
+      const kbReferences: Array<{ title?: string; source: string; topic: string; relevance?: number }> = [];
       try {
         const kbQuery = `${def.topic} ${issue}`.slice(0, 240);
         const { hits } = await retrieveKnowledgeHits(kbQuery);
+        // Score/gate references against the USER ISSUE alone, NOT the broad
+        // `${topic} ${issue}` retrieval query. The topic string ("network
+        // reachability, VPN, DNS, firewall and packet-loss") inflates keyword
+        // coverage for any vaguely-networking page, so gating on it let
+        // off-topic pages ("Use TeamViewer on cloned systems", the product
+        // landing page) slip into the citations. The issue text ("drops every
+        // few minutes") is the precise relevance signal.
+        const relevanceQuery = issue.slice(0, 240);
         const top = hits.slice(0, 3).map((h: KnowledgeHit) => {
           const snippet = h.text.replace(/\s+/g, " ").trim().slice(0, 220);
           const label = h.title ? `${h.title}` : h.source;
-          // Track the source so the aggregate step can surface it as a
-          // verifiable reference in the rendered report.
-          if (h.source) {
-            kbReferences.push({ title: h.title, source: h.source, topic: def.topic });
+          // Track the source as a citeable reference ONLY when it is actually
+          // on-topic for the user's issue. The retriever returns the top-N of
+          // its pool even when the pool is weak, so without this absolute gate
+          // a connection-drop issue would cite unrelated pages. isRelevantReference
+          // uses an absolute floor, so an off-topic issue yields ZERO references.
+          if (h.source && isRelevantReference(relevanceQuery, h)) {
+            kbReferences.push({
+              title: h.title,
+              source: h.source,
+              topic: def.topic,
+              relevance: referenceRelevance(relevanceQuery, h)
+            });
           }
           return `- [${label}] ${snippet}`;
         });
@@ -335,7 +364,8 @@ function buildSpecialistStep(def: SpecialistDef) {
         rootCauses: mergedRoots,
         actions: mergedActions,
         hypotheses: enrichmentHypotheses.map((h) => h.trim()).filter(Boolean).slice(0, 3),
-        references: kbReferences
+        references: kbReferences,
+        logSources: baseline.logSources ?? []
       };
     }
   });
@@ -388,14 +418,33 @@ const aggregateStep = createStep({
     // hypotheses block in the report had been showing "firewall might block"
     // even when DNS+TCP probes proved the firewall is fine.
     const filteredHypotheses = filterHypothesesAgainstEvidence(allHypotheses, evidence);
-    // Aggregate KB references across specialists, deduped by source URL.
-    const dedupRefMap = new Map<string, { title?: string; source: string; topic: string }>();
+    // Aggregate KB references across specialists, deduped by source URL and
+    // sorted by on-topic relevance so the most pertinent pages appear first.
+    // Capped low (6) because a focused, relevant shortlist is more useful than
+    // a long list padded with marginal hits.
+    const dedupRefMap = new Map<string, { title?: string; source: string; topic: string; relevance?: number }>();
     for (const b of branches) {
       for (const ref of (b.references ?? [])) {
-        if (!dedupRefMap.has(ref.source)) dedupRefMap.set(ref.source, ref);
+        const existing = dedupRefMap.get(ref.source);
+        if (!existing || (ref.relevance ?? 0) > (existing.relevance ?? 0)) {
+          dedupRefMap.set(ref.source, ref);
+        }
       }
     }
-    const references = Array.from(dedupRefMap.values()).slice(0, 10);
+    const references = Array.from(dedupRefMap.values())
+      .sort((a, b) => (b.relevance ?? 0) - (a.relevance ?? 0))
+      .slice(0, 6);
+
+    // Collect the concrete log sources consulted across all specialists
+    // (only the log specialist populates these). Deduped by source string so
+    // the report can show exactly which logs were read on the target.
+    const logSourceMap = new Map<string, { source: string; detail?: string }>();
+    for (const b of branches) {
+      for (const ls of (b.logSources ?? [])) {
+        if (!logSourceMap.has(ls.source)) logSourceMap.set(ls.source, ls);
+      }
+    }
+    const logSources = Array.from(logSourceMap.values());
 
     // LLM rerank of root causes (narrow JSON contract)
     let rerankedRoots: RootCauseCandidate[] = filteredRoots;
@@ -525,7 +574,8 @@ const aggregateStep = createStep({
           : "Root cause confidence acceptable, proceed with guided remediation"
       },
       execution,
-      references
+      references,
+      logSources
     };
   }
 });

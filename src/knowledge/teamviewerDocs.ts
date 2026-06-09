@@ -1448,6 +1448,45 @@ export async function retrieveKnowledgeHits(
 }
 
 /**
+ * Relevance score for a single knowledge hit against a query, on the same
+ * blended scale (`hitRelevance`) the retriever uses internally to rank the
+ * pool. Exported so callers that attach KB pages as *references* (e.g. the
+ * troubleshoot workflow) can drop pages that merely ranked top-N relative to
+ * a weak pool but are not actually on-topic.
+ */
+export function referenceRelevance(query: string, h: KnowledgeHit): number {
+  return hitRelevance(tokenize(query), h, queryPhrases(query));
+}
+
+/**
+ * Absolute on-topic gate for KB references. A page is only worth citing as a
+ * supporting reference when it is EITHER blended-relevant above an absolute
+ * floor OR genuinely semantically close to the query. This filters out the
+ * "top-3 of a weak pool" pages (e.g. "Use TeamViewer on cloned systems"
+ * surfacing for a DNS-drop issue) that confuse the reader.
+ *
+ * Thresholds are deliberately absolute (not relative to the pool) so that a
+ * query with no good matches yields ZERO references rather than three
+ * irrelevant ones.
+ */
+export function isRelevantReference(query: string, h: KnowledgeHit): boolean {
+  const rel = referenceRelevance(query, h);
+  return rel >= REFERENCE_RELEVANCE_FLOOR || (h.sem ?? 0) >= REFERENCE_SEM_FLOOR;
+}
+
+/** Blended-relevance floor for citing a doc/fact as a reference.
+ *  Calibrated against the local embedder, which clusters ALL TeamViewer docs
+ *  at sem≈0.41–0.52 (even the product landing page) — so the blended score,
+ *  not raw cosine, is the discriminating signal. At 0.6 the product/landing
+ *  pages and unrelated topics fall away while symptom-matched pages survive. */
+const REFERENCE_RELEVANCE_FLOOR = 0.6;
+/** Semantic-similarity escape hatch. Deliberately set ABOVE the embedder's
+ *  TeamViewer-doc cluster ceiling (~0.52) so it only fires for genuinely
+ *  exceptional semantic matches, not for the whole TeamViewer corpus. */
+const REFERENCE_SEM_FLOOR = 0.62;
+
+
+/**
  * Extractive answer composer (no LLM): returns verbatim passages from the
  * retrieved chunks. Used by the Mastra docs tool and as the non-LLM path.
  */
