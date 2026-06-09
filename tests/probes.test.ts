@@ -10,7 +10,7 @@ import type { EndpointHealthReport } from "../src/probes/endpointHealth.js";
 import type { LogProbeReport } from "../src/probes/logs.js";
 import type { AuthProbeReport } from "../src/probes/authPolicy.js";
 import { normalize } from "../src/probes/logs.js";
-import { buildMacCaptureCommand } from "../src/probes/logs.js";
+import { buildMacCaptureCommand, parseMacPowerEvents } from "../src/probes/logs.js";
 
 describe("buildMacCaptureCommand", () => {
   it("builds a self-contained capture-then-grep pipeline for a window", () => {
@@ -32,6 +32,54 @@ describe("buildMacCaptureCommand", () => {
   it("filters for failure-related keywords", () => {
     const cmd = buildMacCaptureCommand(30);
     expect(cmd.toLowerCase()).toMatch(/disconnect|drop|timeout|reconnect/);
+  });
+});
+
+describe("parseMacPowerEvents", () => {
+  const sample = [
+    "===PMSET===",
+    "System-wide power settings:",
+    "Currently in use:",
+    " standby              1",
+    " powernap             0",
+    " sleep                0",
+    " tcpkeepalive         1",
+    " standbydelaylow      10800",
+    " hibernatefile        /var/vm/sleepimage",
+    " womp                 1",
+    "===EVENTS===",
+    "2026-06-08 15:53:27.867 Df TeamViewer_Service NetWatchdog: OnStandby going to sleep",
+    "2026-06-08 15:53:27.867 Df TeamViewer_Service NetWatchdog: Completely disconnected. Going offline",
+    "2026-06-08 19:12:33.790 Df TeamViewer_Service NetWatchdog: OnStandby woke up",
+    "2026-06-08 20:19:05.824 Df TeamViewer_Service NetWatchdog: OnStandby going to sleep",
+    "2026-06-08 20:19:05.824 Df TeamViewer_Service NetWatchdog: Completely disconnected. Going offline",
+    "2026-06-08 20:19:21.462 Df TeamViewer_Service NetWatchdog: OnStandby woke up"
+  ].join("\n");
+
+  it("counts standby disconnects, enters and wake recoveries", () => {
+    const p = parseMacPowerEvents(sample);
+    expect(p.standbyDisconnects).toBe(2);
+    expect(p.standbyEnters).toBe(2);
+    expect(p.wakeRecoveries).toBe(2);
+    expect(p.disconnectTimes).toEqual(["2026-06-08 15:53:27", "2026-06-08 20:19:05"]);
+  });
+
+  it("parses pmset flags (standby on, powernap off, sleep disabled, tcpkeepalive on)", () => {
+    const p = parseMacPowerEvents(sample);
+    expect(p.standbyEnabled).toBe(true);
+    expect(p.powerNapEnabled).toBe(false);
+    expect(p.sleepDisabled).toBe(true);
+    expect(p.tcpKeepAlive).toBe(true);
+    expect(p.standbyDelayLowSec).toBe(10800);
+    expect(p.pmsetSummary).toContain("standby=1");
+    expect(p.pmsetSummary).toContain("powernap=0");
+  });
+
+  it("returns zero counts and undefined flags when nothing matches", () => {
+    const p = parseMacPowerEvents("===PMSET===\n===EVENTS===\n");
+    expect(p.standbyDisconnects).toBe(0);
+    expect(p.standbyEnabled).toBeUndefined();
+    expect(p.pmsetSummary).toBeUndefined();
   });
 });
 
@@ -268,6 +316,65 @@ describe("fromLogs", () => {
     expect(action).toContain("transport");
     expect(action).toMatch(/ping|tcpdump|traceroute|mtr/);
     expect(action).not.toContain("triage the dominant signature");
+  });
+
+  it("surfaces a macOS standby root cause when NetWatchdog logged standby disconnects", () => {
+    const report: LogProbeReport = {
+      filesInspected: ["<macOS unified log>"],
+      totalLines: 96, errorCount: 58, warningCount: 16,
+      topSignatures: [
+        {
+          signature: "RetryHandle::HandleRetry(): Trying resend to 13 failed with error RCommand:1, retrying",
+          count: 8,
+          exampleLine: "Df TeamViewer_Service ... RetryHandle::HandleRetry(): Trying resend to 13 failed with error RCommand:1, retrying"
+        }
+      ],
+      diagnostics: [],
+      power: {
+        standbyDisconnects: 4,
+        standbyEnters: 4,
+        wakeRecoveries: 4,
+        disconnectTimes: ["2026-06-08 15:53:27", "2026-06-08 19:12:33", "2026-06-08 20:19:05", "2026-06-08 21:35:56"],
+        standbyEnabled: true,
+        powerNapEnabled: false,
+        tcpKeepAlive: true,
+        standbyDelayLowSec: 10800,
+        pmsetSummary: "sleep=0, standby=1, powernap=0, tcpkeepalive=1, standbydelaylow=10800"
+      }
+    };
+    const out = fromLogs(report);
+    const standby = out.rootCauses.find((r) => /standby|sleep/i.test(r.title));
+    expect(standby).toBeDefined();
+    // The standby cause must OUTRANK the demoted RetryHandle signature.
+    const retry = out.rootCauses.find((r) => /recurring failure signature/i.test(r.title));
+    expect(retry).toBeDefined();
+    expect(standby!.score).toBeGreaterThan(retry!.score);
+    // The RetryHandle signature is demoted to reconnection noise.
+    expect(retry!.score).toBeLessThan(0.5);
+    expect(retry!.rationale.toLowerCase()).toContain("reconnection aftermath");
+    // The transport action is reframed (standby-aware), not the generic one.
+    const action = out.actions.map((a) => a.step).join("\n").toLowerCase();
+    expect(action).toMatch(/standby|caffeinate|pmset|prevent system from sleeping/);
+  });
+
+  it("rules out idle-sleep when pmset is present but no standby disconnects occurred", () => {
+    const report: LogProbeReport = {
+      filesInspected: ["<macOS unified log>"],
+      totalLines: 50, errorCount: 0, warningCount: 0,
+      topSignatures: [],
+      diagnostics: [],
+      power: {
+        standbyDisconnects: 0,
+        standbyEnters: 0,
+        wakeRecoveries: 0,
+        disconnectTimes: [],
+        standbyEnabled: false,
+        pmsetSummary: "sleep=0, standby=0"
+      }
+    };
+    const out = fromLogs(report);
+    expect(out.rootCauses.some((r) => /standby|sleep/i.test(r.title))).toBe(false);
+    expect(out.evidence.join("\n").toLowerCase()).toContain("idle-sleep is ruled out");
   });
 });
 

@@ -24,6 +24,35 @@ export interface SignatureCluster {
   exampleLine: string;
 }
 
+/**
+ * macOS power-management findings. Correlates TeamViewer NetWatchdog standby
+ * events with `pmset` settings so an "it drops every few minutes" symptom that
+ * is really *idle-sleep dropping the connection* can be diagnosed correctly
+ * instead of being misattributed to the post-wake RetryHandle error burst.
+ */
+export interface PowerEventSummary {
+  /** "Completely disconnected. Going offline" NetWatchdog events (the real drops). */
+  standbyDisconnects: number;
+  /** "OnStandby going to sleep" transitions. */
+  standbyEnters: number;
+  /** "OnStandby woke up" / "Internet is now connected" recoveries. */
+  wakeRecoveries: number;
+  /** Best-effort timestamps of the disconnect events, oldest→newest. */
+  disconnectTimes: string[];
+  /** pmset `sleep == 0` (true = sleep disabled). undefined if not parsed. */
+  sleepDisabled?: boolean;
+  /** pmset `standby == 1`. */
+  standbyEnabled?: boolean;
+  /** pmset `powernap == 1`. */
+  powerNapEnabled?: boolean;
+  /** pmset `tcpkeepalive == 1`. */
+  tcpKeepAlive?: boolean;
+  /** pmset `standbydelaylow` (seconds before low-power standby). */
+  standbyDelayLowSec?: number;
+  /** Compact human-readable pmset summary for the Evidence block. */
+  pmsetSummary?: string;
+}
+
 export interface LogProbeReport {
   filesInspected: string[];
   totalLines: number;
@@ -35,7 +64,10 @@ export interface LogProbeReport {
   product?: string;
   /** Description of where the probe ran ("local" or "ssh user@host"). */
   executionTarget?: string;
+  /** macOS power-management correlation (undefined on non-macOS targets). */
+  power?: PowerEventSummary;
 }
+
 
 /**
  * Candidate log directories on a *remote* host, by target OS. Local runs
@@ -355,12 +387,107 @@ async function captureMacUnifiedLog(
   }
 }
 
+/**
+ * Parse the combined `pmset -g` + NetWatchdog event block emitted by
+ * harvestMacPowerEvents into a structured PowerEventSummary. Pure + exported so
+ * it is unit-testable without a real macOS host.
+ *
+ * Expected input shape (two labelled sections):
+ *   ===PMSET===
+ *    standby              1
+ *    powernap             0
+ *    ...
+ *   ===EVENTS===
+ *   2026-06-08 15:53:27 ... NetWatchdog: Completely disconnected. Going offline
+ *   2026-06-08 19:12:33 ... NetWatchdog: OnStandby woke up
+ */
+export function parseMacPowerEvents(raw: string): PowerEventSummary {
+  let section: "pmset" | "events" | "" = "";
+  const pmset: Record<string, string> = {};
+  const eventLines: string[] = [];
+  for (const line of (raw ?? "").split(/\r?\n/)) {
+    const t = line.trim();
+    if (/^===\s*PMSET\s*===$/i.test(t)) { section = "pmset"; continue; }
+    if (/^===\s*EVENTS\s*===$/i.test(t)) { section = "events"; continue; }
+    if (section === "pmset") {
+      const m = t.match(/^([a-z]+)\s+(-?\d+)\b/i);
+      if (m) pmset[m[1].toLowerCase()] = m[2];
+    } else if (section === "events" && t) {
+      eventLines.push(t);
+    }
+  }
+
+  let standbyDisconnects = 0;
+  let standbyEnters = 0;
+  let wakeRecoveries = 0;
+  const disconnectTimes: string[] = [];
+  for (const l of eventLines) {
+    if (/completely disconnected|going offline/i.test(l)) {
+      standbyDisconnects++;
+      const tm = l.match(/\b(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
+      if (tm) disconnectTimes.push(tm[1]);
+    }
+    if (/onstandby going to sleep/i.test(l)) standbyEnters++;
+    if (/onstandby woke up|internet is now connected/i.test(l)) wakeRecoveries++;
+  }
+
+  const num = (k: string): number | undefined => (k in pmset ? Number(pmset[k]) : undefined);
+  const flag = (k: string, on: number): boolean | undefined => {
+    const v = num(k);
+    return v === undefined ? undefined : v === on;
+  };
+  const summaryKeys = ["sleep", "standby", "powernap", "tcpkeepalive", "standbydelaylow", "womp"];
+  const pmsetSummary = summaryKeys.filter((k) => k in pmset).map((k) => `${k}=${pmset[k]}`).join(", ") || undefined;
+
+  return {
+    standbyDisconnects,
+    standbyEnters,
+    wakeRecoveries,
+    disconnectTimes,
+    sleepDisabled: flag("sleep", 0),
+    standbyEnabled: flag("standby", 1),
+    powerNapEnabled: flag("powernap", 1),
+    tcpKeepAlive: flag("tcpkeepalive", 1),
+    standbyDelayLowSec: num("standbydelaylow"),
+    pmsetSummary
+  };
+}
+
+/**
+ * macOS power-management harvest: one read-only command that emits the current
+ * `pmset -g` settings plus the last-24h TeamViewer NetWatchdog standby/wake
+ * lines, so parseMacPowerEvents can correlate idle-sleep with disconnects.
+ * Returns null on non-macOS or if the command fails.
+ */
+async function harvestMacPowerEvents(ctx: ExecutionContext): Promise<PowerEventSummary | null> {
+  if (ctx.os !== "macos") return null;
+  const cmd =
+    `echo "===PMSET==="; pmset -g 2>/dev/null; ` +
+    `echo "===EVENTS==="; ` +
+    `log show --predicate 'process CONTAINS "TeamViewer"' --info --last 24h --style compact 2>/dev/null ` +
+    `| egrep -i 'NetWatchdog|OnStandby|Going offline|woke up|Internet is now connected' | tail -200`;
+  try {
+    const r = await ctx.runShell(cmd, { timeoutMs: 30000 });
+    const out = r.stdout || "";
+    if (!out.trim()) return null;
+    return parseMacPowerEvents(out);
+  } catch {
+    return null;
+  }
+}
+
+
 export async function runLogProbe(
   profile: ProductDiagnosticProfile = getProductProfile("teamviewer-remote"),
   ctx: ExecutionContext = new LocalContext(),
   captureWindowSec?: number
 ): Promise<LogProbeReport> {
   const diagnostics: string[] = [];
+
+  // macOS power-management correlation (read-only). Gathered once up front so
+  // EVERY return path (live capture, history, empty) carries the standby story.
+  // On non-macOS targets this is a no-op (returns undefined).
+  const power = ctx.os === "macos" ? ((await harvestMacPowerEvents(ctx)) ?? undefined) : undefined;
 
   // LIVE CAPTURE MODE (macOS only, opt-in via --capture <minutes>).
   // For intermittent "drops every few minutes" symptoms the last-24h history
@@ -385,7 +512,8 @@ export async function runLogProbe(
           topSignatures: scan.topSignatures,
           diagnostics,
           product: profile.name,
-          executionTarget: ctx.description
+          executionTarget: ctx.description,
+          power
         };
       }
       diagnostics.push(
@@ -440,7 +568,8 @@ export async function runLogProbe(
           topSignatures: scan.topSignatures,
           diagnostics,
           product: profile.name,
-          executionTarget: ctx.description
+          executionTarget: ctx.description,
+          power
         };
       }
       if (unified) {
@@ -461,7 +590,8 @@ export async function runLogProbe(
       topSignatures: [],
       diagnostics,
       product: profile.name,
-      executionTarget: ctx.description
+      executionTarget: ctx.description,
+      power
     };
   }
 
@@ -498,7 +628,8 @@ export async function runLogProbe(
     topSignatures,
     diagnostics,
     product: profile.name,
-    executionTarget: ctx.description
+    executionTarget: ctx.description,
+    power
   };
 }
 

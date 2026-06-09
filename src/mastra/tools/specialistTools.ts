@@ -372,6 +372,13 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
   evidence.push(`Inspected ${report.filesInspected.length} log file(s): ${report.filesInspected.join(" | ")}`);
   evidence.push(`Lines scanned: ${report.totalLines}, errors: ${report.errorCount}, warnings: ${report.warningCount}`);
 
+  // Power-management correlation (macOS). When the real disconnects are macOS
+  // entering standby, the post-wake RetryHandle/RCommand burst is just
+  // reconnection noise — so we DEMOTE that signature below and surface standby
+  // as the actual evidence-anchored root cause further down.
+  const power = report.power;
+  const standbyExplainsDrops = !!power && power.standbyDisconnects > 0;
+
   if (report.topSignatures.length > 0) {
     evidence.push(
       `Top failure signatures: ` +
@@ -379,18 +386,26 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
     );
     const dominant = report.topSignatures[0];
     if (dominant.count >= 3) {
+      const sigText = `${dominant.exampleLine} ${dominant.signature}`.toLowerCase();
+      const isReconnectNoise =
+        standbyExplainsDrops &&
+        /retryhandle|::handleretry|resend to|rcommand|retry|netwatchdog|reconnect/.test(sigText);
       rootCauses.push({
         title: "Recurring failure signature in TeamViewer logs",
-        score: Math.min(0.9, 0.55 + Math.log10(dominant.count) * 0.15),
-        rationale: `Pattern repeats ${dominant.count}\u00d7: ${dominant.exampleLine.slice(0, 260)}`
+        score: isReconnectNoise ? 0.35 : Math.min(0.9, 0.55 + Math.log10(dominant.count) * 0.15),
+        rationale:
+          `Pattern repeats ${dominant.count}\u00d7: ${dominant.exampleLine.slice(0, 260)}` +
+          (isReconnectNoise
+            ? " \u2014 note: these coincide with the macOS standby wake events; they are reconnection aftermath, not the root cause (see the power-management finding)."
+            : "")
       });
       // Signature-aware action routing: the dominant signature usually
       // points at a specific failure mode (DNS, TLS, timeout, auth) and
       // each one has a different remediation playbook. Emitting "Triage
       // the dominant signature" was correct but useless — the user already
       // sees the signature. Pick the right playbook automatically.
-      const sigText = `${dominant.exampleLine} ${dominant.signature}`.toLowerCase();
       if (/could not resolve|resolve failed|resolvednsname|getaddrinfo|asio\.netdb|name (?:not|or service not) known|nodename nor servname/.test(sigText)) {
+
         actions.push({
           step:
             "DNS resolution failures detected for TeamViewer router hostnames " +
@@ -415,20 +430,35 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
           rollback: "Reverting ca-certificates / removing the TLS-inspection bypass restores prior behavior."
         });
       } else if (/timed? ?out|timeout|connection reset|broken pipe|aborted|disconnect|retryhandle|::handleretry|resend to|retry(?:ing)?\b|rcommand|retransmit|netwatchdog/.test(sigText)) {
-        actions.push({
-          step:
-            "Transport-layer instability dominates the log (timeouts / disconnects / TeamViewer " +
-            "internal RetryHandle / RCommand retries — TeamViewer is repeatedly resending " +
-            "commands because replies don't arrive in time). This is a network-path symptom, " +
-            "not a TeamViewer bug. Measure link quality to the routers: " +
-            "`ping -c 50 router11.teamviewer.com` (loss & jitter), MTR/`traceroute -T -p 5938`. " +
-            "If intermittent, capture a 2-min `tcpdump`/`pktmon` on port 5938. Check upstream " +
-            "NAT/firewall for idle-timeout < 60s and any rate-limiting on long-lived TCP sessions; " +
-            "if on Wi-Fi, test on Ethernet to isolate radio packet loss.",
-          risk: "low",
-          rollback: "Observation steps only — no rollback needed."
-        });
+        if (standbyExplainsDrops) {
+          actions.push({
+            step:
+              "These RetryHandle / RCommand retry bursts line up with the macOS standby wake " +
+              "events detected below \u2014 they are reconnection noise after the Mac slept, NOT a " +
+              "live-session network fault. Fix the standby drops first (see the power-management " +
+              "root cause). ONLY if drops ALSO happen during an ACTIVE remote-control session " +
+              "(machine awake) should you measure link quality: `ping -c 50 router11.teamviewer.com` " +
+              "(loss & jitter), MTR/`traceroute -T -p 5938`, and check upstream NAT/firewall idle-timeout.",
+            risk: "low",
+            rollback: "Observation steps only — no rollback needed."
+          });
+        } else {
+          actions.push({
+            step:
+              "Transport-layer instability dominates the log (timeouts / disconnects / TeamViewer " +
+              "internal RetryHandle / RCommand retries — TeamViewer is repeatedly resending " +
+              "commands because replies don't arrive in time). This is a network-path symptom, " +
+              "not a TeamViewer bug. Measure link quality to the routers: " +
+              "`ping -c 50 router11.teamviewer.com` (loss & jitter), MTR/`traceroute -T -p 5938`. " +
+              "If intermittent, capture a 2-min `tcpdump`/`pktmon` on port 5938. Check upstream " +
+              "NAT/firewall for idle-timeout < 60s and any rate-limiting on long-lived TCP sessions; " +
+              "if on Wi-Fi, test on Ethernet to isolate radio packet loss.",
+            risk: "low",
+            rollback: "Observation steps only — no rollback needed."
+          });
+        }
       } else if (/auth|unauthor|forbidden|401|403|token|credential/.test(sigText)) {
+
         actions.push({
           step:
             "Authentication-class failures dominate. Re-verify the account token / device " +
@@ -447,6 +477,59 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
     }
   } else if (report.errorCount === 0) {
     evidence.push("No errors or warnings detected in log tail window.");
+  }
+
+  // macOS standby / power-management root cause. This is the high-value
+  // correction: an idle Mac that enters standby drops the TeamViewer connection
+  // and reconnects on wake, producing the RetryHandle burst that the signature
+  // clustering otherwise misattributes. Surface it as an evidence-anchored
+  // root cause (baseline → tagged evidenceAnchored=true in the workflow merge).
+  if (power) {
+    if (power.pmsetSummary) {
+      evidence.push(`macOS power management (pmset): ${power.pmsetSummary}.`);
+    }
+    if (power.standbyDisconnects > 0) {
+      const when = power.disconnectTimes.length
+        ? ` (e.g. ${power.disconnectTimes.slice(-3).join(", ")})`
+        : "";
+      evidence.push(
+        `NetWatchdog logged ${power.standbyDisconnects} standby disconnect event(s) ` +
+          `("Completely disconnected. Going offline") and ${power.wakeRecoveries} wake recovery(ies) ` +
+          `in the last 24h${when}.`
+      );
+      const cfg = [
+        power.standbyEnabled === true ? "standby=on" : power.standbyEnabled === false ? "standby=off" : null,
+        power.powerNapEnabled === false ? "powernap=off" : power.powerNapEnabled === true ? "powernap=on" : null,
+        power.tcpKeepAlive === false ? "tcpkeepalive=off" : null,
+        typeof power.standbyDelayLowSec === "number" ? `standbydelaylow=${power.standbyDelayLowSec}s` : null
+      ]
+        .filter(Boolean)
+        .join(", ");
+      rootCauses.push({
+        title: "macOS standby/sleep is dropping the idle TeamViewer connection",
+        score: Math.min(0.92, 0.7 + Math.log10(power.standbyDisconnects + 1) * 0.2),
+        rationale:
+          `The macOS NetWatchdog reported ${power.standbyDisconnects} "Completely disconnected. Going offline" ` +
+          `event(s) as the Mac entered standby, each followed by a reconnect on wake \u2014 this is the actual ` +
+          `disconnect pattern. ${cfg ? `Power settings: ${cfg}. ` : ""}` +
+          `When the machine goes idle it sleeps and the connection drops until wake; the RetryHandle/RCommand ` +
+          `errors are the reconnection aftermath, not the cause.`
+      });
+      actions.push({
+        step:
+          "Stop the Mac from sleeping while TeamViewer must stay reachable. For unattended access, " +
+          "enable TeamViewer \u2192 Preferences \u2192 Advanced \u2192 'Prevent System from sleeping' (Unattended " +
+          "Access), or keep it awake at the OS level: `sudo pmset -a sleep 0 standby 0 powernap 1 " +
+          "tcpkeepalive 1` (on AC power), or run `caffeinate -s` during sessions. Verify with `pmset -g`. " +
+          "If the Mac MUST sleep, drops while asleep are by design \u2014 not a TeamViewer fault.",
+        risk: "low",
+        rollback: "Capture `pmset -g` before changing, then restore prior values with `sudo pmset -a sleep <old> standby <old> powernap <old>`."
+      });
+    } else if (power.pmsetSummary) {
+      evidence.push(
+        "No macOS standby-related TeamViewer disconnects in the last 24h \u2014 idle-sleep is ruled out as the cause."
+      );
+    }
   }
 
   for (const d of report.diagnostics) evidence.push(d);

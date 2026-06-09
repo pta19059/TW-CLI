@@ -15,6 +15,10 @@ are grounded against the official Knowledge Base via a local hybrid RAG index.
   no cloud, no fallback.
 - **Real probes, not canned data** — DNS / TCP `5938` / HTTPS, services & processes (Win/Linux/macOS),
   log clustering, optional TeamViewer Web API checks.
+- **macOS standby/power-management correlation** — on macOS targets the log probe reads `pmset -g`
+  and the `NetWatchdog` standby/wake events, so an "it drops every few minutes" symptom that is
+  really *idle-sleep dropping the connection* is diagnosed correctly (and the post-wake
+  RetryHandle/RCommand error burst is demoted to reconnection noise instead of being misattributed).
 - **Readable, evidence-first reports** — a fixed section order (root causes → actions → knowledge
   base → log sources → evidence) keeps the decision content on top; speculative hypotheses appear
   only when no definitive cause was found.
@@ -217,7 +221,10 @@ answer is readable at a glance:
    LLM-proposed causes must be **evidence-anchored**: a candidate that shares no distinctive term
    with the collected probe/log evidence is dropped as speculation, so the report never invents a
    plausible-sounding cause (e.g. "Permissions Issue") that nothing actually observed supports.
-   Probe-derived causes (real log signatures, failed connectivity checks) are always trusted.
+   Probe-derived causes (real log signatures, failed connectivity checks) are always trusted. On
+   macOS, recurring disconnects that line up with `NetWatchdog` standby events surface a dedicated
+   *"macOS standby/sleep is dropping the idle connection"* root cause and demote the correlated
+   RetryHandle signature to reconnection noise.
 3. **Recommended Actions** — prioritized remediation steps with risk + rollback.
 4. **Knowledge Base** — only the official KB articles that pass an absolute on-topic relevance
    gate, sorted by relevance (off-topic filler is dropped, not just down-ranked).
