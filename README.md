@@ -4,9 +4,10 @@
 
 **Local-first, AI-assisted CLI for diagnosing and troubleshooting TeamViewer.**
 Five Mastra agents run on Foundry Local (on-device, no cloud) against real probe evidence —
-connectivity, endpoint health, logs, auth/policy — and produce ranked root causes, remediation
-steps, a confidence score and an escalation decision. Answers about TeamViewer features are
-grounded against the official Knowledge Base via a local hybrid RAG index.
+connectivity, endpoint health, logs, auth/policy — and produce a readable report with ranked
+root causes, remediation steps, the exact log sources consulted, relevance-filtered Knowledge
+Base articles, a confidence score and an escalation decision. Answers about TeamViewer features
+are grounded against the official Knowledge Base via a local hybrid RAG index.
 
 ## Highlights
 
@@ -14,8 +15,15 @@ grounded against the official Knowledge Base via a local hybrid RAG index.
   no cloud, no fallback.
 - **Real probes, not canned data** — DNS / TCP `5938` / HTTPS, services & processes (Win/Linux/macOS),
   log clustering, optional TeamViewer Web API checks.
+- **Readable, evidence-first reports** — a fixed section order (root causes → actions → knowledge
+  base → log sources → evidence) keeps the decision content on top; speculative hypotheses appear
+  only when no definitive cause was found.
+- **Log-source transparency** — every report lists the exact log sources consulted on the target
+  (file paths, the macOS unified-log `log show` command, etc.) with line/error/warning counts —
+  works across local, SSH (Win/Linux/macOS), Azure VM and Kubernetes backends.
 - **Grounded answers** — `docs ask` retrieves from a local LanceDB index of the official KB and
-  verifies every sentence by embedding similarity.
+  verifies every sentence by embedding similarity. Troubleshoot reports cite only KB articles
+  that pass an absolute on-topic relevance gate (no off-topic filler).
 - **Non-blocking jobs** — every `debug`/`troubleshoot` runs as a detached worker with persisted
   logs, structured reports and a cancellable PID tree.
 - **Modern terminal UX** — REPL + one-shot + free-text natural language; slash commands;
@@ -194,6 +202,22 @@ calls its Mastra Agent with a sanitized prompt and a narrow JSON contract, and m
 
 For the full architecture (component diagram, no-fallback policy, runtime flow) see
 **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+
+### Report layout
+
+Both the text and Markdown renderers emit the same fixed, decision-first section order so the
+answer is readable at a glance:
+
+1. **Summary / Target / Confidence** — one-line outcome, where the probes ran, confidence + escalation.
+2. **Root Causes** — ranked, scored causes (or an honest "none identified" when probes can't conclude).
+3. **Recommended Actions** — prioritized remediation steps with risk + rollback.
+4. **Knowledge Base** — only the official KB articles that pass an absolute on-topic relevance
+   gate, sorted by relevance (off-topic filler is dropped, not just down-ranked).
+5. **Log Sources Consulted** — the exact log paths / commands inspected on the target (e.g. the
+   macOS unified-log `log show` invocation) with line/error/warning counts.
+6. **Evidence** — the raw probe findings backing the conclusions.
+7. **Exploratory Leads** — shown **only** when no definitive root cause was found, clearly labelled
+   as unverified so they never distract from a confirmed cause.
 
 ## Azure demo
 
