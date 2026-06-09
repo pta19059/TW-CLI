@@ -700,7 +700,13 @@ const ANCHOR_STOPWORDS = new Set([
   "teamviewer", "remote", "client", "clients", "server", "servers", "system",
   "systems", "host", "hosts", "user", "users", "device", "devices",
   "application", "app", "software", "program", "running", "occur", "occurs",
-  "occurring", "happening", "behavior", "behaviour"
+  "occurring", "happening", "behavior", "behaviour",
+  // "service"/"services" appear in nearly every TeamViewer evidence line
+  // (process name "TeamViewer_Service", daemon descriptions, etc.) so they
+  // are NOT a distinctive anchor — an LLM cause that only touches the evidence
+  // via the word "service" ("the TeamViewer service requires admin rights")
+  // is still an unanchored guess and must be dropped.
+  "service", "services", "daemon", "daemons", "process", "processes"
 ]);
 
 /**

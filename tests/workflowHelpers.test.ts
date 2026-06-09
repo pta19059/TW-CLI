@@ -333,6 +333,31 @@ describe("filterRootCausesAgainstEvidence", () => {
     expect(out.length).toBe(0);
   });
 
+  it("drops 'System lacks necessary permissions' whose only evidence overlap is the generic word 'service'", () => {
+    // Regression: the live Mac run kept this LLM guess because its rationale
+    // mentions "service", which matched "TeamViewer_Service" in the process
+    // list. "service"/"daemon"/"process" are now generic stopwords, so the
+    // candidate has no real anchor and is dropped. (Verified: the user IS an
+    // admin and TeamViewer_Service runs as root.)
+    const out = filterRootCausesAgainstEvidence(
+      [
+        {
+          title: "System lacks necessary permissions",
+          score: 0.42,
+          rationale: "The TeamViewer service requires administrative privileges to run properly.",
+          evidenceAnchored: false
+        }
+      ],
+      [
+        "DNS resolved 6/6 TeamViewer hosts",
+        "TCP 5938 reachability: 3/3 routers OK",
+        "Processes running: TeamViewer, TeamViewer_Service, bash",
+        "Top failure signature: RetryHandle::HandleRetry(): Trying resend to 13 failed (x8)"
+      ]
+    );
+    expect(out.length).toBe(0);
+  });
+
   it("keeps an LLM candidate (evidenceAnchored=false) that anchors to an evidence token", () => {
     const out = filterRootCausesAgainstEvidence(
       [
