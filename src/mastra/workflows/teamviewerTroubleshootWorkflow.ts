@@ -489,7 +489,12 @@ const aggregateStep = createStep({
         'Reply ONLY with JSON: {"rootCauses":[{"title":"...","score":0.0,"rationale":"..."}]}';
       const reranked = await generateStructured(gatewayAgent, rerankPrompt, {
         schema: z.object({ rootCauses: z.array(rootCauseSchema) }),
-        retries: 1
+        retries: 1,
+        // Reranking is a best-effort ENHANCEMENT, not essential. The small
+        // local model occasionally emits malformed JSON; never let that crash
+        // the whole troubleshoot run — fall back to the evidence-filtered
+        // candidates in their original (probe-derived) order.
+        fallback: { rootCauses: filteredRoots }
       });
       rerankedRoots = applyRerankScores(filteredRoots, reranked.rootCauses);
       if (rerankedRoots.length === 0) {
@@ -841,6 +846,14 @@ export function filterRootCausesAgainstEvidence(
   const endpointTcpOk = /endpoint\s+tcp\s+reachability:\s*([1-9]\d*)\/\d+[^\n]*?\bok\b/i.test(joined);
   const dnsOk = /dns\s+resolved\s+([1-9]\d*)\/\d+\s+teamviewer\s+hosts/i.test(joined);
   const firewallRuledOut = dnsOk && (port5938Open || endpointTcpOk);
+  // Backbone fully healthy = DNS resolved with NO failures AND every 5938 router
+  // reachable. The TeamViewer *session* path is the 5938 router backbone; the
+  // SaaS management hosts (webapi/login/master) only serve the Management Console
+  // REST API. When the backbone is healthy, a flaky/slow Web API endpoint is NOT
+  // the root cause of session-stability symptoms ("drops every few minutes") and
+  // must not dominate the ranking — drop those management-plane misattributions.
+  const port5938FullyOpen = port5938Open && !/tcp\s+5938\s+blocked/i.test(joined);
+  const backboneHealthy = port5938FullyOpen && !/dns\s+failures:/i.test(joined);
   // We injected a CAVEAT line for stale-CA-bundle probe issues. If it's
   // present, the TLS validation failure is a probe-host hygiene issue, NOT a
   // user-symptom cause — drop any rootCause the LLM synthesised about it.
@@ -878,6 +891,22 @@ export function filterRootCausesAgainstEvidence(
     // Generic "unstable network / connectivity issue" titled cause whose
     // rationale just blames the firewall — same trap, no "firewall" in title.
     if (firewallRuledOut && /\b(unstable\s+network|network\s+connectivity|connection\s+drop)/.test(text) && /firewall|blocking|inbound|outbound/.test(text)) {
+      return false;
+    }
+    // Backbone healthy: a Web API / management-plane endpoint that is slow or
+    // momentarily unreachable is NOT the cause of session drops. Drop the
+    // "Web API unreachable over HTTPS" candidate and the "<product> endpoint
+    // unreachable" candidate when its rationale references ONLY webapi (the
+    // management host) and not a router/master/login session host.
+    if (backboneHealthy && /(web\s*api|webapi)/.test(titleClean.toLowerCase()) && /(unreachable|unavailable|blocked|fail)/.test(titleClean.toLowerCase())) {
+      return false;
+    }
+    if (
+      backboneHealthy &&
+      /endpoint\s+unreachable/.test(text) &&
+      /webapi\.teamviewer\.com/.test(rationale) &&
+      !/(router\d|master\d|login\.teamviewer)/.test(rationale)
+    ) {
       return false;
     }
     // CA bundle / TLS validation as a CAUSE of the user's symptom — already

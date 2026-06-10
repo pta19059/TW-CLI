@@ -212,6 +212,9 @@ export class SshContext implements ExecutionContext {
   os: RemoteOs;
   readonly description: string;
   private readonly opts: SshConnectionOptions;
+  /** Serializes Windows runShell calls so concurrent probes don't saturate the
+   *  remote host with simultaneous powershell.exe cold starts. */
+  private winQueue: Promise<unknown> = Promise.resolve();
 
   private constructor(opts: SshConnectionOptions, os: RemoteOs) {
     this.opts = opts;
@@ -285,6 +288,25 @@ export class SshContext implements ExecutionContext {
   }
 
   async runShell(command: string, opts: ShellOptions = {}): Promise<ShellResult> {
+    // Windows targets: each `ssh → powershell.exe` round-trip pays a 3–5s cold
+    // start. Firing many concurrently (the workflow runs connectivity, endpoint,
+    // log and auth specialists in parallel) saturates the remote host, so probe
+    // commands time out and return EMPTY — which the callers then misread as
+    // "TeamViewer not installed / no logs". Serialize Windows runShell calls
+    // through a single queue so only ONE powershell.exe runs at a time. POSIX
+    // shells start in milliseconds, so they stay concurrent.
+    if (this.os === "windows") {
+      const run = this.winQueue.then(() => this.execRunShell(command, opts));
+      this.winQueue = run.then(
+        () => undefined,
+        () => undefined
+      );
+      return run;
+    }
+    return this.execRunShell(command, opts);
+  }
+
+  private async execRunShell(command: string, opts: ShellOptions = {}): Promise<ShellResult> {
     const t0 = Date.now();
     const timeout = opts.timeoutMs ?? this.opts.defaultTimeoutMs ?? 8000;
     const maxBuffer = opts.maxBuffer ?? 2 * 1024 * 1024;
@@ -294,12 +316,14 @@ export class SshContext implements ExecutionContext {
     const wire = this.os === "windows" ? encodePwshOverSsh(command) : command;
     try {
       const r = await pExecFile("ssh", buildSshArgs(this.opts, wire), { timeout, maxBuffer });
-      return { stdout: r.stdout, stderr: r.stderr, exitCode: 0, ms: Date.now() - t0 };
+      const stdout = this.os === "windows" ? stripCliXml(r.stdout) : r.stdout;
+      const stderr = this.os === "windows" ? stripCliXml(r.stderr) : r.stderr;
+      return { stdout, stderr, exitCode: 0, ms: Date.now() - t0 };
     } catch (err: unknown) {
       const e = err as { code?: number; stdout?: string; stderr?: string; message?: string };
       return {
-        stdout: String(e.stdout ?? "").trim(),
-        stderr: String(e.stderr ?? e.message ?? "").trim(),
+        stdout: this.os === "windows" ? stripCliXml(String(e.stdout ?? "").trim()) : String(e.stdout ?? "").trim(),
+        stderr: this.os === "windows" ? stripCliXml(String(e.stderr ?? e.message ?? "").trim()) : String(e.stderr ?? e.message ?? "").trim(),
         exitCode: typeof e.code === "number" ? e.code : null,
         ms: Date.now() - t0
       };
@@ -406,10 +430,33 @@ function pwshQuote(value: string): string {
  * Encode a PowerShell script as `powershell -EncodedCommand <base64-utf16le>`.
  * Avoids every layer of shell escaping when sending PowerShell through ssh
  * to a Windows target whose default shell is cmd.exe.
+ *
+ * Prepends `$ProgressPreference='SilentlyContinue'` so module-load progress
+ * records ("Preparing modules for first use", emitted the first time
+ * Get-Service / Get-CimInstance load Microsoft.PowerShell.Management) are NOT
+ * serialized as CLIXML (`#< CLIXML … <Objs>…`) onto the output stream. That
+ * CLIXML pollution otherwise corrupts JSON.parse / line parsing and makes
+ * probes falsely report "no services / no logs found".
  */
 function encodePwshOverSsh(script: string): string {
-  const b64 = Buffer.from(script, "utf16le").toString("base64");
+  const wrapped = `$ProgressPreference='SilentlyContinue';${script}`;
+  const b64 = Buffer.from(wrapped, "utf16le").toString("base64");
   return `powershell -NoLogo -NoProfile -NonInteractive -EncodedCommand ${b64}`;
+}
+
+/**
+ * Strip PowerShell CLIXML remoting noise from a captured output stream.
+ * Even with ProgressPreference suppressed, a remote shell that has stderr
+ * folded into stdout can still surface a `#< CLIXML` header + `<Objs …>` blob.
+ * Removing those lines leaves the real payload (JSON / tab-delimited data)
+ * intact so downstream parsers don't choke.
+ */
+function stripCliXml(text: string): string {
+  if (!text || !text.includes("#< CLIXML")) return text;
+  return text
+    .split(/\r?\n/)
+    .filter((line) => !line.startsWith("#< CLIXML") && !line.trimStart().startsWith("<Objs"))
+    .join("\n");
 }
 
 // ──────────────────────── AzureRunCommandContext ───────────────────

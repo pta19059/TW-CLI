@@ -108,10 +108,17 @@ function remoteLogRoots(os: RemoteOs): string[] {
     ];
   }
   if (os === "windows") {
-    // Most TeamViewer installs log under %APPDATA%\TeamViewer. ProgramData
-    // covers ServiceMode and DEX. PowerShell-friendly expansion.
+    // TeamViewer 15 writes its connection/network logs into the INSTALL dir
+    // (C:\Program Files\TeamViewer\TeamViewer15_Logfile.log, TVNetwork.log,
+    // TeamViewer15_Hooks.log) — NOT under %APPDATA% on most desktop installs.
+    // ProgramData covers ServiceMode/DEX; %APPDATA%/%LOCALAPPDATA% cover
+    // per-user installs. Install dir is listed FIRST because it holds the
+    // real session logs. PowerShell-friendly expansion via ExpandString.
     return [
+      "$env:ProgramFiles\\TeamViewer",
+      "${env:ProgramFiles(x86)}\\TeamViewer",
       "$env:APPDATA\\TeamViewer",
+      "$env:LOCALAPPDATA\\TeamViewer",
       "$env:ProgramData\\TeamViewer\\Logs",
       "$env:ProgramData\\TeamViewer",
       "$env:ProgramData\\1E\\Client"
@@ -154,18 +161,20 @@ async function findLogFilesRemote(profile: ProductDiagnosticProfile, ctx: Execut
   if (ctx.os === "windows") {
     // PowerShell variant — `Get-ChildItem -Path … -File -Recurse:$false -Filter *`
     // and filter by regex client-side via Where-Object.
-    // Note: backtick-t is PowerShell's tab escape. Inside this JS template literal
-    // we escape the backtick (\`) so it becomes a literal backtick in the command.
+    // Emit "size<TAB>path" using [char]9 for the tab: a backtick-t escape only
+    // produces a tab inside DOUBLE-quoted PowerShell strings, so the original
+    // single-quoted `'{0}\`t{1}'` form emitted a LITERAL backtick-t and broke
+    // parseSizePathPairs (which splits on a real tab) → zero files discovered.
     const escaped = patternSrc.replace(/'/g, "''");
     const dirsExpr = roots.map((r) => `'${r.replace(/'/g, "''")}'`).join(",");
     const cmd =
-      `$pat='${escaped}'; ` +
+      `$pat='${escaped}'; $tab=[char]9; ` +
       `foreach($d in @(${dirsExpr})){ ` +
       `  $resolved = $ExecutionContext.InvokeCommand.ExpandString($d); ` +
       `  if(Test-Path $resolved){ Get-ChildItem -LiteralPath $resolved -File -ErrorAction SilentlyContinue | ` +
-      `    Where-Object { $_.Name -match $pat } | ForEach-Object { '{0}\`t{1}' -f $_.Length, $_.FullName } } ` +
+      `    Where-Object { $_.Name -match $pat } | ForEach-Object { '{0}{1}{2}' -f $_.Length, $tab, $_.FullName } } ` +
       `}`;
-    const r = await ctx.runShell(cmd, { timeoutMs: 8000 });
+    const r = await ctx.runShell(cmd, { timeoutMs: 15000 });
     return parseSizePathPairs(r.stdout).slice(0, MAX_FILES);
   }
 
@@ -257,11 +266,11 @@ async function diagnoseRemoteLogRoots(ctx: ExecutionContext): Promise<string[]> 
   if (ctx.os === "windows") {
     for (const r of roots) {
       try {
-        const resolved = await ctx.runShell(`$ExecutionContext.InvokeCommand.ExpandString('${r.replace(/'/g, "''")}')`, { timeoutMs: 4000 });
+        const resolved = await ctx.runShell(`$ExecutionContext.InvokeCommand.ExpandString('${r.replace(/'/g, "''")}')`, { timeoutMs: 10000 });
         const path = resolved.stdout.trim();
         const exists = await ctx.pathExists(path);
         if (!exists) { out.push(`  ${path} (missing)`); continue; }
-        const ls = await ctx.runShell(`(Get-ChildItem -LiteralPath '${path.replace(/'/g, "''")}' -File -ErrorAction SilentlyContinue | Measure-Object).Count`, { timeoutMs: 4000 });
+        const ls = await ctx.runShell(`(Get-ChildItem -LiteralPath '${path.replace(/'/g, "''")}' -File -ErrorAction SilentlyContinue | Measure-Object).Count`, { timeoutMs: 10000 });
         out.push(`  ${path} (exists, ${ls.stdout.trim() || "?"} file(s))`);
       } catch (e) {
         out.push(`  ${r} (diagnostic failed: ${(e as Error).message.slice(0, 80)})`);

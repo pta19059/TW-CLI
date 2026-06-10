@@ -6,12 +6,15 @@ import {
   fromLogs
 } from "../src/mastra/tools/specialistTools.js";
 import type { ConnectivityReport } from "../src/probes/connectivity.js";
-import { probeDnsHost, probeTcpHost } from "../src/probes/connectivity.js";
+import { probeDnsHost, probeTcpHost, runConnectivityProbe } from "../src/probes/connectivity.js";
 import type { EndpointHealthReport } from "../src/probes/endpointHealth.js";
+import { runEndpointHealthProbe } from "../src/probes/endpointHealth.js";
 import type { LogProbeReport } from "../src/probes/logs.js";
 import type { AuthProbeReport } from "../src/probes/authPolicy.js";
-import { normalize } from "../src/probes/logs.js";
+import { normalize, runLogProbe } from "../src/probes/logs.js";
 import { buildMacCaptureCommand, parseMacPowerEvents, parseWindowsPowerEvents, parseLinuxPowerEvents } from "../src/probes/logs.js";
+import { getProductProfile } from "../src/catalog/productProfiles.js";
+import { filterRootCausesAgainstEvidence } from "../src/mastra/workflows/teamviewerTroubleshootWorkflow.js";
 
 describe("buildMacCaptureCommand", () => {
   it("builds a self-contained capture-then-grep pipeline for a window", () => {
@@ -705,3 +708,240 @@ describe("remote connectivity probes are OS-aware (Windows)", () => {
     expect(res.error).toMatch(/timed out/i);
   });
 });
+
+describe("Windows connectivity probes are BATCHED (one SSH+PowerShell per category)", () => {
+  // Every ssh→powershell.exe round-trip on a Windows target pays a 3–5s cold
+  // start, so runConnectivityProbe must collapse all DNS/TCP/HTTPS probes into
+  // ONE invocation each instead of a 20-way concurrent storm (which blew the
+  // per-probe timeout during PowerShell startup → flaky false "unreachable").
+  function fakeWinBatchCtx() {
+    const commands: string[] = [];
+    const pick = (cmd: string, marker: RegExp) => {
+      const m = cmd.match(marker);
+      if (!m) return [] as string[];
+      return [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]);
+    };
+    const ctx = {
+      kind: "ssh" as const,
+      os: "windows" as const,
+      description: "ssh user@win",
+      async runShell(command: string) {
+        commands.push(command);
+        let stdout = "";
+        if (command.includes("__DNS__")) {
+          stdout = pick(command, /\$targets=@\(([^)]*)\)/)
+            .map((h) => `__DNS__|${h}|93.184.216.34`)
+            .join("\n");
+        } else if (command.includes("__TCP__")) {
+          stdout = pick(command, /\$pairs=@\(([^)]*)\)/)
+            .map((p) => {
+              const i = p.lastIndexOf(":");
+              return `__TCP__|${p.slice(0, i)}|${p.slice(i + 1)}|OK`;
+            })
+            .join("\n");
+        } else if (command.includes("__HTTPS__")) {
+          stdout = pick(command, /\$urls=@\(([^)]*)\)/)
+            .map((u) => `__HTTPS__|${u}|0|200`)
+            .join("\n");
+        }
+        return { stdout, stderr: "", exitCode: 0, ms: 1 };
+      },
+      async readFile() { return ""; },
+      async listDir() { return []; },
+      async pathExists() { return false; }
+    };
+    return { ctx, commands };
+  }
+
+  it("issues exactly ONE DNS, ONE TCP and ONE HTTPS PowerShell call for the whole product", async () => {
+    const { ctx, commands } = fakeWinBatchCtx();
+    const report = await runConnectivityProbe(getProductProfile("teamviewer-remote"), ctx as any);
+    expect(commands.filter((c) => c.includes("__DNS__")).length).toBe(1);
+    expect(commands.filter((c) => c.includes("__TCP__")).length).toBe(1);
+    expect(commands.filter((c) => c.includes("__HTTPS__")).length).toBe(1);
+    // teamviewer-remote has 12 TCP endpoint/port pairs — all must be reported
+    // from that single batched call, not 12 separate SSH connections.
+    const allTcp = [...report.tcp5938, ...(report.tcpExtra ?? [])];
+    expect(allTcp.length).toBeGreaterThanOrEqual(12);
+    expect(allTcp.every((t) => t.ok)).toBe(true);
+    expect(report.https.ok).toBe(true);
+    expect(report.https.status).toBe(200);
+  });
+
+  it("never emits the misleading 'curl failed' string on Windows", async () => {
+    const { ctx, commands } = fakeWinBatchCtx();
+    await runConnectivityProbe(getProductProfile("teamviewer-remote"), ctx as any);
+    expect(commands.some((c) => /curl/i.test(c))).toBe(false);
+  });
+});
+
+describe("Windows log discovery looks in the TeamViewer INSTALL dir", () => {
+  it("searches C:\\Program Files\\TeamViewer where TeamViewer15_Logfile.log / TVNetwork.log live", async () => {
+    const commands: string[] = [];
+    const ctx = {
+      kind: "ssh" as const,
+      os: "windows" as const,
+      description: "ssh user@win",
+      async runShell(command: string) {
+        commands.push(command);
+        return { stdout: "", stderr: "", exitCode: 0, ms: 1 };
+      },
+      async readFile() { return ""; },
+      async listDir() { return []; },
+      async pathExists() { return false; }
+    };
+    await runLogProbe(getProductProfile("teamviewer-remote"), ctx as any);
+    expect(commands.some((c) => c.includes("ProgramFiles\\TeamViewer"))).toBe(true);
+    expect(commands.some((c) => c.includes("LOCALAPPDATA\\TeamViewer"))).toBe(true);
+  });
+});
+
+describe("TeamViewer log file pattern matches the real Windows log names", () => {
+  const pat = getProductProfile("teamviewer-remote").logFilePattern;
+  it("matches TeamViewer15_Logfile.log and TVNetwork.log", () => {
+    expect(pat.test("TeamViewer15_Logfile.log")).toBe(true);
+    expect(pat.test("TeamViewer15_Hooks.log")).toBe(true);
+    expect(pat.test("TVNetwork.log")).toBe(true);
+  });
+  it("rejects the LevelDB / browser-control noise under %LOCALAPPDATA%", () => {
+    expect(pat.test("000003.log")).toBe(false);
+    expect(pat.test("favorites_diagnostic.log")).toBe(false);
+  });
+});
+
+describe("filterRootCausesAgainstEvidence drops management-plane misattributions when the backbone is healthy", () => {
+  it("drops 'endpoint unreachable' / 'Web API unreachable' for webapi when DNS + 5938 are fully OK", () => {
+    const evidence = [
+      "DNS resolved 6/6 TeamViewer hosts from 192.168.1.104",
+      "TCP 5938 reachability: 3/3 routers OK",
+      "TeamViewer Remote endpoint TCP reachability: 9/9 OK"
+    ];
+    const roots = [
+      { title: "TeamViewer Remote endpoint unreachable", score: 0.8, rationale: "Cannot reach webapi.teamviewer.com:443" },
+      { title: "TeamViewer Web API unreachable over HTTPS", score: 0.7, rationale: "request timed out" }
+    ];
+    const out = filterRootCausesAgainstEvidence(roots, evidence);
+    expect(out).toHaveLength(0);
+  });
+
+  it("KEEPS the endpoint-unreachable cause when port 5938 is actually blocked", () => {
+    const evidence = [
+      "DNS resolved 6/6 TeamViewer hosts from 192.168.1.104",
+      "TCP 5938 reachability: 0/3 routers OK",
+      "TCP 5938 blocked for: router1.teamviewer.com (timeout)"
+    ];
+    const roots = [
+      { title: "TeamViewer Remote endpoint unreachable", score: 0.8, rationale: "Cannot reach webapi.teamviewer.com:443" }
+    ];
+    const out = filterRootCausesAgainstEvidence(roots, evidence);
+    expect(out).toHaveLength(1);
+  });
+
+  it("KEEPS the endpoint-unreachable cause when a session host (router) is also blocked", () => {
+    const evidence = [
+      "DNS resolved 6/6 TeamViewer hosts from 192.168.1.104",
+      "TCP 5938 reachability: 3/3 routers OK"
+    ];
+    const roots = [
+      {
+        title: "TeamViewer Remote endpoint unreachable",
+        score: 0.8,
+        rationale: "Cannot reach router1.teamviewer.com:443, webapi.teamviewer.com:443"
+      }
+    ];
+    const out = filterRootCausesAgainstEvidence(roots, evidence);
+    expect(out).toHaveLength(1);
+  });
+});
+
+describe("Windows endpoint-health probe tolerates noisy SSH exit codes and maps service enums", () => {
+  // Get-Service over SSH returns exit code 1 whenever ANY requested name is
+  // absent (e.g. "TeamViewer_Service" is a process, not a service), yet the
+  // JSON for services that DO exist is still emitted. The probe must parse it
+  // and map the numeric Status/StartType enums to human-readable labels.
+  function fakeWinHealthCtx() {
+    const ctx = {
+      kind: "ssh" as const,
+      os: "windows" as const,
+      description: "ssh user@win",
+      async runShell(command: string) {
+        if (command.includes("Get-Service")) {
+          // exit code 1, but valid single-object JSON for the one real service
+          return {
+            stdout: '{"Name":"TeamViewer","Status":4,"StartType":2}',
+            stderr: "",
+            exitCode: 1,
+            ms: 1
+          };
+        }
+        if (command.includes("Get-Process")) {
+          return { stdout: "TeamViewer\nTeamViewer_Service\ntv_w32\ntv_x64", stderr: "", exitCode: 1, ms: 1 };
+        }
+        if (command.includes("Get-ItemProperty")) {
+          return { stdout: '{"Version":"15.78.4","ClientID":1637297536}', stderr: "", exitCode: 1, ms: 1 };
+        }
+        // host-info / anything else
+        return { stdout: "", stderr: "", exitCode: 0, ms: 1 };
+      },
+      async readFile() { return ""; },
+      async listDir() { return []; },
+      async pathExists() { return false; }
+    };
+    return ctx;
+  }
+
+  it("reports the TeamViewer service even when Get-Service exits non-zero, with a 'Running' label", async () => {
+    const report = await runEndpointHealthProbe(getProductProfile("teamviewer-remote"), fakeWinHealthCtx() as any);
+    const tv = report.services.find((s) => s.name === "TeamViewer");
+    expect(tv).toBeDefined();
+    expect(tv?.status).toBe("Running");
+    expect(tv?.startType).toBe("Automatic");
+  });
+
+  it("still parses processes and registry version/clientId despite exit code 1", async () => {
+    const report = await runEndpointHealthProbe(getProductProfile("teamviewer-remote"), fakeWinHealthCtx() as any);
+    expect(report.processes).toContain("TeamViewer");
+    expect(report.processes).toContain("tv_x64");
+    expect(report.installedVersion).toBe("15.78.4");
+    expect(report.clientId).toBe("1637297536");
+  });
+});
+
+describe("Windows log discovery emits a REAL tab delimiter (not single-quoted backtick-t)", () => {
+  it("formats size/path pairs with [char]9 so parseSizePathPairs can split them", async () => {
+    const commands: string[] = [];
+    const ctx = {
+      kind: "ssh" as const,
+      os: "windows" as const,
+      description: "ssh user@win",
+      async runShell(command: string) {
+        commands.push(command);
+        // Emulate the install-dir discovery returning a real tab between
+        // size and path (what [char]9 produces on the wire).
+        if (command.includes("[char]9")) {
+          return {
+            stdout: "1866410\tC:\\Program Files\\TeamViewer\\TeamViewer15_Logfile.log\n57462\tC:\\Program Files\\TeamViewer\\TVNetwork.log\n",
+            stderr: "",
+            exitCode: 0,
+            ms: 1
+          };
+        }
+        return { stdout: "", stderr: "", exitCode: 0, ms: 1 };
+      },
+      async readFile() { return "...connection lost...reconnecting..."; },
+      async listDir() { return []; },
+      async pathExists() { return false; }
+    };
+    const report = await runLogProbe(getProductProfile("teamviewer-remote"), ctx as any);
+    // The discovery command must use [char]9, never the broken single-quoted
+    // backtick-t form which PowerShell emits LITERALLY (no tab).
+    const disc = commands.find((c) => c.includes("Get-ChildItem"));
+    expect(disc).toBeDefined();
+    expect(disc).toContain("[char]9");
+    expect(disc).not.toContain("'{0}\\`t{1}'");
+    // And the real-tab output must yield discovered files.
+    expect(report.filesInspected.length).toBeGreaterThanOrEqual(2);
+    expect(report.filesInspected).toContain("C:\\Program Files\\TeamViewer\\TeamViewer15_Logfile.log");
+  });
+});
+

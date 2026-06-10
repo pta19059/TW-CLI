@@ -68,19 +68,44 @@ async function getWindowsServices(ctx: ExecutionContext, names: string[]): Promi
   const cmd =
     `Get-Service -Name ${psList(names)} -ErrorAction SilentlyContinue | ` +
     `Select-Object Name,Status,StartType | ConvertTo-Json -Compress`;
-  const r = await ctx.runShell(cmd, { timeoutMs: 6000 });
-  if (r.exitCode !== 0 || !r.stdout.trim()) return [];
+  const r = await ctx.runShell(cmd, { timeoutMs: 15000 });
+  // NOTE: Get-Service over SSH returns exit code 1 whenever ANY requested name
+  // doesn't exist (e.g. "TeamViewer_Service" is a PROCESS, not a service), even
+  // with -ErrorAction SilentlyContinue — but the JSON for the services that DO
+  // exist is still emitted. So parse stdout regardless of exit code; only bail
+  // when stdout is genuinely empty.
+  if (!r.stdout.trim()) return [];
   try {
     const parsed: unknown = JSON.parse(r.stdout);
     const arr = Array.isArray(parsed) ? parsed : [parsed];
     return arr.map((s: any) => ({
       name: String(s?.Name ?? ""),
-      status: s?.Status !== undefined ? String(s.Status) : undefined,
-      startType: s?.StartType !== undefined ? String(s.StartType) : undefined
+      status: s?.Status !== undefined ? mapServiceStatus(s.Status) : undefined,
+      startType: s?.StartType !== undefined ? mapServiceStartType(s.StartType) : undefined
     }));
   } catch {
     return [];
   }
+}
+
+// Get-Service serializes Status/StartType enums as their NUMERIC value when
+// piped through ConvertTo-Json over SSH (e.g. 4 = Running). Map them back to
+// human-readable labels so the report shows "Running"/"Automatic", not "4"/"2".
+function mapServiceStatus(v: unknown): string {
+  const n = typeof v === "number" ? v : Number(v);
+  const labels: Record<number, string> = {
+    1: "Stopped", 2: "StartPending", 3: "StopPending", 4: "Running",
+    5: "ContinuePending", 6: "PausePending", 7: "Paused"
+  };
+  return Number.isFinite(n) && labels[n] ? labels[n] : String(v);
+}
+
+function mapServiceStartType(v: unknown): string {
+  const n = typeof v === "number" ? v : Number(v);
+  const labels: Record<number, string> = {
+    0: "Boot", 1: "System", 2: "Automatic", 3: "Manual", 4: "Disabled"
+  };
+  return Number.isFinite(n) && labels[n] ? labels[n] : String(v);
 }
 
 async function getWindowsProcesses(ctx: ExecutionContext, patterns: string[]): Promise<string[]> {
@@ -88,8 +113,9 @@ async function getWindowsProcesses(ctx: ExecutionContext, patterns: string[]): P
   const cmd =
     `Get-Process -Name ${psList(patterns.map((p) => `${p}*`))} -ErrorAction SilentlyContinue | ` +
     `Select-Object -ExpandProperty ProcessName | Sort-Object -Unique`;
-  const r = await ctx.runShell(cmd, { timeoutMs: 6000 });
-  if (r.exitCode !== 0) return [];
+  const r = await ctx.runShell(cmd, { timeoutMs: 15000 });
+  // Same as services: a missing process name yields exit code 1 but valid
+  // stdout for the ones that matched — parse regardless of exit code.
   return r.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
 }
 
@@ -97,8 +123,10 @@ async function getWindowsRegistry(ctx: ExecutionContext): Promise<{ version?: st
   const cmd =
     `$paths=@('HKLM:\\SOFTWARE\\TeamViewer','HKLM:\\SOFTWARE\\WOW6432Node\\TeamViewer');` +
     `foreach($p in $paths){ if(Test-Path $p){ Get-ItemProperty $p | Select-Object Version,ClientID | ConvertTo-Json -Compress; break } }`;
-  const r = await ctx.runShell(cmd, { timeoutMs: 6000 });
-  if (r.exitCode !== 0 || !r.stdout.trim()) return {};
+  const r = await ctx.runShell(cmd, { timeoutMs: 15000 });
+  // Tolerate a non-zero exit code as long as JSON was produced (consistent
+  // with the services/processes probes — SSH PowerShell exit codes are noisy).
+  if (!r.stdout.trim()) return {};
   try {
     const parsed: any = JSON.parse(r.stdout);
     return {
@@ -259,7 +287,7 @@ async function gatherHostInfoRemote(ctx: ExecutionContext): Promise<HostInfo> {
       `$free=[int]($o.FreePhysicalMemory/1024);` +
       `$total=[int]($o.TotalVisibleMemorySize/1024);` +
       `"$($env:COMPUTERNAME)|$([System.Environment]::OSVersion.Version.ToString())|$up|$free|$total"`;
-    const r = await ctx.runShell(cmd, { timeoutMs: 6000 });
+    const r = await ctx.runShell(cmd, { timeoutMs: 15000 });
     const parts = (r.stdout || "").trim().split("|");
     if (parts.length >= 5) {
       hostname = parts[0] || "remote";

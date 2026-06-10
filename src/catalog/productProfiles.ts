@@ -109,7 +109,9 @@ export const PRODUCT_PROFILES: Record<ProductKey, ProductDiagnosticProfile> = {
     endpoints: [...BACKBONE],
     services: CORE_SERVICES,
     processes: CORE_PROCESSES,
-    logFilePattern: /teamviewer.*\.log$/i,
+    // Matches TeamViewer15_Logfile.log / TeamViewer15_Hooks.log AND TVNetwork.log
+    // (the connection/keepalive network log — the most relevant for "drops").
+    logFilePattern: /^(teamviewer|tvnetwork).*\.log$/i,
     webApiPaths: ["/account", "/devices"],
     notes: "Core remote-access client. Depends on the router backbone (TCP 5938, 443 fallback)."
   },
@@ -130,7 +132,7 @@ export const PRODUCT_PROFILES: Record<ProductKey, ProductDiagnosticProfile> = {
     ],
     services: CORE_SERVICES,
     processes: CORE_PROCESSES,
-    logFilePattern: /teamviewer.*\.log$/i,
+    logFilePattern: /^(teamviewer|tvnetwork).*\.log$/i,
     // Tensor adds enterprise mgmt: users, managed groups, policies (conditional access).
     // Paths verified against the official Web API v1 OpenAPI spec.
     webApiPaths: ["/account", "/devices", "/users", "/managed/groups"],
@@ -179,7 +181,7 @@ export const PRODUCT_PROFILES: Record<ProductKey, ProductDiagnosticProfile> = {
     // Supporter uses the desktop/web client; customer uses the mobile app.
     services: { win32: ["TeamViewer", "TeamViewer_Service"], linux: [], darwin: [] },
     processes: { win32: ["TeamViewer"], linux: [], darwin: ["TeamViewer"] },
-    logFilePattern: /(teamviewer|assist[-_]?ar|pilot).*\.log$/i,
+    logFilePattern: /^(teamviewer|tvnetwork|assist[-_]?ar|pilot).*\.log$/i,
     webApiPaths: ["/account"],
     notes: "AR remote support (formerly Pilot). Uses the session backbone; the field side is the mobile app, the supporter side the desktop/web client."
   },
@@ -209,7 +211,7 @@ export const PRODUCT_PROFILES: Record<ProductKey, ProductDiagnosticProfile> = {
       linux: ["teamviewerd"],
       darwin: ["TeamViewer"]
     },
-    logFilePattern: /(teamviewer|monitoring|itbrain|remotemanagement).*\.log$/i,
+    logFilePattern: /^(teamviewer|tvnetwork|monitoring|itbrain|remotemanagement).*\.log$/i,
     webApiPaths: ["/account", "/devices"],
     notes: "RMM suite (Monitoring, Asset Management, Endpoint Protection, Patch, Backup). Adds a monitoring agent and a data-ingest endpoint."
   },

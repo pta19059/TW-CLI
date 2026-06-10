@@ -19,7 +19,12 @@ are grounded against the official Knowledge Base via a local hybrid RAG index.
   log clustering, optional TeamViewer Web API checks. Over SSH the probes are emitted in the
   *target's* native shell — POSIX (`getent`/`dig`, `nc`, `curl`) on Linux/macOS and native PowerShell
   (`[System.Net.Dns]`, `TcpClient`, `HttpWebRequest` + CIM host metrics) on Windows — so reachability,
-  uptime and memory are measured from the host itself regardless of its OS.
+  uptime and memory are measured from the host itself regardless of its OS. On Windows the DNS, TCP and
+  HTTPS checks are **batched into one PowerShell round-trip each** (instead of one SSH connection per
+  endpoint) to avoid the 3–5 s per-call cold-start storm that previously caused flaky false
+  "unreachable" results. Service status / start-type enums are mapped to human labels
+  (`Running`/`Automatic`), and `Get-Service`/`Get-Process` output is parsed even when the remote shell
+  returns a non-zero exit code for an unrelated missing name.
 - **Cross-OS standby/power-management correlation** — the log probe detects an idle machine that
   sleeps and drops the connection on *every* supported OS, then demotes the post-wake
   RetryHandle/RCommand error burst to reconnection noise instead of misattributing it:
