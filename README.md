@@ -16,7 +16,10 @@ are grounded against the official Knowledge Base via a local hybrid RAG index.
 - **Local & private by design** — every LLM call is loopback-only Foundry Local. No telemetry,
   no cloud, no fallback.
 - **Real probes, not canned data** — DNS / TCP `5938` / HTTPS, services & processes (Win/Linux/macOS),
-  log clustering, optional TeamViewer Web API checks.
+  log clustering, optional TeamViewer Web API checks. Over SSH the probes are emitted in the
+  *target's* native shell — POSIX (`getent`/`dig`, `nc`, `curl`) on Linux/macOS and native PowerShell
+  (`[System.Net.Dns]`, `TcpClient`, `HttpWebRequest` + CIM host metrics) on Windows — so reachability,
+  uptime and memory are measured from the host itself regardless of its OS.
 - **Cross-OS standby/power-management correlation** — the log probe detects an idle machine that
   sleeps and drops the connection on *every* supported OS, then demotes the post-wake
   RetryHandle/RCommand error burst to reconnection noise instead of misattributing it:

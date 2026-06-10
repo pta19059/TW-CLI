@@ -224,8 +224,13 @@ export class SshContext implements ExecutionContext {
    * Two-stage probe so Windows OpenSSH targets (where `uname` is not
    * recognised by cmd.exe / pwsh) are still classified correctly:
    *   1. POSIX probe: `uname -s` — succeeds on Linux/macOS.
-   *   2. Fallback Windows probe: `powershell -NoProfile -Command "$PSVersionTable.OS"`
-   *      — succeeds on any Windows host with PowerShell (built-in since W7).
+   *   2. Fallback Windows probe: `powershell … "[System.Environment]::OSVersion.VersionString"`
+   *      — prints e.g. "Microsoft Windows NT 10.0.19045.0" on EVERY Windows
+   *      PowerShell (5.1 built-in) *and* PowerShell 7+. NOTE: do NOT use
+   *      `$PSVersionTable.OS` here — that property only exists on PowerShell
+   *      Core 6+, so it returns EMPTY on the in-box Windows PowerShell 5.1 that
+   *      ships with Windows 10/11/Server, leaving the host misdetected as
+   *      "unknown" and the POSIX command set wrongly sent to cmd.exe.
    */
   static async connect(opts: SshConnectionOptions): Promise<SshContext> {
     let os: RemoteOs = "unknown";
@@ -240,9 +245,11 @@ export class SshContext implements ExecutionContext {
 
     if (os === "unknown") {
       // Try PowerShell. Works whether the SSH default shell is cmd.exe or pwsh.
+      // OSVersion.VersionString is present on Windows PowerShell 5.1 AND 7+,
+      // unlike $PSVersionTable.OS which is PS-Core-only (empty on 5.1).
       const win = await SshContext.execOnce(
         opts,
-        `powershell -NoLogo -NoProfile -NonInteractive -Command "$PSVersionTable.OS"`,
+        `powershell -NoLogo -NoProfile -NonInteractive -Command "[System.Environment]::OSVersion.VersionString"`,
         8000
       );
       const winOut = (win.stdout + win.stderr).toLowerCase();

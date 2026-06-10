@@ -6,6 +6,7 @@ import {
   fromLogs
 } from "../src/mastra/tools/specialistTools.js";
 import type { ConnectivityReport } from "../src/probes/connectivity.js";
+import { probeDnsHost, probeTcpHost } from "../src/probes/connectivity.js";
 import type { EndpointHealthReport } from "../src/probes/endpointHealth.js";
 import type { LogProbeReport } from "../src/probes/logs.js";
 import type { AuthProbeReport } from "../src/probes/authPolicy.js";
@@ -655,5 +656,52 @@ describe("log normalize()", () => {
     const sig = normalize("payload contains tag(99:158b) somewhere");
     expect(sig).toContain("(99:158b)");
     expect(sig).not.toMatch(/<time>[0-9a-f]/);
+  });
+});
+
+describe("remote connectivity probes are OS-aware (Windows)", () => {
+  // Minimal fake context that records the command it was asked to run and
+  // returns a canned ShellResult. ctx.os drives which command set the probe
+  // emits, exactly like a real SshContext to a Windows host.
+  function fakeWinCtx(stdout: string) {
+    const commands: string[] = [];
+    const ctx = {
+      kind: "ssh" as const,
+      os: "windows" as const,
+      description: "ssh user@win",
+      async runShell(command: string) {
+        commands.push(command);
+        return { stdout, stderr: "", exitCode: 0, ms: 1 };
+      },
+      async readFile() { return ""; },
+      async listDir() { return []; },
+      async pathExists() { return false; }
+    };
+    return { ctx, commands };
+  }
+
+  it("resolves DNS via .NET [System.Net.Dns], never POSIX getent/dig", async () => {
+    const { ctx, commands } = fakeWinCtx("93.184.216.34");
+    const res = await probeDnsHost("login.teamviewer.com", ctx as any);
+    expect(commands[0]).toContain("System.Net.Dns");
+    expect(commands[0]).not.toContain("getent");
+    expect(commands[0]).not.toContain("dig ");
+    expect(res.ok).toBe(true);
+    expect(res.addresses).toContain("93.184.216.34");
+  });
+
+  it("probes TCP via a .NET TcpClient and __ok__ sentinel, never POSIX nc", async () => {
+    const { ctx, commands } = fakeWinCtx("__ok__");
+    const res = await probeTcpHost("router1.teamviewer.com", 5938, 3000, ctx as any);
+    expect(commands[0]).toContain("Net.Sockets.TcpClient");
+    expect(commands[0]).not.toMatch(/\bnc -z\b/);
+    expect(res.ok).toBe(true);
+  });
+
+  it("reports a TCP failure when the sentinel is __fail__", async () => {
+    const { ctx } = fakeWinCtx("connection timed out\n__fail__");
+    const res = await probeTcpHost("router1.teamviewer.com", 5938, 3000, ctx as any);
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/timed out/i);
   });
 });

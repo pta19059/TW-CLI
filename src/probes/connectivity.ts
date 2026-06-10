@@ -6,9 +6,11 @@
 // Execution model: every probe goes through an ExecutionContext.
 //   • LocalContext → uses Node's `dns.resolve4` + `net.Socket` + `fetch` (fast,
 //     no external tools required).
-//   • SshContext   → emits POSIX commands (`dig`, `nc`, `curl`) so reachability
-//     is measured from the *target's* point of view — exactly what you want
-//     when diagnosing "why can't my Mac reach the TeamViewer cloud?".
+//   • SshContext   → emits commands matched to the *target* OS so reachability
+//     is measured from the target's point of view: POSIX (`dig`/`getent`, `nc`,
+//     `curl`) for Linux/macOS, and native PowerShell (`[Net.Dns]`, `TcpClient`,
+//     `HttpWebRequest`) for Windows — exactly what you want when diagnosing
+//     "why can't my Mac/PC reach the TeamViewer cloud?".
 
 import dns from "node:dns/promises";
 import net from "node:net";
@@ -116,7 +118,9 @@ async function remoteDnsResolve(ctx: ExecutionContext, host: string): Promise<Dn
   // fall back through them so the probe works on bare images without dig.
   const safeHost = host.replace(/[^A-Za-z0-9._-]/g, "");
   const cmd =
-    ctx.os === "macos"
+    ctx.os === "windows"
+      ? `try { [System.Net.Dns]::GetHostAddresses('${safeHost}') | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.IPAddressToString } } catch { [Console]::Error.WriteLine($_.Exception.Message) }`
+      : ctx.os === "macos"
       ? `dscacheutil -q host -a name '${safeHost}' 2>/dev/null | awk '/^ip_address:/ {print $2}'`
       : `getent hosts '${safeHost}' 2>/dev/null | awk '{print $1}' || dig +short '${safeHost}' A 2>/dev/null`;
   const r = await ctx.runShell(cmd, { timeoutMs: 5000 });
@@ -134,12 +138,24 @@ async function remoteTcpProbe(ctx: ExecutionContext, host: string, port: number,
   const t0 = Date.now();
   const safeHost = host.replace(/[^A-Za-z0-9._-]/g, "");
   // On macOS `nc -G N` sets connect timeout. On Linux netcat-openbsd uses `-w N`.
-  // Try both, pick whichever the host has. `2>&1` so the error message is captured.
-  const ncCmd =
-    ctx.os === "macos"
-      ? `/usr/bin/nc -z -G 3 '${safeHost}' ${port}`
-      : `nc -z -w 3 '${safeHost}' ${port}`;
-  const r = await ctx.runShell(`${ncCmd} 2>&1 && echo __ok__ || echo __fail__`, { timeoutMs: timeoutMs + 1500 });
+  // Windows has neither nc nor a POSIX shell, so use a .NET TcpClient with an
+  // async connect + WaitOne timeout. All branches converge on the same
+  // __ok__/__fail__ sentinel the parser below expects.
+  let probeCmd: string;
+  if (ctx.os === "windows") {
+    probeCmd =
+      `$ErrorActionPreference='SilentlyContinue';$c=New-Object Net.Sockets.TcpClient;` +
+      `try{$a=$c.BeginConnect('${safeHost}',${port},$null,$null);` +
+      `if($a.AsyncWaitHandle.WaitOne(3000)){$c.EndConnect($a);'__ok__'}else{'connection timed out';'__fail__'}}` +
+      `catch{$_.Exception.Message;'__fail__'}finally{$c.Close()}`;
+  } else {
+    const ncCmd =
+      ctx.os === "macos"
+        ? `/usr/bin/nc -z -G 3 '${safeHost}' ${port}`
+        : `nc -z -w 3 '${safeHost}' ${port}`;
+    probeCmd = `${ncCmd} 2>&1 && echo __ok__ || echo __fail__`;
+  }
+  const r = await ctx.runShell(probeCmd, { timeoutMs: timeoutMs + 1500 });
   const out = (r.stdout || "").trim();
   if (out.endsWith("__ok__")) {
     return { host, port, ok: true, ms: Date.now() - t0 };
@@ -162,7 +178,27 @@ async function remoteHttpsProbe(ctx: ExecutionContext, url: string, timeoutMs = 
   //   anything else → real connectivity failure (DNS, timeout, refused)
   // Bundling stdout+stderr behind a sentinel keeps the parse robust across shells.
   const sec = Math.ceil(timeoutMs / 1000);
-  const cmd = `out=$(curl -sS -o /dev/null -w "%{http_code}" --max-time ${sec} '${safe}' 2>&1); rc=$?; printf "__TWC_RC__:%s\\n__TWC_OUT__:%s\\n" "$rc" "$out"`;
+  // Windows lacks a reliable POSIX curl under the encoded-PowerShell wrapper, so
+  // use HttpWebRequest and emit the SAME __TWC_RC__/__TWC_OUT__ sentinels the
+  // POSIX branch produces. Map WebException states to curl-equivalent exit codes
+  // (60 = trust failure, 35 = secure-channel failure) so the parser below treats
+  // them identically across operating systems.
+  let cmd: string;
+  if (ctx.os === "windows") {
+    const ms = sec * 1000;
+    cmd =
+      `[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]'Tls12,Tls11,Tls';` +
+      `try{$r=[Net.HttpWebRequest]::Create('${safe}');$r.Method='GET';$r.Timeout=${ms};$r.AllowAutoRedirect=$false;` +
+      `$resp=$r.GetResponse();$code=[int]$resp.StatusCode;$resp.Close();"__TWC_RC__:0";"__TWC_OUT__:$code"}` +
+      `catch [Net.WebException]{$we=$_.Exception;` +
+      `if($we.Response){"__TWC_RC__:0";"__TWC_OUT__:$([int]$we.Response.StatusCode)"}` +
+      `elseif($we.Status -eq 'TrustFailure'){"__TWC_RC__:60";"__TWC_OUT__:$($we.Message)"}` +
+      `elseif($we.Status -eq 'SecureChannelFailure'){"__TWC_RC__:35";"__TWC_OUT__:$($we.Message)"}` +
+      `else{"__TWC_RC__:7";"__TWC_OUT__:$($we.Message)"}}` +
+      `catch{"__TWC_RC__:7";"__TWC_OUT__:$($_.Exception.Message)"}`;
+  } else {
+    cmd = `out=$(curl -sS -o /dev/null -w "%{http_code}" --max-time ${sec} '${safe}' 2>&1); rc=$?; printf "__TWC_RC__:%s\\n__TWC_OUT__:%s\\n" "$rc" "$out"`;
+  }
   const r = await ctx.runShell(cmd, { timeoutMs: timeoutMs + 1500 });
   const combined = (r.stdout || "") + (r.stderr || "");
   const rcMatch = combined.match(/__TWC_RC__:(\d+)/);
@@ -180,7 +216,10 @@ async function remoteHttpsProbe(ctx: ExecutionContext, url: string, timeoutMs = 
     // Confirm with -k: if the server returns ANY HTTP code, it's purely a TLS
     // verification problem (server reachable, cert chain not trusted). The user
     // gets a clear, actionable message instead of a scary "failed".
+    // Skip the curl re-probe on Windows (no POSIX curl under the encoded-PowerShell
+    // wrapper) — the WebException already told us it's a trust failure.
     try {
+      if (ctx.os === "windows") throw new Error("skip-curl-on-windows");
       const insecure = await ctx.runShell(
         `curl -ksS -o /dev/null -w "%{http_code}" --max-time ${sec} '${safe}' 2>&1 || echo 000`,
         { timeoutMs: timeoutMs + 1500 }

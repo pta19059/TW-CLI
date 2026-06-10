@@ -249,6 +249,28 @@ async function gatherHostInfoRemote(ctx: ExecutionContext): Promise<HostInfo> {
   let freeMemMb = 0;
   let totalMemMb = 0;
 
+  if (ctx.os === "windows") {
+    // Windows hosts speak PowerShell, not POSIX: `hostname`/`uname`/`/proc/*`
+    // all fail there. Pull hostname, OS build, uptime and memory from CIM in a
+    // single pipe-delimited line so the parse is trivial and shell-agnostic.
+    const cmd =
+      `$o=Get-CimInstance Win32_OperatingSystem;` +
+      `$up=[int]((Get-Date) - $o.LastBootUpTime).TotalSeconds;` +
+      `$free=[int]($o.FreePhysicalMemory/1024);` +
+      `$total=[int]($o.TotalVisibleMemorySize/1024);` +
+      `"$($env:COMPUTERNAME)|$([System.Environment]::OSVersion.Version.ToString())|$up|$free|$total"`;
+    const r = await ctx.runShell(cmd, { timeoutMs: 6000 });
+    const parts = (r.stdout || "").trim().split("|");
+    if (parts.length >= 5) {
+      hostname = parts[0] || "remote";
+      osRelease = parts[1] || "";
+      uptimeSec = parseInt(parts[2], 10) || 0;
+      freeMemMb = parseInt(parts[3], 10) || 0;
+      totalMemMb = parseInt(parts[4], 10) || 0;
+    }
+    return { hostname, osRelease, uptimeSec, freeMemMb, totalMemMb };
+  }
+
   const hn = await ctx.runShell("hostname 2>/dev/null", { timeoutMs: 4000 });
   if (hn.exitCode === 0 && hn.stdout) hostname = hn.stdout.trim().split(/\s+/)[0] ?? "remote";
 

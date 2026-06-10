@@ -8,6 +8,9 @@ dist-cjs/
 # Runtime data (jobs, logs, history, config)
 .twc-data/
 
+# Local scratch run captures
+.last-run*.txt
+
 # Secrets / local env
 .env
 .env.local
