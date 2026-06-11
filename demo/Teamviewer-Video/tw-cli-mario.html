@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TW-CLI · Super Tech Bros</title>
+<style>
+  :root { --tv:#0E72ED; }
+  * { box-sizing: border-box; }
+  html,body { margin:0; height:100%; background:#11131a; color:#e8eefc;
+    font-family:'Segoe UI',system-ui,sans-serif; }
+  .wrap { min-height:100%; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:14px; padding:18px; }
+  h1 { margin:0; font-size:20px; letter-spacing:.5px; font-weight:700; }
+  h1 span { color:var(--tv); }
+  .sub { margin:0; font-size:12px; opacity:.65; }
+  .stage { position:relative; border-radius:12px; overflow:hidden;
+    box-shadow:0 18px 50px rgba(0,0,0,.55), 0 0 0 3px #1d2230;
+    background:#000; }
+  canvas { display:block; width:960px; max-width:92vw; height:auto; image-rendering:pixelated; }
+  .bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:center; }
+  button { cursor:pointer; border:none; border-radius:10px; padding:10px 18px;
+    font-weight:700; font-size:14px; color:#fff; background:var(--tv);
+    transition:transform .08s ease, filter .15s ease; }
+  button:hover { filter:brightness(1.12); }
+  button:active { transform:translateY(1px) scale(.98); }
+  button.ghost { background:#262c3b; }
+  label.chk { display:flex; align-items:center; gap:7px; font-size:13px; opacity:.85;
+    background:#1b2030; padding:8px 12px; border-radius:10px; user-select:none; }
+  .tag { font-size:11px; opacity:.5; }
+  a.dl { font-size:13px; color:var(--tv); text-decoration:none; font-weight:700; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><span>TW-CLI</span> · Super Tech Bros <span style="opacity:.5">🍄</span></h1>
+  <p class="sub">Mario hits the blocks to unlock the tech stack, then captures the TeamViewer logo at the flag.</p>
+  <div class="stage">
+    <canvas id="game" width="960" height="540"></canvas>
+  </div>
+  <div class="bar">
+    <button id="play">▶ Play</button>
+    <button id="replay" class="ghost">↻ Replay</button>
+    <button id="mute" class="ghost">🔊 Audio: ON</button>
+  </div>
+</div>
+<script>
+(() => {
+"use strict";
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const W = cv.width, H = cv.height;
+
+// ---------- AUDIO (retro synth) ----------
+let AC = null, muted = false;
+function audio(){ if(!AC){ try{ AC = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } return AC; }
+function blip(freq, dur, type='square', vol=0.12, glide=0){
+  if(muted) return; const ac=audio(); if(!ac) return;
+  const o=ac.createOscillator(), g=ac.createGain();
+  o.type=type; o.frequency.value=freq;
+  if(glide) o.frequency.exponentialRampToValueAtTime(Math.max(40,freq*glide), ac.currentTime+dur);
+  g.gain.setValueAtTime(vol, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime+dur);
+  o.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime+dur);
+}
+const sJump  = ()=> blip(520, .18, 'square', .10, 2.4);
+const sCoin  = ()=>{ blip(988,.09,'square',.11); setTimeout(()=>blip(1319,.16,'square',.11),70); };
+const sBump  = ()=> blip(160,.09,'square',.10,.6);
+const sFlag  = ()=>{ const n=[660,784,988,1319]; n.forEach((f,i)=>setTimeout(()=>blip(f,.18,'triangle',.12),i*120)); };
+const sWin   = ()=>{ const n=[523,659,784,1047,784,1047,1319]; n.forEach((f,i)=>setTimeout(()=>blip(f,.22,'square',.12),i*150)); };
+
+// ---------- TECH STACK (i blocchi "?") ----------
+const TECH = [
+  { name:'TypeScript',     sub:'ESM · strict · Node 22', color:'#3178c6' },
+  { name:'Node.js',        sub:'CLI runtime',            color:'#3c873a' },
+  { name:'.NET 9',         sub:'twc.exe launcher',       color:'#7c3aed' },
+  { name:'Foundry Local',  sub:'LLM · 100% local',       color:'#0E72ED' },
+  { name:'Mastra',         sub:'agents + workflow',      color:'#8b5cf6' },
+  { name:'LanceDB',        sub:'vector store',           color:'#00b3a4' },
+  { name:'ONNX Runtime',   sub:'on-device embeddings',   color:'#f5a623' },
+  { name:'Hybrid RAG',     sub:'keyword + vectors + RRF',color:'#e0245e' },
+  { name:'SSH Probes',     sub:'native DNS/TCP/HTTPS',   color:'#16a34a' },
+  { name:'PowerShell',     sub:'Windows probes',         color:'#2b579a' },
+  { name:'Vitest',         sub:'197 tests green',        color:'#6da33e' },
+];
+
+// ---------- LEVEL LAYOUT ----------
+const GROUND = 460;           // y top of ground
+const VX = 3.2;               // hero run speed
+const GRAV = 0.6, JUMP = -12; // physics
+const B0 = 470, BSPACE = 250; // first block x, spacing
+const BLOCK = TECH.map((t,i)=>({ x:B0+i*BSPACE, y:300, w:46, h:46, hit:false, sched:false,
+  bounce:0, tech:t }));
+const FLAG_X = B0 + TECH.length*BSPACE + 120;
+const LEVEL_W = FLAG_X + 360;
+
+// ---------- STATE ----------
+let phase, t, hero, cam, badges, collected, particles, fireworks, flag, winT, recState;
+function reset(){
+  phase='intro'; t=0;
+  hero = { x:80, y:GROUND-44, w:32, h:44, vy:0, onGround:true, face:1, run:0, pose:'idle', slide:0 };
+  cam = 0;
+  badges = [];          // floating world-space tech labels
+  collected = [];       // HUD entries (reveal animation)
+  particles = [];
+  fireworks = [];
+  flag = { grabbed:false, slideDone:false, logoY:118, captured:false, capScale:1, capX:0, capY:0, flash:0 };
+  winT = 0;
+  // CRITICAL: BLOCK is a module-level array built once — its hit/sched/bounce
+  // flags MUST be cleared on every (re)start or Replay shows already-emptied blocks.
+  BLOCK.forEach(b=>{ b.hit=false; b.sched=false; b.bounce=0; });
+}
+reset();
+
+// ---------- INPUT ----------
+const playBtn=document.getElementById('play');
+const replayBtn=document.getElementById('replay');
+const muteBtn=document.getElementById('mute');
+
+playBtn.onclick = ()=>{ audio() && audio().resume && audio().resume(); reset(); phase='intro'; };
+replayBtn.onclick = ()=>{ reset(); phase='intro'; };
+muteBtn.onclick = ()=>{ muted=!muted; muteBtn.textContent = muted?'🔇 Audio: OFF':'🔊 Audio: ON'; };
+
+// ---------- MEDIA RECORDER removed (no .webm capture UI) ----------
+function stopRec(){ /* no-op */ }
+
+// ================= DRAW HELPERS =================
+function rrect(x,y,w,h,r){ ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+
+// TeamViewer logo — the real mark: a solid disc with a navy-blue
+// double-headed horizontal arrow (↔) centred inside it.
+function drawTVLogo(cx, cy, R, alpha=1, discColor='#ffffff'){
+  ctx.save(); ctx.globalAlpha=alpha;
+  const NAVY='#0E2A6B';        // TeamViewer deep navy for the arrow
+  // disc
+  ctx.fillStyle=discColor;
+  ctx.beginPath(); ctx.arc(cx,cy,R,0,Math.PI*2); ctx.fill();
+  // double-headed horizontal arrow
+  ctx.fillStyle=NAVY;
+  const shaftHalf = R*0.46;    // half-length of the shaft (to head base)
+  const shaftH    = R*0.22;    // shaft thickness
+  const headLen   = R*0.30;    // arrowhead length
+  const headHalf  = R*0.42;    // arrowhead half-height
+  const tip       = R*0.62;    // x of the arrow tips
+  // shaft
+  ctx.fillRect(cx-shaftHalf, cy-shaftH/2, shaftHalf*2, shaftH);
+  // right head
+  ctx.beginPath();
+  ctx.moveTo(cx+tip, cy);
+  ctx.lineTo(cx+tip-headLen, cy-headHalf);
+  ctx.lineTo(cx+tip-headLen, cy+headHalf);
+  ctx.closePath(); ctx.fill();
+  // left head
+  ctx.beginPath();
+  ctx.moveTo(cx-tip, cy);
+  ctx.lineTo(cx-tip+headLen, cy-headHalf);
+  ctx.lineTo(cx-tip+headLen, cy+headHalf);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+// pixel plumber hero
+function drawHero(h){
+  const x=Math.round(h.x), y=Math.round(h.y);
+  const RED='#e52521', RED2='#b81d1a', SKIN='#ffc191', BLUE='#2a5fd8',
+        BRN='#6b3410', DRK='#2a1a0e', YEL='#ffd400', WHT='#fff';
+  const r=(px,py,pw,ph,c)=>{ ctx.fillStyle=c; ctx.fillRect(x+px,y+py,pw,ph); };
+  const face = h.face; // 1 right, -1 left
+  ctx.save();
+  if(face<0){ ctx.translate(x*2+h.w,0); ctx.scale(-1,1); }
+  const X = face<0 ? (px)=>px : (px)=>px; // mirrored via transform
+  // cap
+  r(6,0,22,7,RED); r(2,5,30,5,RED); r(0,9,16,3,RED2);
+  // face
+  r(8,8,18,15,SKIN);
+  // sideburn / hair
+  r(6,9,4,11,DRK);
+  // eye
+  r(18,11,3,5,DRK);
+  // nose
+  r(24,13,5,5,SKIN); r(25,14,4,4,'#f0a878');
+  // mustache
+  r(8,19,18,4,DRK); r(22,18,7,3,DRK);
+  // shirt (red)
+  r(4,23,26,9,RED);
+  // overalls torso
+  r(8,24,14,16,BLUE);
+  r(7,24,3,8,BLUE); r(20,24,3,8,BLUE); // straps
+  r(11,28,3,3,YEL); r(17,28,3,3,YEL);  // buttons
+  // arms
+  r(1,25,5,9,RED); r(26,25,6,9,RED);
+  r(1,32,5,4,SKIN); r(27,32,5,4,SKIN); // hands
+  // legs + shoes (run animation)
+  let l1,l2;
+  if(h.pose==='jump'){ l1=-2; l2=2; }
+  else if(h.pose==='run'){ const s=Math.sin(h.run*0.45); l1=s>0?3:-1; l2=s>0?-1:3; }
+  else { l1=0; l2=0; }
+  r(8,40,7,3+ (l1>0?l1:0),BLUE); r(17,40,7,3+(l2>0?l2:0),BLUE);
+  r(6,42+ (l1<0?0:l1),9,3,BRN);   // shoe L
+  r(16,42+ (l2<0?0:l2),9,3,BRN);  // shoe R
+  ctx.restore();
+}
+
+function drawBlock(b){
+  if(b.hit){
+    // emptied brick
+    ctx.fillStyle='#9a5a23';
+    rrect(b.x, b.y - b.bounce, b.w, b.h, 6); ctx.fill();
+    ctx.fillStyle='#6e3d14';
+    ctx.fillRect(b.x+5, b.y - b.bounce+5, b.w-10, 4);
+    return;
+  }
+  const yy=b.y - b.bounce;
+  // gold "?" block
+  const g=ctx.createLinearGradient(b.x,yy,b.x,yy+b.h);
+  g.addColorStop(0,'#ffd34d'); g.addColorStop(1,'#f2a51c');
+  ctx.fillStyle=g; rrect(b.x,yy,b.w,b.h,7); ctx.fill();
+  ctx.strokeStyle='#a96b10'; ctx.lineWidth=3; rrect(b.x+1.5,yy+1.5,b.w-3,b.h-3,6); ctx.stroke();
+  // rivets
+  ctx.fillStyle='#fff3c4';
+  [[6,6],[b.w-9,6],[6,b.h-9],[b.w-9,b.h-9]].forEach(p=>ctx.fillRect(b.x+p[0],yy+p[1],3,3));
+  // ? mark
+  ctx.fillStyle='#7a4a08'; ctx.font='bold 28px Segoe UI'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('?', b.x+b.w/2, yy+b.h/2+2);
+}
+
+function drawGroundAndBg(){
+  // sky
+  const sky=ctx.createLinearGradient(0,0,0,H);
+  sky.addColorStop(0,'#5fb0ff'); sky.addColorStop(.7,'#9fd0ff'); sky.addColorStop(1,'#cde9ff');
+  ctx.fillStyle=sky; ctx.fillRect(0,0,W,H);
+  // parallax hills
+  ctx.fillStyle='#7ec85a';
+  for(let i=0;i<8;i++){ const hx=(i*420 - cam*0.4)%(LEVEL_W) ; drawHill(hx,GROUND); drawHill(hx+LEVEL_W,GROUND);} 
+  // clouds (some carry a small TeamViewer logo as Mario runs)
+  for(let i=0;i<10;i++){
+    const cxp=(i*330 - cam*0.25);
+    const cxw=((cxp%2400)+2400)%2400, cyw=70+ (i%3)*44;
+    ctx.fillStyle='rgba(255,255,255,.92)';
+    drawCloud(cxw, cyw);
+    if(i%2===0){ drawTVLogo(cxw+24, cyw+2, 15, .9); } // logo nested in the cloud
+  }
+  // ground
+  const gy=GROUND;
+  ctx.fillStyle='#caa15a'; ctx.fillRect(0,gy,W,H-gy);
+  ctx.fillStyle='#3fae3f'; ctx.fillRect(0,gy,W,12);
+  ctx.fillStyle='#2e8b2e'; ctx.fillRect(0,gy+12,W,4);
+  // brick texture
+  ctx.fillStyle='rgba(0,0,0,.08)';
+  for(let bx=-(cam% 40); bx<W; bx+=40){ for(let by=gy+18; by<H; by+=24){ ctx.fillRect(bx,by,38,2); ctx.fillRect(bx,by,2,22);} }
+}
+function drawHill(hx,gy){ ctx.beginPath(); ctx.moveTo(hx-70,gy); ctx.quadraticCurveTo(hx,gy-95,hx+70,gy); ctx.closePath(); ctx.fill(); }
+function drawCloud(x,y){ ctx.beginPath();
+  ctx.arc(x,y,20,0,7); ctx.arc(x+22,y-6,26,0,7); ctx.arc(x+50,y,22,0,7); ctx.arc(x+24,y+10,24,0,7);
+  ctx.fill(); }
+
+function drawFlag(){
+  const px=FLAG_X;
+  // base block
+  ctx.fillStyle='#2a2f3d'; rrect(px-26,GROUND-26,52,26,6); ctx.fill();
+  // pole
+  ctx.fillStyle='#cfd6e6'; ctx.fillRect(px-3,120,6,GROUND-120);
+  ctx.fillStyle='#9aa3b8'; ctx.fillRect(px+1,120,2,GROUND-120);
+  // top ball
+  ctx.fillStyle='#0E72ED'; ctx.beginPath(); ctx.arc(px,116,9,0,7); ctx.fill();
+  // flag triangle
+  ctx.fillStyle='#0E72ED';
+  const fy=140;
+  ctx.beginPath(); ctx.moveTo(px-2,fy); ctx.lineTo(px-66,fy+18); ctx.lineTo(px-2,fy+36); ctx.closePath(); ctx.fill();
+  ctx.fillStyle='#fff'; ctx.font='bold 13px Segoe UI'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('TW', px-30, fy+18);
+  // captured logo riding the pole (until captured)
+  if(!flag.captured){ drawTVLogo(px, flag.logoY, 22); }
+}
+
+// ================= HUD =================
+// Compact translucent TOP BAR so it never covers the gameplay area.
+// Collected techs render as small chips that wrap onto a 2nd row if needed;
+// the most-recent chip pulses briefly. A counter sits on the right.
+function drawHUD(){
+  const barH = 34, x=10, y=8, w=W-20;
+  ctx.save();
+  ctx.fillStyle='rgba(10,14,24,.55)'; rrect(x,y,w,barH,10); ctx.fill();
+  ctx.strokeStyle='rgba(14,114,237,.35)'; ctx.lineWidth=1.5; rrect(x,y,w,barH,10); ctx.stroke();
+
+  // label
+  ctx.textAlign='left'; ctx.textBaseline='middle';
+  ctx.fillStyle='#cfe0ff'; ctx.font='bold 13px Segoe UI';
+  const labelW = 96;
+  ctx.fillText('🛠 STACK', x+12, y+barH/2);
+
+  // counter chip on the right
+  const cntTxt = '🧩 '+collected.length+'/'+TECH.length;
+  ctx.font='bold 13px Segoe UI';
+  const cntW = ctx.measureText(cntTxt).width + 20;
+  ctx.fillStyle='rgba(255,211,77,.18)'; rrect(x+w-cntW-8, y+6, cntW, barH-12, 8); ctx.fill();
+  ctx.fillStyle='#ffd34d'; ctx.fillText(cntTxt, x+w-cntW+2, y+barH/2);
+
+  // chips area (between label and counter) — clipped horizontal ticker so the
+  // bar stays one compact row; it auto-scrolls left to keep the newest visible.
+  const chipX0 = x+12+labelW, chipXmax = x+w-cntW-18;
+  const areaW = chipXmax - chipX0;
+  const chipH = 22;
+  ctx.font='bold 12px Segoe UI';
+  // measure total width
+  let total=0; const ws=collected.map(c=>{ const tw=ctx.measureText(c.tech.name).width+24; total+=tw+7; return tw; });
+  const offset = Math.max(0, total - areaW);
+  ctx.save();
+  rrect(chipX0-4, y+5, areaW+8, barH-10, 7); ctx.clip();
+  let gx = chipX0 - offset, gy = y+barH/2;
+  collected.forEach((c,i)=>{
+    const tw=ws[i];
+    const ease=Math.min(1,c.appear/12);
+    const pulse = c.appear<20 ? 1+Math.sin(c.appear*0.5)*0.06 : 1;
+    ctx.save();
+    ctx.globalAlpha=ease;
+    ctx.translate(gx+tw/2, gy); ctx.scale(pulse,pulse); ctx.translate(-(gx+tw/2), -gy);
+    ctx.fillStyle=c.tech.color; rrect(gx, gy-chipH/2, tw, chipH, 7); ctx.fill();
+    ctx.fillStyle='#fff'; ctx.textAlign='left'; ctx.textBaseline='middle';
+    ctx.fillText(c.tech.name, gx+12, gy);
+    ctx.restore();
+    gx += tw+7;
+  });
+  ctx.restore();
+  ctx.restore();
+}
+
+// floating badge popped from a block
+function drawBadges(){
+  badges.forEach(bd=>{
+    const sx=bd.x-cam, sy=bd.y;
+    ctx.save(); ctx.globalAlpha=bd.alpha;
+    const w=ctx.measureText? 0:0;
+    ctx.font='bold 16px Segoe UI';
+    const tw=ctx.measureText(bd.tech.name).width+28;
+    ctx.fillStyle=bd.tech.color; rrect(sx-tw/2, sy-18, tw, 30, 9); ctx.fill();
+    ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(bd.tech.name, sx, sy-2);
+    ctx.restore();
+  });
+}
+
+function spawnCoinParticles(x,y,color){
+  for(let i=0;i<14;i++){ particles.push({ x,y, vx:(Math.random()-.5)*4, vy:-Math.random()*5-2,
+    life:30+Math.random()*20, color, r:2+Math.random()*2 }); }
+}
+function drawParticles(){
+  particles.forEach(p=>{ ctx.globalAlpha=Math.max(0,p.life/40);
+    ctx.fillStyle=p.color; ctx.fillRect(p.x-cam,p.y,p.r*2,p.r*2); ctx.globalAlpha=1; });
+}
+
+// ================= UPDATE =================
+function update(){
+  t++;
+  if(phase==='intro'){
+    if(t>170){ phase='run'; sJump(); }
+    return;
+  }
+  if(phase==='run' || phase==='approach'){
+    // physics
+    hero.x += VX;
+    hero.vy += GRAV; hero.y += hero.vy;
+    if(hero.y+hero.h>=GROUND){ hero.y=GROUND-hero.h; hero.vy=0; hero.onGround=true; }
+    else hero.onGround=false;
+    hero.pose = hero.onGround? 'run':'jump'; hero.run++;
+    // jumps + block hits
+    const hc = hero.x+hero.w/2;
+    BLOCK.forEach(b=>{
+      const bc=b.x+b.w/2;
+      if(!b.sched && hero.onGround && hc>=bc-26){ hero.vy=JUMP; hero.onGround=false; b.sched=true; sJump(); }
+      if(!b.hit && hero.vy<0){
+        const ovX = hero.x+hero.w> b.x+4 && hero.x < b.x+b.w-4;
+        if(ovX && hero.y <= b.y+b.h && hero.y > b.y){
+          hero.y=b.y+b.h; hero.vy=2; b.hit=true; b.bounce=10;
+          badges.push({ x:b.x+b.w/2, y:b.y-6, alpha:1, vy:-0.7, tech:b.tech });
+          collected.push({ tech:b.tech, appear:0 });
+          spawnCoinParticles(b.x+b.w/2-cam+cam, b.y-10, b.tech.color);
+          sCoin();
+        }
+      }
+      if(b.bounce>0) b.bounce-=1.2; if(b.bounce<0)b.bounce=0;
+    });
+    badges.forEach(bd=>{ bd.y+=bd.vy; bd.alpha-=0.012; });
+    badges = badges.filter(b=>b.alpha>0);
+    collected.forEach(c=>c.appear++);
+    particles.forEach(p=>{ p.x+=p.vx; p.y+=p.vy; p.vy+=0.25; p.life--; });
+    particles=particles.filter(p=>p.life>0);
+    // camera
+    cam = Math.max(0, Math.min(hero.x-260, LEVEL_W-W));
+    // reach flag
+    if(hero.x+hero.w >= FLAG_X-4){ hero.x=FLAG_X-hero.w-2; phase='flag'; flag.grabbed=true; sFlag(); }
+    return;
+  }
+  if(phase==='flag'){
+    // slide down pole
+    hero.pose='idle'; hero.face=1;
+    if(hero.y+hero.h < GROUND){ hero.y+=4; hero.x=FLAG_X-hero.w-2; }
+    else { hero.y=GROUND-hero.h; flag.slideDone=true; }
+    // logo descends the pole toward hero
+    if(flag.slideDone){
+      const targetY = GROUND-70;
+      if(flag.logoY<targetY) flag.logoY+=4;
+      else {
+        // begin capture
+        flag.captured=true; flag.capX=FLAG_X; flag.capY=flag.logoY; flag.flash=18;
+        phase='capture';
+        spawnCoinParticles(FLAG_X, flag.logoY, '#0E72ED');
+        for(let i=0;i<26;i++) particles.push({x:FLAG_X,y:flag.logoY,vx:(Math.random()-.5)*8,
+          vy:(Math.random()-.5)*8,life:40,color: i%2?'#ffd34d':'#0E72ED', r:2+Math.random()*2});
+        sWin();
+      }
+    }
+    cam = Math.max(0, Math.min(FLAG_X-260, LEVEL_W-W));
+    return;
+  }
+  if(phase==='capture'){
+    // logo flies toward hero and shrinks "into" him
+    const tx=hero.x+hero.w/2, ty=hero.y+10;
+    flag.capX += (tx-flag.capX)*0.12;
+    flag.capY += (ty-flag.capY)*0.12;
+    flag.capScale *= 0.965;
+    if(flag.flash>0) flag.flash--;
+    particles.forEach(p=>{ p.x+=p.vx; p.y+=p.vy; p.vy+=0.18; p.life--; });
+    particles=particles.filter(p=>p.life>0);
+    if(flag.capScale<0.12){ phase='win'; winT=0; spawnFireworks(); }
+    cam = Math.max(0, Math.min(FLAG_X-260, LEVEL_W-W));
+    return;
+  }
+  if(phase==='win'){
+    winT++;
+    // Fire a few celebratory bursts ONLY near the start of the win screen, then
+    // go quiet — the previous code spawned fireworks forever, and each burst
+    // emitted a beep, producing an endless "bug-like" beeping after MISSION COMPLETE.
+    if(winT<150 && winT%30===0) spawnFireworks();
+    fireworks.forEach(f=>{ f.parts.forEach(p=>{ p.x+=p.vx; p.y+=p.vy; p.vy+=0.05; p.life--; }); });
+    fireworks=fireworks.filter(f=>f.parts.some(p=>p.life>0));
+    return;
+  }
+}
+function spawnFireworks(){
+  const cx=200+Math.random()*560, cy=120+Math.random()*160, col=['#ffd34d','#0E72ED','#e0245e','#16a34a','#8b5cf6'][Math.floor(Math.random()*5)];
+  const parts=[]; for(let i=0;i<26;i++){ const a=i/26*Math.PI*2, s=2+Math.random()*2;
+    parts.push({x:cx,y:cy,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:50,color:col}); }
+  fireworks.push({parts});
+  // a soft pop, gentle volume — only fires for the first few bursts (see update)
+  if(!muted) blip(740,.18,'triangle',.05,2);
+}
+
+// ================= RENDER =================
+function render(){
+  if(phase==='intro'){ renderIntro(); return; }
+  drawGroundAndBg();
+  ctx.save(); ctx.translate(-cam,0);
+  BLOCK.forEach(drawBlock);
+  if(phase!=='intro') drawFlag();
+  drawHero(hero);
+  ctx.restore();
+  drawBadges();
+  drawParticles();
+  // captured logo overlay (world)
+  if((phase==='capture') && !(flag.capScale<0.12)){
+    ctx.save(); if(flag.flash>0){ ctx.globalAlpha=flag.flash/18; ctx.fillStyle='#fff'; ctx.fillRect(0,0,W,H);} ctx.restore();
+    drawTVLogo(flag.capX-cam, flag.capY, 22*flag.capScale);
+  }
+  drawHUD();
+  if(phase==='win') renderWin();
+  // fireworks (screen space)
+  fireworks.forEach(f=>f.parts.forEach(p=>{ if(p.life>0){ ctx.globalAlpha=Math.max(0,p.life/50);
+    ctx.fillStyle=p.color; ctx.fillRect(p.x,p.y,3,3); ctx.globalAlpha=1; }}));
+}
+
+function renderIntro(){
+  // dark techy backdrop
+  const g=ctx.createLinearGradient(0,0,W,H); g.addColorStop(0,'#0a1326'); g.addColorStop(1,'#10203f');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+  // grid
+  ctx.strokeStyle='rgba(14,114,237,.12)'; ctx.lineWidth=1;
+  for(let x=0;x<W;x+=40){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  for(let y=0;y<H;y+=40){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+  const pulse=1+Math.sin(t*0.08)*0.05;
+  drawTVLogo(W/2, 210, 92*pulse);
+  ctx.fillStyle='#fff'; ctx.textAlign='center';
+  ctx.font='bold 46px Segoe UI'; ctx.fillText('TW-CLI', W/2, 360);
+  ctx.fillStyle='#7fb6ff'; ctx.font='bold 20px Segoe UI';
+  ctx.fillText('SUPER  TECH  BROS', W/2, 392);
+  ctx.fillStyle='rgba(255,255,255,.7)'; ctx.font='15px Segoe UI';
+  ctx.fillText('TeamViewer diagnostics · 100% local · agentic', W/2, 426);
+  if(Math.floor(t/20)%2===0){ ctx.fillStyle='#ffd34d'; ctx.font='bold 16px Segoe UI';
+    ctx.fillText('— LEVEL 1: THE STACK —', W/2, 470); }
+  // mini hero entering
+  drawHero({x:W/2-16, y:H-96+Math.abs(Math.sin(t*0.2))*-10, w:32,h:44, face:1, pose:'run', run:t, vy:0});
+}
+
+function renderWin(){
+  ctx.save();
+  ctx.fillStyle='rgba(6,10,20,'+Math.min(.82,winT/60*.82)+')'; ctx.fillRect(0,0,W,H);
+  const a=Math.min(1,winT/30);
+  ctx.globalAlpha=a;
+  drawTVLogo(W/2, 170, 78);
+  ctx.fillStyle='#ffd34d'; ctx.textAlign='center'; ctx.font='bold 40px Segoe UI';
+  ctx.fillText('MISSION COMPLETE!', W/2, 286);
+  ctx.fillStyle='#fff'; ctx.font='bold 18px Segoe UI';
+  ctx.fillText('TeamViewer logo captured 🏁  ·  Full stack unlocked', W/2, 318);
+  // stack recap chips
+  ctx.font='bold 12px Segoe UI';
+  const chips=TECH.map(x=>x.name); let cx=W/2- (chips.length*0)/2;
+  let lineY=356, startX=70, gx=startX, gy=lineY;
+  ctx.textAlign='left';
+  TECH.forEach((tch,i)=>{
+    const txt=tch.name, tw=ctx.measureText(txt).width+26;
+    if(gx+tw> W-70){ gx=startX; gy+=34; }
+    ctx.globalAlpha=Math.min(1,Math.max(0,(winT-20-i*4)/14));
+    ctx.fillStyle=tch.color; rrect(gx,gy-16,tw,26,8); ctx.fill();
+    ctx.fillStyle='#fff'; ctx.fillText(txt, gx+13, gy-1);
+    gx+=tw+10;
+  });
+  ctx.globalAlpha=1;
+  ctx.fillStyle='rgba(255,255,255,.6)'; ctx.textAlign='center'; ctx.font='13px Segoe UI';
+  ctx.fillText('TW-CLI · TypeScript + Foundry Local + Mastra + LanceDB · pta19059/TW-CLI', W/2, H-34);
+  ctx.restore();
+}
+
+// ================= LOOP =================
+function frame(){ update(); render(); requestAnimationFrame(frame); }
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
