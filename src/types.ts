@@ -67,8 +67,13 @@ export interface WorkflowReport {
   executionTarget?: string;
   /** Knowledge-base passages retrieved (LanceDB hybrid) and injected into the
    *  specialist prompts. Surfaced in the rendered report as a References section
-   *  so the user can verify which KB pages grounded each specialist's reasoning. */
+   *  so the user can verify which KB pages grounded each specialist's reasoning.
+   *  STRONG tier only (relevance >= REFERENCE_STRONG_FLOOR). */
   references?: Array<{ title?: string; source: string; topic: string; relevance?: number }>;
+  /** Lower-confidence KB articles that are on-topic enough to be worth a look but
+   *  did not clear the strong relevance floor. Rendered in a separate "Related
+   *  articles" section so they never get mixed with the strong supporting set. */
+  relatedReferences?: Array<{ title?: string; source: string; topic: string; relevance?: number }>;
   /** Concrete log sources the log probe actually read on the target (file paths,
    *  the macOS unified-log command, kubectl/journalctl invocations, ...). Surfaced
    *  in the rendered report so the user can see exactly which logs were consulted.

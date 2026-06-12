@@ -53,6 +53,19 @@ export function renderReportText(report: WorkflowReport): string {
     lines.push("");
   }
 
+  // ── Related articles (lower-confidence, on-topic KB pages) ────────────
+  if (report.relatedReferences && report.relatedReferences.length > 0) {
+    lines.push(rule);
+    lines.push("RELATED ARTICLES (lower-confidence, may still help)");
+    lines.push(rule);
+    for (const ref of report.relatedReferences) {
+      const label = ref.title ? ref.title : ref.source;
+      lines.push(`- ${label}`);
+      lines.push(`    ${ref.source}`);
+    }
+    lines.push("");
+  }
+
   // ── Log sources consulted (cross-platform) ────────────────────────────
   if (report.logSources && report.logSources.length > 0) {
     lines.push(rule);
@@ -151,6 +164,18 @@ export function renderReportMarkdown(report: WorkflowReport): string {
     lines.push(`| Article | Source |`);
     lines.push(`|---------|--------|`);
     for (const ref of report.references) {
+      lines.push(`| ${escapePipe(ref.title ?? ref.source)} | ${ref.source} |`);
+    }
+    lines.push("");
+  }
+
+  // ── Related articles (lower-confidence, on-topic KB pages) ────────────
+  if (report.relatedReferences && report.relatedReferences.length > 0) {
+    lines.push(`## Related Articles`);
+    lines.push("");
+    lines.push(`| Article | Source |`);
+    lines.push(`|---------|--------|`);
+    for (const ref of report.relatedReferences) {
       lines.push(`| ${escapePipe(ref.title ?? ref.source)} | ${ref.source} |`);
     }
     lines.push("");

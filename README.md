@@ -278,10 +278,14 @@ answer is readable at a glance:
    (a resolver *tool* invocation — `dig`/`nslookup` during a live-repro capture — is kept).
 4. **Knowledge Base** — only the official KB articles that pass an absolute on-topic relevance
    gate, sorted by relevance (off-topic filler is dropped, not just down-ranked).
-5. **Log Sources Consulted** — the exact log paths / commands inspected on the target (e.g. the
+5. **Related Articles** — a separate, clearly-labelled tier of lower-confidence KB *articles*
+   (below the strong relevance floor but still on-topic) so weaker matches are surfaced for further
+   reading without being mixed into the strong supporting set. Marketing / product-landing pages
+   are excluded; only genuine `/knowledge-base/` articles appear here.
+6. **Log Sources Consulted** — the exact log paths / commands inspected on the target (e.g. the
    macOS unified-log `log show` invocation) with line/error/warning counts.
-6. **Evidence** — the raw probe findings backing the conclusions.
-7. **Exploratory Leads** — shown **only** when no definitive root cause was found, clearly labelled
+7. **Evidence** — the raw probe findings backing the conclusions.
+8. **Exploratory Leads** — shown **only** when no definitive root cause was found, clearly labelled
    as unverified so they never distract from a confirmed cause.
 
 ## Azure demo

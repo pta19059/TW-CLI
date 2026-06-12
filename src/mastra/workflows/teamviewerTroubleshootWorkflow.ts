@@ -84,6 +84,7 @@ const reportSchema = z.object({
     })
   ),
   references: z.array(referenceSchema).default([]),
+  relatedReferences: z.array(referenceSchema).default([]),
   logSources: z.array(logSourceSchema).default([])
 });
 
@@ -436,13 +437,15 @@ const aggregateStep = createStep({
     // Aggregate KB references across specialists, deduped by source URL and
     // sorted by on-topic relevance. Two-tier selection so the citation list is
     // neither padded with off-topic filler nor too sparse to be useful:
-    //   • STRONG tier (relevance >= REFERENCE_STRONG_FLOOR): always cited.
+    //   • STRONG tier (relevance >= REFERENCE_STRONG_FLOOR): the "supporting
+    //     articles" that actually grounded the diagnosis — always cited.
     //   • RELATED tier (below strong but a real /knowledge-base/ ARTICLE above
-    //     the related floor): used ONLY to backfill toward MIN_REFERENCES.
+    //     the related floor): rendered in a SEPARATE "Related articles" section
+    //     so weak matches never get mixed in with the strong supporting set.
     //     Marketing/product-landing pages (which score in the same band) are
-    //     excluded via isKbArticleUrl, so they never sneak back in.
-    const MIN_REFERENCES = 4;
+    //     excluded via isKbArticleUrl, so they never sneak in.
     const MAX_REFERENCES = 6;
+    const MAX_RELATED = 6;
     const dedupRefMap = new Map<string, { title?: string; source: string; topic: string; relevance?: number }>();
     for (const b of branches) {
       for (const ref of (b.references ?? [])) {
@@ -455,16 +458,18 @@ const aggregateStep = createStep({
     const sortedRefs = Array.from(dedupRefMap.values()).sort(
       (a, b) => (b.relevance ?? 0) - (a.relevance ?? 0)
     );
-    const strongRefs = sortedRefs.filter((r) => (r.relevance ?? 0) >= REFERENCE_STRONG_FLOOR);
-    const relatedRefs = sortedRefs.filter(
-      (r) => (r.relevance ?? 0) < REFERENCE_STRONG_FLOOR && isKbArticleUrl(r.source)
-    );
-    const references = [...strongRefs];
-    for (const r of relatedRefs) {
-      if (references.length >= MIN_REFERENCES) break;
-      references.push(r);
-    }
-    references.splice(MAX_REFERENCES);
+    const references = sortedRefs
+      .filter((r) => (r.relevance ?? 0) >= REFERENCE_STRONG_FLOOR)
+      .slice(0, MAX_REFERENCES);
+    const strongSources = new Set(references.map((r) => r.source));
+    const relatedReferences = sortedRefs
+      .filter(
+        (r) =>
+          (r.relevance ?? 0) < REFERENCE_STRONG_FLOOR &&
+          isKbArticleUrl(r.source) &&
+          !strongSources.has(r.source)
+      )
+      .slice(0, MAX_RELATED);
 
     // Collect the concrete log sources consulted across all specialists
     // (only the log specialist populates these). Deduped by source string so
@@ -595,6 +600,7 @@ const aggregateStep = createStep({
       },
       execution,
       references,
+      relatedReferences,
       logSources
     };
   }
