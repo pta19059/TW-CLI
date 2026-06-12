@@ -4,7 +4,7 @@ import { ActionItem, ProductKey, RootCauseCandidate } from "../../types.js";
 import { getProductProfile } from "../../catalog/productProfiles.js";
 import { runConnectivityProbe, type ConnectivityReport } from "../../probes/connectivity.js";
 import { runEndpointHealthProbe, type EndpointHealthReport } from "../../probes/endpointHealth.js";
-import { runLogProbe, type LogProbeReport } from "../../probes/logs.js";
+import { runLogProbe, classifySignature, type LogProbeReport, type SignatureCategory } from "../../probes/logs.js";
 import { runAuthPolicyProbe, type AuthProbeReport } from "../../probes/authPolicy.js";
 import { getCurrentContext, getRunOptions } from "../../runtime/runContext.js";
 
@@ -386,7 +386,24 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
         report.topSignatures.map((c) => `${c.count}\u00d7 "${c.signature.slice(0, 200)}"`).join("; ")
     );
     const dominant = report.topSignatures[0];
-    if (dominant.count >= 3) {
+    // Use the probe-computed classification when present, else recompute — so
+    // fromLogs is correct even for externally-built reports / tests.
+    const cls = classifySignature(`${dominant.exampleLine} ${dominant.signature}`);
+    const domCategory: SignatureCategory = dominant.category ?? cls.category;
+    const domWeight = dominant.weight ?? cls.weight;
+
+    if (domCategory === "benign") {
+      // The most-recurring lines are cosmetic (device enumeration, management
+      // polling, driver buffer probes). They are NOT a credible cause of a
+      // disconnect — say so honestly instead of fabricating a "driver" cause.
+      // No fault root cause is emitted; the LLM enrichment + other probes
+      // decide whether anything real remains.
+      evidence.push(
+        "The most frequent recurring log lines are cosmetic/benign (device enumeration, " +
+          "management polling, driver buffer probes) and do NOT indicate a connectivity " +
+          "fault \u2014 no genuine fault signature was found in the scanned window."
+      );
+    } else if (dominant.count >= 3) {
       const sigText = `${dominant.exampleLine} ${dominant.signature}`.toLowerCase();
       // When standby is the PROVEN cause of the drops, the WHOLE recurring
       // error burst at wake is reconnection aftermath, not just the retry
@@ -400,19 +417,24 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
         /retryhandle|::handleretry|resend to|rcommand|retry|netwatchdog|reconnect|taf::|cmml|licenselimit|getlicense|licensecallback|chatprovider|providerregistration|registration failed|timed? ?out|timeout/.test(sigText);
       rootCauses.push({
         title: "Recurring failure signature in TeamViewer logs",
-        score: isReconnectNoise ? 0.35 : Math.min(0.9, 0.55 + Math.log10(dominant.count) * 0.15),
+        // Score factors BOTH frequency and diagnostic severity (domWeight):
+        // a high-severity fault category scores above a generic recurring line
+        // of equal count, and the score can't be inflated by sheer volume of a
+        // low-severity pattern.
+        score: isReconnectNoise
+          ? 0.35
+          : Math.min(0.9, 0.5 + Math.log10(dominant.count) * 0.15 + (domWeight - 1) * 0.05),
         rationale:
           `Pattern repeats ${dominant.count}\u00d7: ${dominant.exampleLine.slice(0, 260)}` +
           (isReconnectNoise
             ? " \u2014 note: these coincide with the " + osName + " standby wake events; they are reconnection aftermath, not the root cause (see the power-management finding)."
             : "")
       });
-      // Signature-aware action routing: the dominant signature usually
-      // points at a specific failure mode (DNS, TLS, timeout, auth) and
-      // each one has a different remediation playbook. Emitting "Triage
-      // the dominant signature" was correct but useless — the user already
-      // sees the signature. Pick the right playbook automatically.
-      if (/could not resolve|resolve failed|resolvednsname|getaddrinfo|asio\.netdb|name (?:not|or service not) known|nodename nor servname/.test(sigText)) {
+      // Signature-aware action routing driven by the CLASSIFIED category (not
+      // an ad-hoc regex), so each failure mode (DNS, TLS, transport/network,
+      // auth) gets its specific remediation playbook. Falls back to a generic
+      // triage step for unclassified ("generic"/"crash") signatures.
+      if (domCategory === "dns") {
 
         actions.push({
           step:
@@ -426,7 +448,7 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
           risk: "low",
           rollback: "Flushing the DNS cache is reversible (entries repopulate on use). Removing custom resolvers can be reverted by re-adding them."
         });
-      } else if (/handshake|tls|ssl|certificate|x509|cert verify|self.signed|untrusted/.test(sigText)) {
+      } else if (domCategory === "tls") {
         actions.push({
           step:
             "TLS / handshake failures dominate the log signature. Verify the system clock " +
@@ -437,7 +459,7 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
           risk: "low",
           rollback: "Reverting ca-certificates / removing the TLS-inspection bypass restores prior behavior."
         });
-      } else if (/timed? ?out|timeout|connection reset|broken pipe|aborted|disconnect|retryhandle|::handleretry|resend to|retry(?:ing)?\b|rcommand|retransmit|netwatchdog/.test(sigText)) {
+      } else if (domCategory === "transport" || domCategory === "network") {
         if (standbyExplainsDrops) {
           actions.push({
             step:
@@ -465,7 +487,7 @@ export function fromLogs(report: LogProbeReport): SpecialistOutput {
             rollback: "Observation steps only — no rollback needed."
           });
         }
-      } else if (/auth|unauthor|forbidden|401|403|token|credential/.test(sigText)) {
+      } else if (domCategory === "auth") {
 
         actions.push({
           step:

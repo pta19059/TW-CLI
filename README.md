@@ -50,6 +50,14 @@ are grounded against the official Knowledge Base via a local hybrid RAG index.
   still holds open for writing can be tailed instead of silently reading back empty — previously the
   default `OpenRead` share mode raised *"being used by another process"* and the active `Logfile.log`
   / `TVNetwork.log` were dropped, leaving only the small idle `Hooks.log` scanned.
+- **Relevance-ranked log signatures** — recurring log lines are ranked by *diagnostic relevance*
+  (occurrence count × severity weight), not raw frequency. Known-benign cosmetic noise that a healthy
+  client emits constantly (device-enumeration buffer probes, `DriverInstalled ... error code 122`,
+  management-poll `device that is not managed`) is pinned to a low weight so it can never become the
+  "dominant" signature and mask a genuine fault. Real fault categories (DNS, TLS, network/transport,
+  auth, crash) are weighted 2–3× so they surface as the root cause even at a lower count — and when
+  the most-frequent line is purely cosmetic, the report says so honestly instead of fabricating a
+  cause.
 - **Grounded answers** — `docs ask` retrieves from a local LanceDB index of the official KB and
   verifies every sentence by embedding similarity. Troubleshoot reports cite only KB articles
   that pass an absolute on-topic relevance gate (no off-topic filler).

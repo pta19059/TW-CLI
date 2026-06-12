@@ -22,6 +22,101 @@ export interface SignatureCluster {
   signature: string;
   count: number;
   exampleLine: string;
+  /**
+   * Diagnostic-relevance weight applied to `count` when ranking. benign≈0.15,
+   * generic=1, fault categories 2–3. Optional so external/test constructors
+   * can omit it — `fromLogs` recomputes it via classifySignature when absent.
+   */
+  weight?: number;
+  /** Fault classification: benign | dns | network | transport | tls | auth | crash | generic. */
+  category?: SignatureCategory;
+}
+
+export type SignatureCategory =
+  | "benign"
+  | "dns"
+  | "network"
+  | "transport"
+  | "tls"
+  | "auth"
+  | "crash"
+  | "generic";
+
+/**
+ * Classify a log signature by how diagnostically RELEVANT it is to a
+ * connectivity / disconnect problem.
+ *
+ * WHY THIS EXISTS (the definitive fix for "wrong root cause"):
+ * Frequency alone is a misleading ranking signal. TeamViewer (and most apps)
+ * emit high-volume *cosmetic* lines on a perfectly HEALTHY client — device
+ * enumeration buffer probes ("DriverInstalled: SetupDiGetDeviceRegistryProperty
+ * failed with error code 122"), management-poll noise ("device that is not
+ * managed"), etc. Ranking purely by occurrence count lets that benign noise
+ * outrank — and mask — the genuine network-fault signatures, producing a
+ * confident-but-wrong root cause. We multiply each signature's count by a
+ * relevance weight so a benign line can never become "dominant", while a real
+ * fault signature is promoted even at a lower count.
+ *
+ * Returns the multiplicative weight + a coarse category used for action routing.
+ */
+export function classifySignature(text: string): { weight: number; category: SignatureCategory } {
+  const s = text.toLowerCase();
+
+  // 1. Known-benign / cosmetic patterns. These recur constantly on a HEALTHY
+  //    client and never explain a drop. Pinned low so volume cannot promote
+  //    them. Checked FIRST so the "!!" severity boost below never applies to
+  //    them (TeamViewer tags even cosmetic lines "G2!!").
+  if (
+    /driverinstalled|setupdigetdeviceregistryproperty|error ?code ?122|errorcode=122/.test(s) ||
+    /updatedeviceflags|device that is not managed|\bnot managed\b|no assignment|managementinfo/.test(s) ||
+    /module loaded|carrier loaded|registered for|heartbeat ok|keep ?alive (?:ok|sent|ack)/.test(s)
+  ) {
+    return { weight: 0.15, category: "benign" };
+  }
+
+  // 2. Genuine fault categories. Highest-signal wins; weights tuned so any
+  //    real fault (>=2.0) decisively outranks generic noise (1.0) and benign
+  //    (0.15) regardless of plausible count differences.
+  const FAULTS: { name: SignatureCategory; w: number; re: RegExp }[] = [
+    { name: "dns", w: 3.0, re: /could not resolve|resolve failed|getaddrinfo|name (?:not|or service not) known|nodename nor servname|asio\.netdb|dns/ },
+    { name: "crash", w: 2.8, re: /access violation|segfault|segmentation fault|unhandled exception|\bfatal\b|stack ?trace|0xc0000005|core dumped/ },
+    { name: "tls", w: 2.6, re: /handshake|\btls\b|\bssl\b|certificate|x509|cert verify|self.signed|untrusted/ },
+    { name: "network", w: 2.5, re: /securenetwork|connection not found|\brcommand\b|resend to|dyngate|sendtodyngate|retrystrategy|sendcallback|invalid sender/ },
+    { name: "auth", w: 2.4, re: /unauthor|forbidden|\b401\b|\b403\b|\btoken\b|credential|access denied|login failed/ },
+    { name: "transport", w: 2.2, re: /timed? ?out|timeout|connection reset|broken pipe|aborted|disconnect|retryhandle|::handleretry|retransmit|netwatchdog|connection lost/ },
+  ];
+  let weight = 1.0;
+  let category: SignatureCategory = "generic";
+  for (const f of FAULTS) {
+    if (f.re.test(s) && f.w > weight) {
+      weight = f.w;
+      category = f.name;
+    }
+  }
+
+  // 3. TeamViewer severity-marker boost: lines the client itself flags "!!"
+  //    are serious errors; nudge them slightly above equal-count peers.
+  if (/!!/.test(text)) weight *= 1.15;
+
+  return { weight, category };
+}
+
+/**
+ * Rank clustered signatures by RELEVANCE (count × severity weight), not raw
+ * frequency, and keep the top N. This is the single ranking authority shared by
+ * every scan path so a benign high-frequency line can never surface as the
+ * dominant signature anywhere in the pipeline.
+ */
+function rankSignatures(
+  counts: Map<string, { count: number; example: string }>
+): SignatureCluster[] {
+  return [...counts.entries()]
+    .map(([signature, { count, example }]) => {
+      const { weight, category } = classifySignature(`${signature} ${example}`);
+      return { signature, count, exampleLine: example, weight, category };
+    })
+    .sort((a, b) => b.count * b.weight - a.count * a.weight)
+    .slice(0, TOP_SIGNATURES);
 }
 
 /**
@@ -839,10 +934,7 @@ export async function runLogProbe(
     warningCount += scan.warningCount;
   }
 
-  const topSignatures: SignatureCluster[] = [...counts.entries()]
-    .map(([signature, { count, example }]) => ({ signature, count, exampleLine: example }))
-    .sort((a, b) => b.count - a.count)
-    .slice(0, TOP_SIGNATURES);
+  const topSignatures: SignatureCluster[] = rankSignatures(counts);
 
   if (errorCount === 0 && warningCount === 0) {
     diagnostics.push(`Scanned ${totalLines} lines across ${files.length} file(s); no errors or warnings detected.`);
@@ -894,9 +986,6 @@ function scanText(
     if (existing) existing.count++;
     else counts.set(sig, { count: 1, example: line.slice(0, 240) });
   }
-  const topSignatures: SignatureCluster[] = [...counts.entries()]
-    .map(([signature, { count, example }]) => ({ signature, count, exampleLine: example }))
-    .sort((a, b) => b.count - a.count)
-    .slice(0, TOP_SIGNATURES);
+  const topSignatures: SignatureCluster[] = rankSignatures(counts);
   return { totalLines, errorCount, warningCount, topSignatures };
 }

@@ -13,6 +13,7 @@ import type { LogProbeReport } from "../src/probes/logs.js";
 import type { AuthProbeReport } from "../src/probes/authPolicy.js";
 import { normalize, runLogProbe } from "../src/probes/logs.js";
 import { buildMacCaptureCommand, parseMacPowerEvents, parseWindowsPowerEvents, parseLinuxPowerEvents } from "../src/probes/logs.js";
+import { classifySignature } from "../src/probes/logs.js";
 import { getProductProfile } from "../src/catalog/productProfiles.js";
 import { filterRootCausesAgainstEvidence } from "../src/mastra/workflows/teamviewerTroubleshootWorkflow.js";
 
@@ -316,6 +317,35 @@ describe("fromEndpointHealth", () => {
   });
 });
 
+describe("classifySignature", () => {
+  it("pins known-benign TeamViewer noise to a low weight", () => {
+    const driver = classifySignature("G2!! DriverInstalled: SetupDiGetDeviceRegistryProperty failed with error code 122, Errorcode=122");
+    expect(driver.category).toBe("benign");
+    expect(driver.weight).toBeLessThan(0.5);
+    const notManaged = classifySignature("S0! MDv2::ManagedDeviceController::UpdateDeviceFlags: cannot update flags for a device that is not managed");
+    expect(notManaged.category).toBe("benign");
+    expect(notManaged.weight).toBeLessThan(0.5);
+  });
+
+  it("classifies genuine network/DNS/TLS faults with a high weight", () => {
+    expect(classifySignature("curl request failed: Could not resolve hostname (6)").category).toBe("dns");
+    expect(classifySignature("tvsecurenetworkimpl::Retry::Handle::Retry: Trying resend to 109 failed with error SecureNetwork:7").category).toBe("network");
+    expect(classifySignature("TLS handshake failed: certificate verify failed").category).toBe("tls");
+    for (const c of ["dns", "network", "tls"]) {
+      // every fault category outweighs benign by a wide margin
+      expect(classifySignature("SecureNetwork connection not found").weight).toBeGreaterThan(2);
+    }
+  });
+
+  it("ranks a high-severity fault above a more-frequent benign line (relevance, not frequency)", () => {
+    // 18× benign driver noise vs 12× real network fault — the network fault
+    // must win because count × severity-weight > count × benign-weight.
+    const benign = classifySignature("G2!! DriverInstalled: SetupDiGetDeviceRegistryProperty failed with error code 122");
+    const fault = classifySignature("S0!! SendToDyngateID: failed to send to 75: invalid sender ID 0");
+    expect(18 * benign.weight).toBeLessThan(12 * fault.weight);
+  });
+});
+
 describe("fromLogs", () => {
   it("promotes a recurring signature to a root cause", () => {
     const report: LogProbeReport = {
@@ -330,6 +360,28 @@ describe("fromLogs", () => {
     };
     const out = fromLogs(report);
     expect(out.rootCauses.some((r) => r.title === "Recurring failure signature in TeamViewer logs")).toBe(true);
+  });
+
+  it("does NOT raise a fault root cause when the dominant signature is cosmetic/benign", () => {
+    const report: LogProbeReport = {
+      filesInspected: ["C:/Program Files/TeamViewer/TeamViewer15_Logfile.log"],
+      totalLines: 1000,
+      errorCount: 30,
+      warningCount: 10,
+      topSignatures: [
+        {
+          signature: "G2!! DriverInstalled: SetupDiGetDeviceRegistryProperty failed with error code 122, Errorcode=122",
+          count: 18,
+          exampleLine: "2026/06/12 08:13:03.016 9300 4744 G2!! DriverInstalled: SetupDiGetDeviceRegistryProperty failed with error code 122, Errorcode=122",
+          weight: 0.15,
+          category: "benign"
+        }
+      ],
+      diagnostics: []
+    };
+    const out = fromLogs(report);
+    expect(out.rootCauses.some((r) => r.title === "Recurring failure signature in TeamViewer logs")).toBe(false);
+    expect(out.evidence.join(" ").toLowerCase()).toContain("cosmetic");
   });
 
   it("handles no log files gracefully", () => {
