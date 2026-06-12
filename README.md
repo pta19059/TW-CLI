@@ -45,7 +45,11 @@ are grounded against the official Knowledge Base via a local hybrid RAG index.
   only when no definitive cause was found.
 - **Log-source transparency** — every report lists the exact log sources consulted on the target
   (file paths, the macOS unified-log `log show` command, etc.) with line/error/warning counts —
-  works across local, SSH (Win/Linux/macOS), Azure VM and Kubernetes backends.
+  works across local, SSH (Win/Linux/macOS), Azure VM and Kubernetes backends. On Windows the log
+  reader opens files with `FileShare.ReadWrite`, so a *live* log that TeamViewer (or any service)
+  still holds open for writing can be tailed instead of silently reading back empty — previously the
+  default `OpenRead` share mode raised *"being used by another process"* and the active `Logfile.log`
+  / `TVNetwork.log` were dropped, leaving only the small idle `Hooks.log` scanned.
 - **Grounded answers** — `docs ask` retrieves from a local LanceDB index of the official KB and
   verifies every sentence by embedding similarity. Troubleshoot reports cite only KB articles
   that pass an absolute on-topic relevance gate (no off-topic filler).

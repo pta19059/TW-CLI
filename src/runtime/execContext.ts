@@ -357,7 +357,11 @@ export class SshContext implements ExecutionContext {
         `if(-not (Test-Path -LiteralPath ${q})){ return };` +
         `$fi=Get-Item -LiteralPath ${q};` +
         `$max=${maxBytes};` +
-        `$fs=[IO.File]::OpenRead($fi.FullName);` +
+        // FileShare::ReadWrite is REQUIRED: TeamViewer (and most services)
+        // hold their ACTIVE log open for writing, so the default OpenRead
+        // (FileShare.Read) throws "being used by another process" and the
+        // file reads back empty. ReadWrite share lets us tail a live log.
+        `$fs=[IO.File]::Open($fi.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite);` +
         `try{` +
         `  if($fi.Length -gt $max){ [void]$fs.Seek($fi.Length - $max,'Begin') };` +
         `  $len=[Math]::Min([int64]$fi.Length,[int64]$max);` +
@@ -610,7 +614,11 @@ export class AzureRunCommandContext implements ExecutionContext {
         `if(-not (Test-Path -LiteralPath ${q})){ return };` +
         `$fi=Get-Item -LiteralPath ${q};` +
         `$max=${maxBytes};` +
-        `$fs=[IO.File]::OpenRead($fi.FullName);` +
+        // FileShare::ReadWrite is REQUIRED: TeamViewer (and most services)
+        // hold their ACTIVE log open for writing, so the default OpenRead
+        // (FileShare.Read) throws "being used by another process" and the
+        // file reads back empty. ReadWrite share lets us tail a live log.
+        `$fs=[IO.File]::Open($fi.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite);` +
         `try{` +
         `  if($fi.Length -gt $max){ [void]$fs.Seek($fi.Length - $max,'Begin') };` +
         `  $len=[Math]::Min([int64]$fi.Length,[int64]$max);` +
