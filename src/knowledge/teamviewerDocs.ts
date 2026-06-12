@@ -1502,11 +1502,13 @@ export function isKbArticleUrl(url: string): boolean {
  *  and unrelated topics fall away while symptom-matched pages survive. */
 export const REFERENCE_STRONG_FLOOR = 0.6;
 /** Related floor: a KB-ARTICLE reference between this and the strong floor is
- *  used ONLY to backfill a sparse citation list (and only via isKbArticleUrl,
- *  so marketing pages in the same band are excluded). 0.42 admits genuine
- *  borderline troubleshooting articles (e.g. "Data flow in connections") that
- *  the strict 0.6 gate would otherwise drop, which left reports too sparse. */
-export const REFERENCE_RELATED_FLOOR = 0.42;
+ *  surfaced in the separate "Related articles" report tier (and only via
+ *  isKbArticleUrl, so marketing pages in the same band are excluded). 0.38
+ *  admits genuine borderline troubleshooting articles (e.g. "Data flow in
+ *  connections", which scores ~0.39 for connection-drop prompts) that the
+ *  strict 0.6 gate drops; calibrated empirically so the related tier is
+ *  populated for real symptom prompts without pulling in off-topic pages. */
+export const REFERENCE_RELATED_FLOOR = 0.38;
 /** Semantic-similarity escape hatch. Deliberately set ABOVE the embedder's
  *  TeamViewer-doc cluster ceiling (~0.52) so it only fires for genuinely
  *  exceptional semantic matches, not for the whole TeamViewer corpus. */
