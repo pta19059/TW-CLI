@@ -238,6 +238,9 @@ answer is readable at a glance:
    LLM-proposed causes must be **evidence-anchored**: a candidate that shares no distinctive term
    with the collected probe/log evidence is dropped as speculation, so the report never invents a
    plausible-sounding cause (e.g. "Permissions Issue") that nothing actually observed supports.
+   Candidates are also dropped when they **directly contradict** the evidence — e.g. a "DNS
+   resolution failure" cause is removed once the resolver probe reports "DNS resolved N/N
+   TeamViewer hosts", so the report can't blame DNS while its own evidence proves DNS works.
    Probe-derived causes (real log signatures, failed connectivity checks) are always trusted. On
    any supported OS, recurring disconnects that line up with a sleep/standby transition surface a
    dedicated *"<OS> standby/sleep is dropping the idle connection"* root cause (macOS `NetWatchdog`,
@@ -254,8 +257,9 @@ answer is readable at a glance:
    fixes float to the top and probe-hygiene / observation-only / generic filler steps sink to the
    bottom. Actions contradicted by the evidence are dropped, not just down-ranked — e.g. any
    firewall-inspection step is removed once DNS + TCP `5938` both prove the path is open
-   ("firewall ruled out"), and a `launchctl load` step is removed when the daemon is already in the
-   process list.
+   ("firewall ruled out"), a `launchctl load` step is removed when the daemon is already in the
+   process list, and a "verify DNS resolution" step is removed when DNS already resolved N/N hosts
+   (a resolver *tool* invocation — `dig`/`nslookup` during a live-repro capture — is kept).
 4. **Knowledge Base** — only the official KB articles that pass an absolute on-topic relevance
    gate, sorted by relevance (off-topic filler is dropped, not just down-ranked).
 5. **Log Sources Consulted** — the exact log paths / commands inspected on the target (e.g. the

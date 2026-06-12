@@ -888,6 +888,15 @@ export function filterRootCausesAgainstEvidence(
       if (port5938Open && /\b5938\b/.test(text)) return false;
       if (firewallRuledOut && /teamviewer|traffic|blocking|outgoing|inbound|connectivity|network/.test(text)) return false;
     }
+    // DNS resolution as a CAUSE, falsified by "DNS resolved N/N TeamViewer
+    // hosts". The small LLM loves to blame DNS for "drops every few minutes"
+    // even when our resolver probe just succeeded for every host — the stem
+    // "dns" appears in the evidence (the success line), so the anchor gate
+    // alone lets it through. Drop any DNS-failure-shaped cause when DNS is OK.
+    // (Symmetric to the rule already in filterHypothesesAgainstEvidence.)
+    if (dnsOk && /\bdns\b/.test(text) && /(resolution|resolve|resolv|lookup|name\s+resolution|fail|failure|issue|problem|unable|cannot|error|misconfigur|incorrect|wrong)/.test(text)) {
+      return false;
+    }
     // Generic "unstable network / connectivity issue" titled cause whose
     // rationale just blames the firewall — same trap, no "firewall" in title.
     if (firewallRuledOut && /\b(unstable\s+network|network\s+connectivity|connection\s+drop)/.test(text) && /firewall|blocking|inbound|outbound/.test(text)) {
@@ -1098,6 +1107,15 @@ export function filterActionsAgainstEvidence(
     // catches exact step matches; the LLM rewords).
     if (/update\s+(the\s+)?(system'?s?\s+)?ca\s+bundle/.test(text) && !/\(probe\s+hygiene/.test(text)) {
       return false;
+    }
+    // "Verify/check DNS resolution" actions are moot when DNS resolved N/N
+    // TeamViewer hosts — the resolver probe already proved name resolution
+    // works. Drop them (paired with the DNS root-cause drop above). Keep the
+    // diagnostic carve-out: an action that runs a resolver TOOL (dig/nslookup/
+    // resolvectl) as part of a live-repro capture is still useful.
+    if (dnsOk && /\bdns\b/.test(text) && /(verify|check|inspect|review|confirm|validate|ensure|resolution|resolve|resolv|lookup|misconfigur|incorrect|wrong|fix|restart\s+dns)/.test(text)) {
+      const isDnsDiagnosticTool = /\b(dig\b|nslookup|resolvectl|systemd-resolve|scutil\s+--dns|host\s+[a-z0-9])\b/.test(text);
+      if (!isDnsDiagnosticTool) return false;
     }
     return true;
   });

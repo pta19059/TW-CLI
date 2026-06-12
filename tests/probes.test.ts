@@ -854,6 +854,42 @@ describe("filterRootCausesAgainstEvidence drops management-plane misattributions
   });
 });
 
+describe("filterRootCausesAgainstEvidence drops DNS-failure causes when DNS resolved successfully", () => {
+  it("drops 'DNS resolution failure' when DNS resolved N/N TeamViewer hosts", () => {
+    const evidence = [
+      "DNS resolved 6/6 TeamViewer hosts from 135.116.82.138",
+      "TCP 5938 reachability: 3/3 routers OK",
+      "All baseline connectivity probes succeeded."
+    ];
+    const roots = [
+      {
+        title: "DNS resolution failure",
+        score: 0.7,
+        rationale: "DNS resolution failure can prevent TeamViewer from reaching the correct servers, leading to dropped connections.",
+        evidenceAnchored: false
+      }
+    ];
+    const out = filterRootCausesAgainstEvidence(roots, evidence);
+    expect(out).toHaveLength(0);
+  });
+
+  it("KEEPS a DNS-failure cause when DNS actually failed", () => {
+    const evidence = [
+      "DNS failures: 3/6 TeamViewer hosts could not be resolved from 135.116.82.138"
+    ];
+    const roots = [
+      {
+        title: "DNS resolution failure",
+        score: 0.7,
+        rationale: "Several TeamViewer hosts failed to resolve.",
+        evidenceAnchored: true
+      }
+    ];
+    const out = filterRootCausesAgainstEvidence(roots, evidence);
+    expect(out).toHaveLength(1);
+  });
+});
+
 describe("Windows endpoint-health probe tolerates noisy SSH exit codes and maps service enums", () => {
   // Get-Service over SSH returns exit code 1 whenever ANY requested name is
   // absent (e.g. "TeamViewer_Service" is a process, not a service), yet the

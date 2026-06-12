@@ -282,6 +282,24 @@ describe("filterActionsAgainstEvidence", () => {
     );
     expect(out.length).toBe(1);
   });
+  it("drops 'Verify DNS resolution' action when DNS resolved N/N hosts", () => {
+    const out = filterActionsAgainstEvidence(
+      [
+        { step: "Verify DNS resolution on the affected machine.", risk: "low", rollback: "Restart DNS service" },
+        { step: "Restart the TeamViewer app", risk: "low", rollback: "r" }
+      ],
+      evidence5938Ok
+    );
+    expect(out.length).toBe(1);
+    expect(out[0].step).toMatch(/restart the teamviewer app/i);
+  });
+  it("keeps a DNS diagnostic-tool action (dig/nslookup) during live-repro capture", () => {
+    const out = filterActionsAgainstEvidence(
+      [{ step: "During a live drop, run nslookup router1.teamviewer.com to confirm DNS still resolves", risk: "low", rollback: "r" }],
+      evidence5938Ok
+    );
+    expect(out.length).toBe(1);
+  });
 });
 
 describe("filterRootCausesAgainstEvidence", () => {
