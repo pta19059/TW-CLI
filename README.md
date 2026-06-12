@@ -24,7 +24,11 @@ are grounded against the official Knowledge Base via a local hybrid RAG index.
   endpoint) to avoid the 3–5 s per-call cold-start storm that previously caused flaky false
   "unreachable" results. Service status / start-type enums are mapped to human labels
   (`Running`/`Automatic`), and `Get-Service`/`Get-Process` output is parsed even when the remote shell
-  returns a non-zero exit code for an unrelated missing name.
+  returns a non-zero exit code for an unrelated missing name. The remote OS is detected with a
+  cold-start-tolerant two-stage probe (a generous-timeout `uname` round-trip, then a retried
+  PowerShell `OSVersion.VersionString` fallback, with the cmd.exe *"'uname' is not recognized"* error
+  itself treated as a positive Windows signal) so a slow first SSH handshake can't misdetect a Windows
+  host as Linux and corrupt the whole report.
 - **Cross-OS standby/power-management correlation** — the log probe detects an idle machine that
   sleeps and drops the connection on *every* supported OS, then demotes the post-wake
   RetryHandle/RCommand error burst to reconnection noise instead of misattributing it:

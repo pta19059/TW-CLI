@@ -238,8 +238,18 @@ export class SshContext implements ExecutionContext {
   static async connect(opts: SshConnectionOptions): Promise<SshContext> {
     let os: RemoteOs = "unknown";
 
-    const posix = await SshContext.execOnce(opts, "uname -s", 6000);
+    // First probe absorbs the SSH cold-start (TCP + handshake + shell spawn),
+    // which on a freshly-woken Windows OpenSSH host regularly exceeds 6s, so a
+    // tight timeout here caused intermittent "unknown" misdetection that sent
+    // POSIX commands to cmd.exe and produced a garbage report. Use a generous
+    // timeout for this first round-trip.
+    const posix = await SshContext.execOnce(opts, "uname -s", 12000);
     const posixOut = posix.stdout.trim().toLowerCase();
+    // cmd.exe rejects `uname` with a distinctive error — that itself is a
+    // reliable signal the SSH default shell is Windows cmd.exe.
+    const looksLikeCmdExe = (posix.stdout + " " + posix.stderr).toLowerCase().match(
+      /is not recognized as an internal or external command|operable program or batch file|the syntax of the command is incorrect/
+    ) != null;
     if (posix.exitCode === 0 && posixOut) {
       if (posixOut.includes("darwin")) os = "macos";
       else if (posixOut.includes("linux")) os = "linux";
@@ -250,15 +260,23 @@ export class SshContext implements ExecutionContext {
       // Try PowerShell. Works whether the SSH default shell is cmd.exe or pwsh.
       // OSVersion.VersionString is present on Windows PowerShell 5.1 AND 7+,
       // unlike $PSVersionTable.OS which is PS-Core-only (empty on 5.1).
-      const win = await SshContext.execOnce(
-        opts,
-        `powershell -NoLogo -NoProfile -NonInteractive -Command "[System.Environment]::OSVersion.VersionString"`,
-        8000
-      );
-      const winOut = (win.stdout + win.stderr).toLowerCase();
-      if (winOut.includes("windows") || winOut.includes("microsoft")) {
-        os = "windows";
+      // Retry once: a single cold-start timeout must not silently leave the OS
+      // "unknown" (downstream probes then default to POSIX and corrupt the run).
+      const pwshCmd = `powershell -NoLogo -NoProfile -NonInteractive -Command "[System.Environment]::OSVersion.VersionString"`;
+      for (let attempt = 0; attempt < 2 && os === "unknown"; attempt++) {
+        const win = await SshContext.execOnce(opts, pwshCmd, 15000);
+        const winOut = (win.stdout + win.stderr).toLowerCase();
+        if (winOut.includes("windows") || winOut.includes("microsoft")) {
+          os = "windows";
+        }
       }
+    }
+
+    // Last-resort signal: the first probe got a cmd.exe rejection (so the host
+    // IS Windows) but every PowerShell round-trip timed out. Trust the cmd.exe
+    // signature rather than falling through to "unknown" → POSIX garbage.
+    if (os === "unknown" && looksLikeCmdExe) {
+      os = "windows";
     }
 
     // Note: connection failures still produce a context with os=unknown so
